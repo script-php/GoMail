@@ -27,12 +27,13 @@ type SessionManager struct {
 }
 
 // NewSessionManager creates a session manager.
-func NewSessionManager(db *store.DB, maxAge int, csrfKey string) *SessionManager {
+// secureCookie controls whether session cookies are marked Secure (requires HTTPS).
+func NewSessionManager(db *store.DB, maxAge int, csrfKey string, secureCookie bool) *SessionManager {
 	return &SessionManager{
 		db:           db,
 		maxAge:       maxAge,
 		csrfKey:      csrfKey,
-		secureCookie: true,
+		secureCookie: secureCookie,
 	}
 }
 

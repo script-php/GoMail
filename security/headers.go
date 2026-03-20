@@ -3,10 +3,13 @@ package security
 import "net/http"
 
 // SecureHeaders applies security-related HTTP headers to all responses.
-func SecureHeaders(next http.Handler) http.Handler {
+// When tlsEnabled is false, HSTS is omitted (no point forcing HTTPS when not using it).
+func SecureHeaders(next http.Handler, tlsEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// HSTS: force HTTPS for 1 year with subdomains
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		// HSTS: only when TLS is enabled
+		if tlsEnabled {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		}
 
 		// Prevent MIME type sniffing
 		w.Header().Set("X-Content-Type-Options", "nosniff")

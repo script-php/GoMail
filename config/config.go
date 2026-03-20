@@ -65,9 +65,18 @@ type StoreConfig struct {
 type WebConfig struct {
 	ListenAddr    string         `toml:"listen_addr"`
 	HTTPAddr      string         `toml:"http_addr"`
+	EnableTLS     *bool          `toml:"enable_tls"`
 	SessionSecret string         `toml:"session_secret"`
 	SessionMaxAge int            `toml:"session_max_age"`
 	Admin         WebAdminConfig `toml:"admin"`
+}
+
+// IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).
+func (w *WebConfig) IsTLSEnabled() bool {
+	if w.EnableTLS == nil {
+		return true
+	}
+	return *w.EnableTLS
 }
 
 type WebAdminConfig struct {
@@ -161,6 +170,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Store.AttachmentsPath == "" {
 		c.Store.AttachmentsPath = "data/attachments"
+	}
+	if c.Web.EnableTLS == nil {
+		t := true
+		c.Web.EnableTLS = &t
+	}
+	if !c.Web.IsTLSEnabled() {
+		if c.Web.HTTPAddr == "" {
+			c.Web.HTTPAddr = ":80"
+		}
 	}
 	if c.Web.SessionMaxAge <= 0 {
 		c.Web.SessionMaxAge = 86400

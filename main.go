@@ -108,31 +108,38 @@ func main() {
 	// Start web server
 	webServer := web.NewServer(cfg, db, queue)
 
-	// HTTP server for ACME challenges and HTTPS redirect
-	go func() {
-		httpHandler := web.HTTPSRedirect(cfg.Web.ListenAddr)
-		if certMgr.AutocertMgr != nil {
-			httpHandler = certMgr.AutocertMgr.HTTPHandler(httpHandler)
-		}
-		httpAddr := cfg.Web.HTTPAddr
-		if httpAddr == "" {
-			httpAddr = ":80"
-		}
-		log.Printf("[main] HTTP redirect server on %s", httpAddr)
-		if err := http.ListenAndServe(httpAddr, httpHandler); err != nil {
-			log.Printf("[main] HTTP server error: %v", err)
-		}
-	}()
+	if cfg.Web.IsTLSEnabled() {
+		// TLS mode: HTTPS on listen_addr, HTTP redirect + ACME on http_addr
+		go func() {
+			httpHandler := web.HTTPSRedirect(cfg.Web.ListenAddr)
+			if certMgr.AutocertMgr != nil {
+				httpHandler = certMgr.AutocertMgr.HTTPHandler(httpHandler)
+			}
+			httpAddr := cfg.Web.HTTPAddr
+			if httpAddr == "" {
+				httpAddr = ":80"
+			}
+			log.Printf("[main] HTTP redirect server on %s", httpAddr)
+			if err := http.ListenAndServe(httpAddr, httpHandler); err != nil {
+				log.Printf("[main] HTTP server error: %v", err)
+			}
+		}()
 
-	// Start HTTPS server
-	go func() {
-		httpServer := webServer.GetHTTPServer()
-		httpServer.TLSConfig = certMgr.TLSConfig
-		log.Printf("[main] HTTPS server on %s", cfg.Web.ListenAddr)
-		if err := httpServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTPS server error: %v", err)
-		}
-	}()
+		go func() {
+			httpServer := webServer.GetHTTPServer()
+			httpServer.TLSConfig = certMgr.TLSConfig
+			if err := webServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("HTTPS server error: %v", err)
+			}
+		}()
+	} else {
+		// No TLS: plain HTTP web interface (e.g. behind Cloudflare / reverse proxy)
+		go func() {
+			if err := webServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("HTTP server error: %v", err)
+			}
+		}()
+	}
 
 	log.Println("[main] GoMail is running. Press Ctrl+C to stop.")
 

@@ -23,7 +23,8 @@ type Server struct {
 
 // NewServer creates the web server with all routes.
 func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue) *Server {
-	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey)
+	tlsEnabled := cfg.Web.IsTLSEnabled()
+	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey, tlsEnabled)
 
 	s := &Server{
 		cfg:        cfg,
@@ -35,11 +36,20 @@ func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue) *Server 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	// Wrap with security headers
-	handler := security.SecureHeaders(mux)
+	// Wrap with security headers (HSTS only when TLS is enabled)
+	handler := security.SecureHeaders(mux, tlsEnabled)
+
+	// When TLS is enabled, listen on HTTPS port; otherwise HTTP port
+	addr := cfg.Web.ListenAddr
+	if !tlsEnabled {
+		addr = cfg.Web.HTTPAddr
+		if addr == "" {
+			addr = ":80"
+		}
+	}
 
 	s.httpServer = &http.Server{
-		Addr:    cfg.Web.ListenAddr,
+		Addr:    addr,
 		Handler: handler,
 	}
 
@@ -87,8 +97,14 @@ func (s *Server) GetHTTPServer() *http.Server {
 
 // ListenAndServeTLS starts the HTTPS server with the given TLS config.
 func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	log.Printf("[web] HTTPS server listening on %s", s.cfg.Web.ListenAddr)
+	log.Printf("[web] HTTPS server listening on %s", s.httpServer.Addr)
 	return s.httpServer.ListenAndServeTLS(certFile, keyFile)
+}
+
+// ListenAndServe starts a plain HTTP server (no TLS).
+func (s *Server) ListenAndServe() error {
+	log.Printf("[web] HTTP server listening on %s (TLS disabled)", s.httpServer.Addr)
+	return s.httpServer.ListenAndServe()
 }
 
 // Shutdown gracefully shuts down the server.
