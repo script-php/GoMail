@@ -66,7 +66,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/.well-known/mta-sts.txt", handlers.MTASTSHandler(policy))
 
 	// Auth routes (no session required)
-	authHandler := handlers.NewAuthHandler(s.cfg, s.db, s.sessionMgr)
+	authHandler := handlers.NewAuthHandler(s.db, s.sessionMgr)
 	mux.HandleFunc("/login", authHandler.LoginPage)
 	mux.HandleFunc("/logout", authHandler.Logout)
 
@@ -88,6 +88,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// API endpoints for JS
 	mux.Handle("/api/mark-read/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.MarkRead)))
 	mux.Handle("/api/unread-count", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.UnreadCount)))
+
+	// Admin panel (requires admin role)
+	adminHandler := handlers.NewAdminHandler(s.cfg, s.db, s.sessionMgr)
+	mux.Handle("/admin/domains", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Domains)))
+	mux.Handle("/admin/domain/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainEdit)))
+	mux.Handle("/admin/domain/dkim/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainGenerateDKIM)))
+	mux.Handle("/admin/domain/delete/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainDelete)))
+	mux.Handle("/admin/accounts", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Accounts)))
+	mux.Handle("/admin/account/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.AccountEdit)))
+	mux.Handle("/admin/account/delete/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.AccountDelete)))
 }
 
 // GetHTTPServer returns the underlying http.Server for TLS configuration.

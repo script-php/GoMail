@@ -24,8 +24,15 @@
             <li class="{{if eq .Section "sent" "outbound"}}active{{end}}">
                 <a href="/sent">&#10148; Sent</a>
             </li>
+            {{if and .Account .Account.IsAdmin}}
+            <li class="nav-divider"></li>
+            <li class="{{if eq .Section "admin"}}active{{end}}">
+                <a href="/admin/domains">&#9881; Admin</a>
+            </li>
+            {{end}}
         </ul>
         <div class="nav-footer">
+            {{if .Account}}<div class="nav-user">{{.Account.Email}}</div>{{end}}
             <a href="/logout" class="logout-link">Logout</a>
         </div>
     </nav>

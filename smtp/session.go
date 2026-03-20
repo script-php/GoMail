@@ -31,9 +31,10 @@ type Session struct {
 	writer     *bufio.Writer
 	state      SessionState
 	hostname   string
-	domain     string
-	clientAddr string
-	clientIP   string
+	domains       []string // all accepted domains
+	accountExists func(email string) bool // checks if a local account exists
+	clientAddr    string
+	clientIP      string
 	ehlo       string
 	mailFrom   string
 	rcptTo     []string
@@ -47,24 +48,25 @@ type Session struct {
 }
 
 // NewSession creates a new SMTP session for the given connection.
-func NewSession(conn net.Conn, hostname, domain string, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration) *Session {
+func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration) *Session {
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
 	return &Session{
-		conn:         conn,
-		reader:       bufio.NewReader(conn),
-		writer:       bufio.NewWriter(conn),
-		state:        StateGreeting,
-		hostname:     hostname,
-		domain:       domain,
-		clientAddr:   remoteAddr,
-		clientIP:     ip,
-		tlsConfig:    tlsCfg,
-		maxSize:      maxSize,
-		maxRcpt:      maxRcpt,
-		readTimeout:  readTimeout,
-		writeTimeout: writeTimeout,
+		conn:          conn,
+		reader:        bufio.NewReader(conn),
+		writer:        bufio.NewWriter(conn),
+		state:         StateGreeting,
+		hostname:      hostname,
+		domains:       domains,
+		accountExists: accountExists,
+		clientAddr:    remoteAddr,
+		clientIP:      ip,
+		tlsConfig:     tlsCfg,
+		maxSize:       maxSize,
+		maxRcpt:       maxRcpt,
+		readTimeout:   readTimeout,
+		writeTimeout:  writeTimeout,
 	}
 }
 
@@ -219,10 +221,28 @@ func (s *Session) handleRCPT(arg string) {
 		return
 	}
 
-	// Check if recipient is for our domain
+	// Check if recipient is for one of our domains
 	parts := strings.SplitN(to, "@", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[1], s.domain) {
+	if len(parts) != 2 {
+		s.send(550, fmt.Sprintf("Invalid address: %s", to))
+		return
+	}
+	recipientDomain := strings.ToLower(parts[1])
+	accepted := false
+	for _, d := range s.domains {
+		if strings.EqualFold(d, recipientDomain) {
+			accepted = true
+			break
+		}
+	}
+	if !accepted {
 		s.send(550, fmt.Sprintf("User not local; not accepting mail for %s", to))
+		return
+	}
+
+	// Verify the specific account exists
+	if s.accountExists != nil && !s.accountExists(to) {
+		s.send(550, fmt.Sprintf("No such user: %s", to))
 		return
 	}
 

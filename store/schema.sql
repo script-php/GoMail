@@ -1,8 +1,34 @@
 -- GoMail database schema
 
+-- Domains managed by this server
+CREATE TABLE IF NOT EXISTS domains (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain      TEXT    NOT NULL UNIQUE,
+    is_active   INTEGER NOT NULL DEFAULT 1,
+    dkim_selector   TEXT NOT NULL DEFAULT 'mail',
+    dkim_algorithm  TEXT NOT NULL DEFAULT 'ed25519',
+    dkim_private_key TEXT NOT NULL DEFAULT '',  -- PEM-encoded private key
+    dkim_public_key  TEXT NOT NULL DEFAULT '',  -- Base64 public key for DNS
+    created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+-- User accounts (each belongs to a domain)
+CREATE TABLE IF NOT EXISTS accounts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id     INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    email         TEXT    NOT NULL UNIQUE,           -- full email: user@domain
+    display_name  TEXT    NOT NULL DEFAULT '',
+    password_hash TEXT    NOT NULL,                  -- bcrypt hash
+    is_admin      INTEGER NOT NULL DEFAULT 0,        -- can manage domains/accounts
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    quota_bytes   INTEGER NOT NULL DEFAULT 0,        -- 0 = unlimited
+    created_at    DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id      TEXT    NOT NULL UNIQUE,       -- RFC 5322 Message-ID
+    account_id      INTEGER NOT NULL DEFAULT 0 REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id      TEXT    NOT NULL,                  -- RFC 5322 Message-ID
     direction       TEXT    NOT NULL DEFAULT 'inbound', -- 'inbound' or 'outbound'
     mail_from       TEXT    NOT NULL,               -- Envelope sender
     rcpt_to         TEXT    NOT NULL,               -- Envelope recipient (JSON array for multi)
@@ -60,11 +86,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 -- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_domains_domain         ON domains(domain);
+CREATE INDEX IF NOT EXISTS idx_accounts_email         ON accounts(email);
+CREATE INDEX IF NOT EXISTS idx_accounts_domain        ON accounts(domain_id);
+CREATE INDEX IF NOT EXISTS idx_messages_account       ON messages(account_id);
 CREATE INDEX IF NOT EXISTS idx_messages_direction     ON messages(direction);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at   ON messages(received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_is_deleted    ON messages(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_messages_is_read       ON messages(is_read);
 CREATE INDEX IF NOT EXISTS idx_messages_mail_from     ON messages(mail_from);
+CREATE INDEX IF NOT EXISTS idx_messages_msgid         ON messages(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_message    ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_queue_status           ON outbound_queue(status, next_retry);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires       ON sessions(expires_at);

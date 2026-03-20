@@ -26,14 +26,19 @@ type DKIMSigner struct {
 	Algorithm  string // "ed25519" or "rsa"
 }
 
-// NewDKIMSigner loads the private key and creates a signer.
+// NewDKIMSigner loads the private key from a file and creates a signer.
 func NewDKIMSigner(domain, selector, keyPath, algorithm string) (*DKIMSigner, error) {
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading DKIM key: %w", err)
 	}
+	return NewDKIMSignerFromPEM(domain, selector, keyData, algorithm)
+}
 
-	block, _ := pem.Decode(keyData)
+// NewDKIMSignerFromPEM creates a signer from PEM-encoded private key data.
+// This is used for per-domain DKIM keys stored in the database.
+func NewDKIMSignerFromPEM(domain, selector string, pemData []byte, algorithm string) (*DKIMSigner, error) {
+	block, _ := pem.Decode(pemData)
 	if block == nil {
 		return nil, fmt.Errorf("no PEM block found in DKIM key")
 	}
@@ -77,6 +82,55 @@ func NewDKIMSigner(domain, selector, keyPath, algorithm string) (*DKIMSigner, er
 		PrivateKey: signer,
 		Algorithm:  algorithm,
 	}, nil
+}
+
+// GenerateDKIMKeyPair generates a DKIM key pair and returns PEM-encoded strings.
+// Returns: privateKeyPEM, publicKeyPEM, dnsRecordValue, error
+func GenerateDKIMKeyPair(algorithm string) (string, string, string, error) {
+	switch algorithm {
+	case "ed25519":
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return "", "", "", fmt.Errorf("generating ed25519 key: %w", err)
+		}
+		privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			return "", "", "", fmt.Errorf("marshaling private key: %w", err)
+		}
+		privPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}))
+
+		pubBytes, err := x509.MarshalPKIXPublicKey(pub)
+		if err != nil {
+			return "", "", "", fmt.Errorf("marshaling public key: %w", err)
+		}
+		pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}))
+		pubB64 := base64.StdEncoding.EncodeToString(pubBytes)
+		dnsRecord := fmt.Sprintf("v=DKIM1; k=ed25519; p=%s", pubB64)
+		return privPEM, pubPEM, dnsRecord, nil
+
+	case "rsa":
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return "", "", "", fmt.Errorf("generating RSA key: %w", err)
+		}
+		privBytes, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			return "", "", "", fmt.Errorf("marshaling RSA private key: %w", err)
+		}
+		privPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}))
+
+		pubBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			return "", "", "", fmt.Errorf("marshaling RSA public key: %w", err)
+		}
+		pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}))
+		pubB64 := base64.StdEncoding.EncodeToString(pubBytes)
+		dnsRecord := fmt.Sprintf("v=DKIM1; k=rsa; p=%s", pubB64)
+		return privPEM, pubPEM, dnsRecord, nil
+
+	default:
+		return "", "", "", fmt.Errorf("unsupported algorithm: %s", algorithm)
+	}
 }
 
 // Sign adds a DKIM-Signature header to the message and returns the signed message.
@@ -318,50 +372,23 @@ func VerifyDKIM(message []byte) (string, string) {
 	return "fail", fmt.Sprintf("unsupported algorithm: %s", algo)
 }
 
-// GenerateDKIMKeys generates a new Ed25519 key pair for DKIM signing.
+// GenerateDKIMKeys generates a new Ed25519 key pair for DKIM signing and writes to files.
+// Deprecated: use GenerateDKIMKeyPair for per-domain keys stored in DB.
 func GenerateDKIMKeys(keyDir string) error {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	privPEM, pubPEM, dnsRecord, err := GenerateDKIMKeyPair("ed25519")
 	if err != nil {
-		return fmt.Errorf("generating key pair: %w", err)
+		return err
 	}
-
-	// Marshal private key
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return fmt.Errorf("marshaling private key: %w", err)
-	}
-
-	privPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: privBytes,
-	})
 
 	if err := os.MkdirAll(keyDir, 0700); err != nil {
 		return fmt.Errorf("creating key directory: %w", err)
 	}
-
-	if err := os.WriteFile(keyDir+"/dkim_private.pem", privPEM, 0600); err != nil {
+	if err := os.WriteFile(keyDir+"/dkim_private.pem", []byte(privPEM), 0600); err != nil {
 		return fmt.Errorf("writing private key: %w", err)
 	}
-
-	// Public key for DNS TXT record
-	pubBytes, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		return fmt.Errorf("marshaling public key: %w", err)
-	}
-
-	pubPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: pubBytes,
-	})
-
-	if err := os.WriteFile(keyDir+"/dkim_public.pem", pubPEM, 0644); err != nil {
+	if err := os.WriteFile(keyDir+"/dkim_public.pem", []byte(pubPEM), 0644); err != nil {
 		return fmt.Errorf("writing public key: %w", err)
 	}
-
-	// Also write the base64 for DNS
-	pubB64 := base64.StdEncoding.EncodeToString(pubBytes)
-	dnsRecord := fmt.Sprintf("v=DKIM1; k=ed25519; p=%s", pubB64)
 	if err := os.WriteFile(keyDir+"/dkim_dns_record.txt", []byte(dnsRecord+"\n"), 0644); err != nil {
 		return fmt.Errorf("writing DNS record: %w", err)
 	}

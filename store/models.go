@@ -2,9 +2,37 @@ package store
 
 import "time"
 
+// Domain represents a mail domain managed by this server.
+type Domain struct {
+	ID             int64     `json:"id"`
+	Domain         string    `json:"domain"`
+	IsActive       bool      `json:"is_active"`
+	DKIMSelector   string    `json:"dkim_selector"`
+	DKIMAlgorithm  string    `json:"dkim_algorithm"`
+	DKIMPrivateKey string    `json:"-"`
+	DKIMPublicKey  string    `json:"dkim_public_key"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// Account represents a user mailbox.
+type Account struct {
+	ID           int64     `json:"id"`
+	DomainID     int64     `json:"domain_id"`
+	Email        string    `json:"email"`
+	DisplayName  string    `json:"display_name"`
+	PasswordHash string    `json:"-"`
+	IsAdmin      bool      `json:"is_admin"`
+	IsActive     bool      `json:"is_active"`
+	QuotaBytes   int64     `json:"quota_bytes"`
+	CreatedAt    time.Time `json:"created_at"`
+	// Joined fields (not stored)
+	DomainName string `json:"domain_name,omitempty"`
+}
+
 // Message represents an email message stored in the database.
 type Message struct {
 	ID             int64     `json:"id"`
+	AccountID      int64     `json:"account_id"`
 	MessageID      string    `json:"message_id"`
 	Direction      string    `json:"direction"` // "inbound" or "outbound"
 	MailFrom       string    `json:"mail_from"`

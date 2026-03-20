@@ -38,7 +38,8 @@ func NewSessionManager(db *store.DB, maxAge int, csrfKey string, secureCookie bo
 }
 
 // CreateSession creates a new authenticated session and sets the cookie.
-func (sm *SessionManager) CreateSession(w http.ResponseWriter, username string) error {
+// The email parameter is stored as the session identifier.
+func (sm *SessionManager) CreateSession(w http.ResponseWriter, email string) error {
 	token, err := generateToken(32)
 	if err != nil {
 		return fmt.Errorf("generating session token: %w", err)
@@ -46,7 +47,7 @@ func (sm *SessionManager) CreateSession(w http.ResponseWriter, username string) 
 
 	expiresAt := time.Now().Add(time.Duration(sm.maxAge) * time.Second)
 
-	if err := sm.db.SaveSession(token, username, expiresAt); err != nil {
+	if err := sm.db.SaveSession(token, email, expiresAt); err != nil {
 		return fmt.Errorf("saving session: %w", err)
 	}
 
@@ -63,19 +64,19 @@ func (sm *SessionManager) CreateSession(w http.ResponseWriter, username string) 
 	return nil
 }
 
-// GetSession returns the username for the current session, or empty if not authenticated.
+// GetSession returns the email for the current session, or empty if not authenticated.
 func (sm *SessionManager) GetSession(r *http.Request) string {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		return ""
 	}
 
-	username, err := sm.db.GetSession(cookie.Value)
-	if err != nil || username == "" {
+	email, err := sm.db.GetSession(cookie.Value)
+	if err != nil || email == "" {
 		return ""
 	}
 
-	return username
+	return email
 }
 
 // DestroySession removes the session.
@@ -128,6 +129,24 @@ func (sm *SessionManager) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sm.GetSession(r) == "" {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// RequireAdmin middleware redirects non-admin users to inbox.
+// It checks that the session user exists and has is_admin=true.
+func (sm *SessionManager) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		email := sm.GetSession(r)
+		if email == "" {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		account, err := sm.db.GetAccountByEmail(email)
+		if err != nil || account == nil || !account.IsAdmin {
+			http.Redirect(w, r, "/inbox", http.StatusSeeOther)
 			return
 		}
 		next.ServeHTTP(w, r)

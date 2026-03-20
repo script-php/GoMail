@@ -98,10 +98,24 @@ func (s *InboundServer) acceptLoop() {
 }
 
 func (s *InboundServer) handleConnection(conn net.Conn) {
+	// Get current list of accepted domains from DB
+	domains, err := s.db.ListAllDomainNames()
+	if err != nil {
+		log.Printf("[smtp] error loading domains: %v", err)
+		conn.Close()
+		return
+	}
+
+	accountExists := func(email string) bool {
+		acct, err := s.db.GetAccountByEmail(email)
+		return err == nil && acct != nil && acct.IsActive
+	}
+
 	session := NewSession(
 		conn,
 		s.cfg.Server.Hostname,
-		s.cfg.Server.Domain,
+		domains,
+		accountExists,
 		s.tlsConfig,
 		s.cfg.SMTP.MaxMessageSize,
 		s.cfg.SMTP.MaxRecipients,
@@ -200,60 +214,76 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	authResults := authBuilder.Build()
 
-	// Serialize recipients
+	// --- Store the message for each recipient's account ---
 	rcptJSON, _ := json.Marshal(rcptTo)
 
-	// Generate message ID if missing
 	messageID := parsed.MessageID
 	if messageID == "" {
 		messageID = fmt.Sprintf("%d.%s@%s", time.Now().UnixNano(), clientIP, s.cfg.Server.Hostname)
 	}
 
-	// --- Store the message ---
-	msg := &store.Message{
-		MessageID:      messageID,
-		Direction:      "inbound",
-		MailFrom:       mailFrom,
-		RcptTo:         string(rcptJSON),
-		FromAddr:       parsed.From,
-		ToAddr:         parsed.To,
-		CcAddr:         parsed.Cc,
-		ReplyTo:        parsed.ReplyTo,
-		Subject:        parsed.Subject,
-		TextBody:       parsed.TextBody,
-		HTMLBody:       parsed.HTMLBody,
-		RawHeaders:     parsed.RawHeaders,
-		RawMessage:     rawMessage,
-		Size:           int64(len(rawMessage)),
-		HasAttachments: len(parsed.Attachments) > 0,
-		SPFResult:      string(spfResult),
-		DKIMResult:     dkimResult,
-		DMARCResult:    string(dmarcResult.Result),
-		AuthResults:    authResults,
-		ReceivedAt:     time.Now(),
-	}
-
-	msgID, err := s.db.SaveMessage(msg)
-	if err != nil {
-		return fmt.Errorf("saving message: %w", err)
-	}
-
-	// Save attachments
-	if len(parsed.Attachments) > 0 {
-		records, err := parser.SaveAttachments(parsed.Attachments, msgID, s.db.AttachmentsPath())
+	// Deliver to each recipient
+	for _, rcpt := range rcptTo {
+		// Look up the account for this recipient
+		account, err := s.db.GetAccountByEmail(rcpt)
 		if err != nil {
-			log.Printf("[smtp] attachment save error: %v", err)
-		} else {
-			for _, rec := range records {
-				if _, err := s.db.SaveAttachment(rec); err != nil {
-					log.Printf("[smtp] attachment db save error: %v", err)
+			log.Printf("[smtp] account lookup error for %s: %v", rcpt, err)
+			continue
+		}
+		if account == nil || !account.IsActive {
+			log.Printf("[smtp] no active account for %s, skipping", rcpt)
+			continue
+		}
+
+		accountID := account.ID
+
+		msg := &store.Message{
+			AccountID:      accountID,
+			MessageID:      messageID,
+			Direction:      "inbound",
+			MailFrom:       mailFrom,
+			RcptTo:         string(rcptJSON),
+			FromAddr:       parsed.From,
+			ToAddr:         parsed.To,
+			CcAddr:         parsed.Cc,
+			ReplyTo:        parsed.ReplyTo,
+			Subject:        parsed.Subject,
+			TextBody:       parsed.TextBody,
+			HTMLBody:       parsed.HTMLBody,
+			RawHeaders:     parsed.RawHeaders,
+			RawMessage:     rawMessage,
+			Size:           int64(len(rawMessage)),
+			HasAttachments: len(parsed.Attachments) > 0,
+			SPFResult:      string(spfResult),
+			DKIMResult:     dkimResult,
+			DMARCResult:    string(dmarcResult.Result),
+			AuthResults:    authResults,
+			ReceivedAt:     time.Now(),
+		}
+
+		msgID, err := s.db.SaveMessage(msg)
+		if err != nil {
+			log.Printf("[smtp] saving message for %s: %v", rcpt, err)
+			continue
+		}
+
+		// Save attachments
+		if len(parsed.Attachments) > 0 {
+			records, err := parser.SaveAttachments(parsed.Attachments, msgID, s.db.AttachmentsPath())
+			if err != nil {
+				log.Printf("[smtp] attachment save error: %v", err)
+			} else {
+				for _, rec := range records {
+					if _, err := s.db.SaveAttachment(rec); err != nil {
+						log.Printf("[smtp] attachment db save error: %v", err)
+					}
 				}
 			}
 		}
-	}
 
-	log.Printf("[smtp] message stored id=%d msgid=%s from=%s subject=%s",
-		msgID, messageID, mailFrom, parsed.Subject)
+		log.Printf("[smtp] message stored id=%d account=%d msgid=%s from=%s to=%s subject=%s",
+			msgID, accountID, messageID, mailFrom, rcpt, parsed.Subject)
+	}
 
 	return nil
 }

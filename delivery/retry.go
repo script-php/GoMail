@@ -35,5 +35,5 @@ func (r *RetrySchedule) NextRetry(attempt int) time.Time {
 		}
 	}
 
-	return time.Now().Add(time.Duration(delaySec) * time.Second)
+	return time.Now().UTC().Add(time.Duration(delaySec) * time.Second)
 }

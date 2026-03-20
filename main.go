@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/crypto/bcrypt"
 
-	"gomail/auth"
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/dns"
@@ -24,7 +24,6 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
-	setupMode := flag.Bool("setup", false, "Run first-time setup (generate DKIM keys, print DNS records)")
 	hashPassword := flag.String("hash-password", "", "Generate bcrypt hash for a password")
 	flag.Parse()
 
@@ -35,7 +34,7 @@ func main() {
 			log.Fatalf("Error hashing password: %v", err)
 		}
 		fmt.Printf("Password hash: %s\n", hash)
-		fmt.Println("Add this to config.json under web.admin.password_hash")
+		fmt.Println("Add this to config.json under web.bootstrap_admin.password_hash")
 		return
 	}
 
@@ -45,13 +44,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("[main] GoMail starting for %s (%s)", cfg.Server.Hostname, cfg.Server.Domain)
-
-	// Setup mode: generate keys and show DNS records
-	if *setupMode {
-		runSetup(cfg)
-		return
-	}
+	log.Printf("[main] GoMail starting (hostname=%s)", cfg.Server.Hostname)
 
 	// Initialize DNS cache
 	dns.InitCache(cfg.DNS.CacheTTL)
@@ -64,28 +57,15 @@ func main() {
 	defer db.Close()
 	log.Println("[main] database opened")
 
+	// Bootstrap admin: create initial domain + account if no accounts exist
+	bootstrapAdmin(cfg, db)
+
 	// Initialize TLS (skip for mode "none")
 	certMgr, err := tlsconfig.NewCertManager(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize TLS: %v", err)
 	}
 	log.Println("[main] TLS initialized")
-
-	// Initialize DKIM signer (optional — only if key exists)
-	var dkimSigner *auth.DKIMSigner
-	if _, err := os.Stat(cfg.DKIM.KeyPath); err == nil {
-		dkimSigner, err = auth.NewDKIMSigner(
-			cfg.Server.Domain, cfg.DKIM.Selector,
-			cfg.DKIM.KeyPath, cfg.DKIM.Algorithm,
-		)
-		if err != nil {
-			log.Printf("[main] warning: DKIM signer init failed: %v (outbound mail will not be DKIM-signed)", err)
-		} else {
-			log.Printf("[main] DKIM signer ready (selector=%s, algo=%s)", cfg.DKIM.Selector, cfg.DKIM.Algorithm)
-		}
-	} else {
-		log.Println("[main] warning: DKIM key not found; run with -setup to generate")
-	}
 
 	// Get TLS config for SMTP (nil when mode=none)
 	var smtpTLS *tls.Config
@@ -108,8 +88,8 @@ func main() {
 	deliveryPool := delivery.NewPool(cfg, db, certMgr.TLSConfig)
 	deliveryPool.Start()
 
-	// Create delivery queue for the web interface
-	queue := delivery.NewQueue(db, cfg, dkimSigner)
+	// Create delivery queue for the web interface (per-domain DKIM from DB)
+	queue := delivery.NewQueue(db, cfg)
 
 	// Start web server
 	webServer := web.NewServer(cfg, db, queue)
@@ -147,6 +127,14 @@ func main() {
 		}()
 	}
 
+	// Log active domains
+	domainNames, _ := db.ListAllDomainNames()
+	if len(domainNames) > 0 {
+		log.Printf("[main] accepting mail for domains: %s", strings.Join(domainNames, ", "))
+	} else {
+		log.Println("[main] warning: no domains configured. Add domains via the admin panel.")
+	}
+
 	log.Println("[main] GoMail is running. Press Ctrl+C to stop.")
 
 	// Wait for shutdown signal
@@ -161,46 +149,62 @@ func main() {
 	log.Println("[main] GoMail stopped.")
 }
 
-func runSetup(cfg *config.Config) {
-	log.Println("[setup] Generating DKIM keys...")
-
-	if err := auth.GenerateDKIMKeys("keys"); err != nil {
-		log.Fatalf("Failed to generate DKIM keys: %v", err)
+// bootstrapAdmin creates the initial domain and admin account on first run
+// using the bootstrap_admin settings from config.json.
+func bootstrapAdmin(cfg *config.Config, db *store.DB) {
+	count, _ := db.CountAccounts()
+	if count > 0 {
+		return // Accounts already exist, skip bootstrap
 	}
 
-	log.Println("[setup] DKIM keys generated in keys/")
-	log.Println("")
-	log.Println("=== DNS Records to Configure ===")
-	log.Println("")
-	log.Printf("1. MX Record:")
-	log.Printf("   %s.  IN  MX  10  %s.", cfg.Server.Domain, cfg.Server.Hostname)
-	log.Println("")
-	log.Printf("2. A Record (point to your server IP):")
-	log.Printf("   %s.  IN  A  <YOUR_SERVER_IP>", cfg.Server.Hostname)
-	log.Println("")
-	log.Printf("3. SPF Record:")
-	log.Printf("   %s.  IN  TXT  \"v=spf1 mx a -all\"", cfg.Server.Domain)
-	log.Println("")
-	log.Printf("4. DKIM Record (paste contents of keys/dkim_dns_record.txt):")
-	log.Printf("   %s._domainkey.%s.  IN  TXT  \"<see keys/dkim_dns_record.txt>\"", cfg.DKIM.Selector, cfg.Server.Domain)
-	log.Println("")
-	log.Printf("5. DMARC Record:")
-	log.Printf("   _dmarc.%s.  IN  TXT  \"v=DMARC1; p=quarantine; rua=mailto:admin@%s\"", cfg.Server.Domain, cfg.Server.Domain)
-	log.Println("")
-	log.Printf("6. MTA-STS Record:")
-	log.Printf("   _mta-sts.%s.  IN  TXT  \"v=STSv1; id=%d\"", cfg.Server.Domain, 1)
-	log.Println("")
-	log.Printf("7. TLS-RPT Record:")
-	log.Printf("   _smtp._tls.%s.  IN  TXT  \"v=TLSRPTv1; rua=mailto:admin@%s\"", cfg.Server.Domain, cfg.Server.Domain)
-	log.Println("")
-	log.Printf("8. PTR Record (configure with your hosting provider):")
-	log.Printf("   <YOUR_SERVER_IP>  PTR  %s.", cfg.Server.Hostname)
-	log.Println("")
-	log.Println("Next steps:")
-	log.Println("  1. Set these DNS records")
-	log.Println("  2. Generate a password hash: gomail -hash-password 'your-password'")
-	log.Println("  3. Add the hash to config.json under web.admin.password_hash")
-	log.Println("  4. Start the server: gomail -config config.json")
+	if cfg.Web.BootstrapAdmin.Email == "" || cfg.Web.BootstrapAdmin.PasswordHash == "" {
+		log.Println("[main] no accounts exist and no bootstrap_admin configured.")
+		log.Println("[main] set web.bootstrap_admin.email and web.bootstrap_admin.password_hash in config.json")
+		log.Println("[main] generate a password hash with: gomail -hash-password 'your-password'")
+		return
+	}
+
+	email := cfg.Web.BootstrapAdmin.Email
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) != 2 {
+		log.Printf("[main] bootstrap_admin.email '%s' is not a valid email address", email)
+		return
+	}
+	domainName := parts[1]
+
+	log.Printf("[main] bootstrapping: creating domain '%s' and admin account '%s'", domainName, email)
+
+	// Create the domain
+	domain := &store.Domain{
+		Domain:        domainName,
+		IsActive:      true,
+		DKIMSelector:  cfg.DKIM.DefaultSelector,
+		DKIMAlgorithm: cfg.DKIM.DefaultAlgorithm,
+	}
+	domainID, err := db.CreateDomain(domain)
+	if err != nil {
+		log.Printf("[main] bootstrap: failed to create domain: %v", err)
+		return
+	}
+
+	// Create the admin account
+	account := &store.Account{
+		DomainID:     domainID,
+		Email:        email,
+		DisplayName:  "Administrator",
+		PasswordHash: cfg.Web.BootstrapAdmin.PasswordHash,
+		IsAdmin:      true,
+		IsActive:     true,
+		QuotaBytes:   0, // unlimited
+	}
+	_, err = db.CreateAccount(account)
+	if err != nil {
+		log.Printf("[main] bootstrap: failed to create admin account: %v", err)
+		return
+	}
+
+	log.Printf("[main] bootstrap complete. Login with: %s", email)
+	log.Println("[main] generate DKIM keys via the admin panel: /admin/domains")
 }
 
 func hashPasswordBcrypt(password string) (string, error) {

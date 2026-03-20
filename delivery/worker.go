@@ -2,11 +2,15 @@ package delivery
 
 import (
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"gomail/config"
+	"gomail/parser"
 	"gomail/smtp"
 	"gomail/store"
 )
@@ -18,6 +22,7 @@ type Worker struct {
 	cfg      *config.Config
 	tlsCfg   *tls.Config
 	schedule *RetrySchedule
+	claimMu  *sync.Mutex // shared mutex to prevent duplicate claims
 }
 
 // Pool manages a group of delivery workers.
@@ -28,6 +33,7 @@ type Pool struct {
 	tlsCfg  *tls.Config
 	quit    chan struct{}
 	wg      sync.WaitGroup
+	claimMu sync.Mutex
 }
 
 // NewPool creates a delivery worker pool.
@@ -51,6 +57,7 @@ func (p *Pool) Start() {
 			cfg:      p.cfg,
 			tlsCfg:   p.tlsCfg,
 			schedule: schedule,
+			claimMu:  &p.claimMu,
 		}
 		p.workers = append(p.workers, w)
 		p.wg.Add(1)
@@ -85,44 +92,147 @@ func (w *Worker) run(quit chan struct{}) {
 }
 
 func (w *Worker) processQueue() {
-	// Fetch one pending entry
+	// Claim one pending entry atomically (mutex prevents two workers from
+	// grabbing the same entry).
+	w.claimMu.Lock()
 	entries, err := w.db.GetPendingQueue(1)
 	if err != nil {
+		w.claimMu.Unlock()
 		log.Printf("[delivery] worker %d: queue read error: %v", w.id, err)
 		return
 	}
+	if len(entries) == 0 {
+		w.claimMu.Unlock()
+		return
+	}
+	entry := entries[0]
+	w.db.UpdateQueueEntry(entry.ID, "sending", entry.Attempts, entry.NextRetry, "")
+	w.claimMu.Unlock()
 
-	for _, entry := range entries {
-		// Mark as sending
-		w.db.UpdateQueueEntry(entry.ID, "sending", entry.Attempts, entry.NextRetry, "")
-
-		// Attempt delivery
-		err := smtp.SendMail(
+	// Deliver outside the lock
+	var deliveryErr error
+	if w.isLocalRecipient(entry.RcptTo) {
+		deliveryErr = w.deliverLocal(entry)
+	} else {
+		deliveryErr = smtp.SendMail(
 			entry.MailFrom,
 			entry.RcptTo,
 			entry.RawMessage,
 			w.cfg.Server.Hostname,
 			w.tlsCfg,
 		)
+	}
 
-		if err != nil {
-			entry.Attempts++
-			if entry.Attempts >= entry.MaxAttempts {
-				// Permanently failed
-				log.Printf("[delivery] worker %d: permanent failure for %s->%s: %v",
-					w.id, entry.MailFrom, entry.RcptTo, err)
-				w.db.UpdateQueueEntry(entry.ID, "failed", entry.Attempts, time.Now(), err.Error())
-			} else {
-				// Schedule retry
-				nextRetry := w.schedule.NextRetry(entry.Attempts)
-				log.Printf("[delivery] worker %d: temporary failure for %s->%s (attempt %d/%d), retry at %s: %v",
-					w.id, entry.MailFrom, entry.RcptTo, entry.Attempts, entry.MaxAttempts, nextRetry.Format(time.RFC3339), err)
-				w.db.UpdateQueueEntry(entry.ID, "pending", entry.Attempts, nextRetry, err.Error())
-			}
+	if deliveryErr != nil {
+		entry.Attempts++
+		if entry.Attempts >= entry.MaxAttempts {
+			log.Printf("[delivery] worker %d: permanent failure for %s->%s: %v",
+				w.id, entry.MailFrom, entry.RcptTo, deliveryErr)
+			w.db.UpdateQueueEntry(entry.ID, "failed", entry.Attempts, time.Now().UTC(), deliveryErr.Error())
 		} else {
-			// Success
-			log.Printf("[delivery] worker %d: delivered %s->%s", w.id, entry.MailFrom, entry.RcptTo)
-			w.db.UpdateQueueEntry(entry.ID, "sent", entry.Attempts+1, time.Now(), "")
+			nextRetry := w.schedule.NextRetry(entry.Attempts)
+			log.Printf("[delivery] worker %d: temporary failure for %s->%s (attempt %d/%d), retry at %s: %v",
+				w.id, entry.MailFrom, entry.RcptTo, entry.Attempts, entry.MaxAttempts, nextRetry.Format(time.RFC3339), deliveryErr)
+			w.db.UpdateQueueEntry(entry.ID, "pending", entry.Attempts, nextRetry, deliveryErr.Error())
+		}
+	} else {
+		log.Printf("[delivery] worker %d: delivered %s->%s", w.id, entry.MailFrom, entry.RcptTo)
+		w.db.UpdateQueueEntry(entry.ID, "sent", entry.Attempts+1, time.Now().UTC(), "")
+	}
+}
+
+// isLocalRecipient checks if the recipient's domain is handled by this server.
+func (w *Worker) isLocalRecipient(rcpt string) bool {
+	parts := strings.SplitN(rcpt, "@", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	domain := strings.ToLower(parts[1])
+
+	domains, err := w.db.ListAllDomainNames()
+	if err != nil {
+		return false
+	}
+	for _, d := range domains {
+		if strings.EqualFold(d, domain) {
+			return true
 		}
 	}
+	return false
+}
+
+// deliverLocal delivers a message directly to a local account's mailbox.
+func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
+	rcpt := entry.RcptTo
+
+	account, err := w.db.GetAccountByEmail(rcpt)
+	if err != nil {
+		return fmt.Errorf("account lookup for %s: %w", rcpt, err)
+	}
+	if account == nil {
+		return fmt.Errorf("no local account for %s", rcpt)
+	}
+	if !account.IsActive {
+		return fmt.Errorf("account %s is inactive", rcpt)
+	}
+
+	// Parse the message
+	parsed, err := parser.Parse(entry.RawMessage)
+	if err != nil {
+		return fmt.Errorf("parsing message: %w", err)
+	}
+
+	messageID := parsed.MessageID
+	if messageID == "" {
+		messageID = fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname)
+	}
+
+	rcptJSON, _ := json.Marshal([]string{rcpt})
+
+	msg := &store.Message{
+		AccountID:      account.ID,
+		MessageID:      messageID,
+		Direction:      "inbound",
+		MailFrom:       entry.MailFrom,
+		RcptTo:         string(rcptJSON),
+		FromAddr:       parsed.From,
+		ToAddr:         parsed.To,
+		CcAddr:         parsed.Cc,
+		ReplyTo:        parsed.ReplyTo,
+		Subject:        parsed.Subject,
+		TextBody:       parsed.TextBody,
+		HTMLBody:        parsed.HTMLBody,
+		RawHeaders:     parsed.RawHeaders,
+		RawMessage:     entry.RawMessage,
+		Size:           int64(len(entry.RawMessage)),
+		HasAttachments: len(parsed.Attachments) > 0,
+		SPFResult:      "none",
+		DKIMResult:     "none",
+		DMARCResult:    "none",
+		AuthResults:    "local-delivery",
+		ReceivedAt:     time.Now(),
+	}
+
+	msgID, err := w.db.SaveMessage(msg)
+	if err != nil {
+		return fmt.Errorf("saving message for %s: %w", rcpt, err)
+	}
+
+	// Save attachments
+	if len(parsed.Attachments) > 0 {
+		records, err := parser.SaveAttachments(parsed.Attachments, msgID, w.db.AttachmentsPath())
+		if err != nil {
+			log.Printf("[delivery] local attachment save error: %v", err)
+		} else {
+			for _, rec := range records {
+				if _, err := w.db.SaveAttachment(rec); err != nil {
+					log.Printf("[delivery] local attachment db save error: %v", err)
+				}
+			}
+		}
+	}
+
+	log.Printf("[delivery] local delivery: id=%d from=%s to=%s subject=%s",
+		msgID, entry.MailFrom, rcpt, parsed.Subject)
+	return nil
 }

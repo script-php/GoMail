@@ -2,9 +2,7 @@
   "_comment": "GoMail LOCAL TESTING config — no root, no TLS, high ports",
 
   "server": {
-    "hostname": "localhost",
-    "domain": "localhost",
-    "admin_email": "admin@localhost"
+    "hostname": "localhost"
   },
 
   "smtp": {
@@ -30,9 +28,9 @@
   },
 
   "dkim": {
-    "selector": "mail",
-    "key_path": "./keys/dkim_private.pem",
-    "algorithm": "ed25519"
+    "default_selector": "mail",
+    "default_algorithm": "ed25519",
+    "keys_dir": "./keys"
   },
 
   "store": {
@@ -46,8 +44,8 @@
     "enable_tls": false,
     "session_secret": "local-testing-secret-not-for-production-use-1234",
     "session_max_age": 86400,
-    "admin": {
-      "username": "admin",
+    "bootstrap_admin": {
+      "email": "admin@localhost",
       "password_hash": "$2a$10$xKUZqLFPijh5HM52Di6XlOwHMc0ZRwaVOEaZGT/4RnR86dN055.J."
     }
   },

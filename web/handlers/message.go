@@ -63,6 +63,12 @@ func NewMessageHandler(db *store.DB, sm *security.SessionManager) *MessageHandle
 
 // View shows a single message.
 func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
 	idStr := strings.TrimPrefix(r.URL.Path, "/message/")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -70,7 +76,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := h.db.GetMessage(id)
+	msg, err := h.db.GetMessage(id, account.ID)
 	if err != nil || msg == nil {
 		http.NotFound(w, r)
 		return
@@ -85,7 +91,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 	// Get attachments
 	attachments, _ := h.db.GetAttachments(id)
 
-	unread, _ := h.db.CountUnread()
+	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
 		"Title":       msg.Subject,
@@ -94,6 +100,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		"Unread":      unread,
 		"CSRFToken":   h.sessionMgr.GenerateCSRFToken(r),
 		"Section":     msg.Direction,
+		"Account":     account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -132,6 +139,12 @@ func (h *MessageHandler) ToggleStar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	idStr := strings.TrimPrefix(r.URL.Path, "/message/star/")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -139,7 +152,7 @@ func (h *MessageHandler) ToggleStar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := h.db.GetMessage(id)
+	msg, err := h.db.GetMessage(id, account.ID)
 	if err != nil || msg == nil {
 		http.NotFound(w, r)
 		return

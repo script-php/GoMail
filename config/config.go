@@ -21,9 +21,7 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Hostname   string `json:"hostname"`
-	Domain     string `json:"domain"`
-	AdminEmail string `json:"admin_email"`
+	Hostname string `json:"hostname"`
 }
 
 type SMTPConfig struct {
@@ -51,9 +49,9 @@ type TLSConfig struct {
 }
 
 type DKIMConfig struct {
-	Selector  string `json:"selector"`
-	KeyPath   string `json:"key_path"`
-	Algorithm string `json:"algorithm"`
+	DefaultSelector  string `json:"default_selector"`
+	DefaultAlgorithm string `json:"default_algorithm"`
+	KeysDir          string `json:"keys_dir"`
 }
 
 type StoreConfig struct {
@@ -67,7 +65,7 @@ type WebConfig struct {
 	EnableTLS     *bool          `json:"enable_tls"`
 	SessionSecret string         `json:"session_secret"`
 	SessionMaxAge int            `json:"session_max_age"`
-	Admin         WebAdminConfig `json:"admin"`
+	BootstrapAdmin BootstrapAdmin `json:"bootstrap_admin"`
 }
 
 // IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).
@@ -78,8 +76,9 @@ func (w *WebConfig) IsTLSEnabled() bool {
 	return *w.EnableTLS
 }
 
-type WebAdminConfig struct {
-	Username     string `json:"username"`
+// BootstrapAdmin is the initial admin created on first run (before any accounts exist).
+type BootstrapAdmin struct {
+	Email        string `json:"email"`
 	PasswordHash string `json:"password_hash"`
 }
 
@@ -126,9 +125,6 @@ func (c *Config) Validate() error {
 	if c.Server.Hostname == "" {
 		return fmt.Errorf("server.hostname is required")
 	}
-	if c.Server.Domain == "" {
-		return fmt.Errorf("server.domain is required")
-	}
 	if c.SMTP.ListenAddr == "" {
 		c.SMTP.ListenAddr = ":25"
 	}
@@ -158,11 +154,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("tls.cert_file and tls.key_file required when mode is 'manual'")
 		}
 	}
-	if c.DKIM.Selector == "" {
-		c.DKIM.Selector = "mail"
+	if c.DKIM.DefaultSelector == "" {
+		c.DKIM.DefaultSelector = "mail"
 	}
-	if c.DKIM.Algorithm == "" {
-		c.DKIM.Algorithm = "ed25519"
+	if c.DKIM.DefaultAlgorithm == "" {
+		c.DKIM.DefaultAlgorithm = "ed25519"
+	}
+	if c.DKIM.KeysDir == "" {
+		c.DKIM.KeysDir = "keys"
 	}
 	if c.Store.DBPath == "" {
 		c.Store.DBPath = "data/mail.db"

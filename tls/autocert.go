@@ -43,14 +43,14 @@ func NewCertManager(cfg *config.Config) (*CertManager, error) {
 			Prompt:     autocert.AcceptTOS,
 			Email:      cfg.TLS.ACMEEmail,
 			Cache:      autocert.DirCache(cfg.TLS.ACMEDir),
-			HostPolicy: autocert.HostWhitelist(cfg.Server.Hostname, cfg.Server.Domain),
+			HostPolicy: autocert.HostWhitelist(cfg.Server.Hostname),
 		}
 
 		baseTLS.GetCertificate = cm.AutocertMgr.GetCertificate
 		baseTLS.NextProtos = append(baseTLS.NextProtos, "h2", "http/1.1", "acme-tls/1")
 		cm.TLSConfig = baseTLS
 
-		log.Printf("[tls] autocert enabled for %s, %s", cfg.Server.Hostname, cfg.Server.Domain)
+		log.Printf("[tls] autocert enabled for %s", cfg.Server.Hostname)
 
 	case "manual":
 		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)

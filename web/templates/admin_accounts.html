@@ -1,0 +1,79 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>Manage Accounts</h2>
+        <a href="/admin/account/edit/new" class="btn btn-primary">+ Add Account</a>
+    </div>
+
+    <!-- Domain filter -->
+    <div class="filter-bar">
+        <form method="GET" action="/admin/accounts" class="inline-form">
+            <label for="domain-filter">Filter by domain:</label>
+            <select name="domain" id="domain-filter" onchange="this.form.submit()">
+                <option value="">All domains</option>
+                {{range .Domains}}
+                <option value="{{.ID}}" {{if eq .ID $.FilterDomainID}}selected{{end}}>{{.Domain}}</option>
+                {{end}}
+            </select>
+        </form>
+    </div>
+
+    {{if not .Accounts}}
+    <div class="empty-state">
+        <p>No accounts found. Create an account to start using email.</p>
+    </div>
+    {{else}}
+    <table class="admin-table">
+        <thead>
+            <tr>
+                <th>Email</th>
+                <th>Display Name</th>
+                <th>Domain</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Quota</th>
+                <th>Created</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Accounts}}
+            <tr>
+                <td><strong>{{.Email}}</strong></td>
+                <td>{{.DisplayName}}</td>
+                <td>{{.DomainName}}</td>
+                <td>
+                    {{if .IsAdmin}}
+                    <span class="badge badge-info">Admin</span>
+                    {{else}}
+                    <span class="badge">User</span>
+                    {{end}}
+                </td>
+                <td>
+                    {{if .IsActive}}
+                    <span class="badge badge-success">Active</span>
+                    {{else}}
+                    <span class="badge badge-danger">Inactive</span>
+                    {{end}}
+                </td>
+                <td>{{formatSize .QuotaBytes}}</td>
+                <td>{{.CreatedAt.Format "2006-01-02"}}</td>
+                <td class="actions">
+                    <a href="/admin/account/edit/{{.ID}}" class="btn btn-sm">Edit</a>
+                    <form method="POST" action="/admin/account/delete/{{.ID}}" class="inline-form"
+                          onsubmit="return confirm('Delete account {{.Email}}?')">
+                        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+    {{end}}
+
+    <div class="admin-nav">
+        <a href="/admin/domains" class="btn">&larr; Manage Domains</a>
+    </div>
+</div>
+{{end}}

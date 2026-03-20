@@ -42,14 +42,18 @@ func NewComposeHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, 
 
 // ComposePage shows the compose form.
 func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
-	unread, _ := h.db.CountUnread()
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
 
 	// Check for reply
 	replyTo := r.URL.Query().Get("reply")
 	var prefill map[string]string
 	if replyTo != "" {
-		// Load original message for reply
-		// (simplified: just set To and Subject)
 		prefill = map[string]string{
 			"to":      r.URL.Query().Get("to"),
 			"subject": r.URL.Query().Get("subject"),
@@ -58,11 +62,12 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 
 	data := map[string]interface{}{
 		"Title":     "Compose",
-		"From":      h.cfg.Server.AdminEmail,
+		"From":      account.Email,
 		"Unread":    unread,
 		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
 		"Section":   "compose",
 		"Prefill":   prefill,
+		"Account":   account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -80,6 +85,12 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	if !h.sessionMgr.ValidateCSRF(r) {
 		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
@@ -104,9 +115,33 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate local recipients exist before enqueuing
+	localDomains, _ := h.db.ListAllDomainNames()
+	for _, rcpt := range recipients {
+		parts := strings.SplitN(rcpt, "@", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		rcptDomain := strings.ToLower(parts[1])
+		isLocal := false
+		for _, d := range localDomains {
+			if strings.EqualFold(d, rcptDomain) {
+				isLocal = true
+				break
+			}
+		}
+		if isLocal {
+			acct, err := h.db.GetAccountByEmail(rcpt)
+			if err != nil || acct == nil || !acct.IsActive {
+				http.Error(w, fmt.Sprintf("Recipient not found: %s", rcpt), http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
 	// Build the RFC 5322 message
-	from := h.cfg.Server.AdminEmail
-	msgID := fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), h.cfg.Server.Domain)
+	from := account.Email
+	msgID := fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), account.DomainName)
 
 	var msg strings.Builder
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
@@ -123,8 +158,8 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString("\r\n")
 	msg.WriteString(body)
 
-	// Enqueue for delivery
-	if err := h.queue.Enqueue(from, recipients, []byte(msg.String())); err != nil {
+	// Enqueue for delivery (queue handles per-domain DKIM signing)
+	if err := h.queue.Enqueue(from, recipients, []byte(msg.String()), account.ID); err != nil {
 		log.Printf("[web] enqueue error: %v", err)
 		http.Error(w, "Failed to send message", http.StatusInternalServerError)
 		return

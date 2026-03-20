@@ -57,21 +57,27 @@ func NewInboxHandler(db *store.DB, sm *security.SessionManager) *InboxHandler {
 
 // Inbox shows the inbox (inbound messages).
 func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
 	}
 	perPage := 50
 
-	messages, err := h.db.ListMessages("inbound", perPage, (page-1)*perPage)
+	messages, err := h.db.ListMessages(account.ID, "inbound", perPage, (page-1)*perPage)
 	if err != nil {
 		log.Printf("[web] inbox list error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	total, _ := h.db.CountMessages("inbound")
-	unread, _ := h.db.CountUnread()
+	total, _ := h.db.CountMessages(account.ID, "inbound")
+	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
 		"Title":      "Inbox",
@@ -82,6 +88,7 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 		"Unread":     unread,
 		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
 		"Section":    "inbox",
+		"Account":    account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -92,21 +99,27 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 
 // Sent shows the sent (outbound) messages.
 func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
 	}
 	perPage := 50
 
-	messages, err := h.db.ListMessages("outbound", perPage, (page-1)*perPage)
+	messages, err := h.db.ListMessages(account.ID, "outbound", perPage, (page-1)*perPage)
 	if err != nil {
 		log.Printf("[web] sent list error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	total, _ := h.db.CountMessages("outbound")
-	unread, _ := h.db.CountUnread()
+	total, _ := h.db.CountMessages(account.ID, "outbound")
+	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
 		"Title":      "Sent",
@@ -117,6 +130,7 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 		"Unread":     unread,
 		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
 		"Section":    "sent",
+		"Account":    account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -127,7 +141,11 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 
 // UnreadCount returns the unread count as JSON (for AJAX polling).
 func (h *InboxHandler) UnreadCount(w http.ResponseWriter, r *http.Request) {
-	count, _ := h.db.CountUnread()
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	var count int
+	if account != nil {
+		count, _ = h.db.CountUnread(account.ID)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"unread": count})
 }

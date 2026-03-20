@@ -8,27 +8,24 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"gomail/config"
 	"gomail/security"
 	"gomail/store"
 )
 
 // AuthHandler handles login/logout.
 type AuthHandler struct {
-	cfg        *config.Config
 	db         *store.DB
 	sessionMgr *security.SessionManager
 	templates  *template.Template
 }
 
 // NewAuthHandler creates an auth handler.
-func NewAuthHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager) *AuthHandler {
+func NewAuthHandler(db *store.DB, sm *security.SessionManager) *AuthHandler {
 	tmpl := template.Must(template.ParseFiles(
 		filepath.Join("web", "templates", "base.html"),
 		filepath.Join("web", "templates", "login.html"),
 	))
 	return &AuthHandler{
-		cfg:        cfg,
 		db:         db,
 		sessionMgr: sm,
 		templates:  tmpl,
@@ -48,11 +45,11 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
-		username := r.FormValue("username")
+		email := r.FormValue("email")
 		password := r.FormValue("password")
 
-		if h.authenticate(username, password) {
-			if err := h.sessionMgr.CreateSession(w, username); err != nil {
+		if h.authenticate(email, password) {
+			if err := h.sessionMgr.CreateSession(w, email); err != nil {
 				log.Printf("[web] session creation error: %v", err)
 				data["Error"] = "Internal error, please try again"
 			} else {
@@ -60,7 +57,7 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			data["Error"] = "Invalid username or password"
+			data["Error"] = "Invalid email or password"
 		}
 	}
 
@@ -77,22 +74,20 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-func (h *AuthHandler) authenticate(username, password string) bool {
-	if username != h.cfg.Web.Admin.Username {
+func (h *AuthHandler) authenticate(email, password string) bool {
+	if email == "" || password == "" {
 		return false
 	}
 
-	// If password hash is set, use bcrypt
-	if h.cfg.Web.Admin.PasswordHash != "" {
-		err := bcrypt.CompareHashAndPassword(
-			[]byte(h.cfg.Web.Admin.PasswordHash),
-			[]byte(password),
-		)
-		return err == nil
+	account, err := h.db.GetAccountByEmail(email)
+	if err != nil || account == nil {
+		return false
 	}
 
-	// Fallback: no hash set means first-run; reject all logins
-	// User must run setup script first
-	log.Println("[web] warning: no password hash set; run setup.sh to configure admin password")
-	return false
+	if !account.IsActive {
+		return false
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(account.PasswordHash), []byte(password))
+	return err == nil
 }

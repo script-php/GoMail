@@ -516,3 +516,234 @@ main.with-sidebar {
 
     .col-auth, .col-size { display: none; }
 }
+
+/* Admin Panel */
+.admin-panel {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.admin-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.admin-header h2 {
+    margin: 0;
+    color: #1e293b;
+}
+
+.admin-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.admin-table th,
+.admin-table td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.admin-table th {
+    background: #f8fafc;
+    font-weight: 600;
+    color: #64748b;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+}
+
+.admin-table td { font-size: 0.9rem; }
+
+.admin-table .actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.inline-form { display: inline; }
+
+.admin-form {
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    max-width: 600px;
+}
+
+.admin-form .form-group {
+    margin-bottom: 16px;
+}
+
+.admin-form label {
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 500;
+    color: #334155;
+}
+
+.admin-form input[type="text"],
+.admin-form input[type="email"],
+.admin-form input[type="password"],
+.admin-form input[type="number"],
+.admin-form select {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+
+.admin-form input[readonly] {
+    background: #f1f5f9;
+    color: #64748b;
+}
+
+.admin-form small {
+    display: block;
+    margin-top: 4px;
+    color: #94a3b8;
+    font-size: 0.8rem;
+}
+
+.admin-form .form-row {
+    display: flex;
+    gap: 16px;
+}
+
+.admin-form .form-row .form-group {
+    flex: 1;
+}
+
+.admin-section {
+    margin-top: 30px;
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.admin-section h3 {
+    margin-top: 0;
+    color: #1e293b;
+}
+
+.admin-nav {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px solid #e2e8f0;
+}
+
+/* DNS records table */
+.dns-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}
+
+.dns-table th,
+.dns-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+    font-size: 0.85rem;
+}
+
+.dns-table th {
+    background: #f8fafc;
+    font-weight: 600;
+    color: #64748b;
+}
+
+.dns-name,
+.dns-value {
+    font-size: 0.8rem;
+    word-break: break-all;
+}
+
+.dns-value-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.dns-comment {
+    color: #64748b;
+    font-size: 0.8rem;
+}
+
+.copy-btn {
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+}
+
+/* Badges */
+.badge-success { background: #dcfce7; color: #166534; }
+.badge-warning { background: #fef9c3; color: #854d0e; }
+.badge-danger { background: #fecaca; color: #991b1b; }
+.badge-info { background: #dbeafe; color: #1e40af; }
+
+.btn-sm {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+}
+
+.btn-danger {
+    background: #ef4444;
+    color: #fff;
+    border: none;
+}
+
+.btn-danger:hover {
+    background: #dc2626;
+}
+
+.empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: #64748b;
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.filter-bar {
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.filter-bar label {
+    font-weight: 500;
+    color: #334155;
+}
+
+.filter-bar select {
+    padding: 6px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+}
+
+.nav-divider {
+    border-top: 1px solid #334155;
+    margin: 8px 12px;
+    list-style: none;
+}
+
+.nav-user {
+    font-size: 0.75rem;
+    color: #94a3b8;
+    padding: 0 15px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
