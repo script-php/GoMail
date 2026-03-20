@@ -22,7 +22,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.toml", "Path to configuration file")
+	configPath := flag.String("config", "config.json", "Path to configuration file")
 	setupMode := flag.Bool("setup", false, "Run first-time setup (generate DKIM keys, print DNS records)")
 	hashPassword := flag.String("hash-password", "", "Generate bcrypt hash for a password")
 	flag.Parse()
@@ -34,7 +34,7 @@ func main() {
 			log.Fatalf("Error hashing password: %v", err)
 		}
 		fmt.Printf("Password hash: %s\n", hash)
-		fmt.Println("Add this to config.toml under [web.admin] password_hash")
+		fmt.Println("Add this to config.json under web.admin.password_hash")
 		return
 	}
 
@@ -193,8 +193,8 @@ func runSetup(cfg *config.Config) {
 	log.Println("Next steps:")
 	log.Println("  1. Set these DNS records")
 	log.Println("  2. Generate a password hash: gomail -hash-password 'your-password'")
-	log.Println("  3. Add the hash to config.toml [web.admin] password_hash")
-	log.Println("  4. Start the server: gomail -config config.toml")
+	log.Println("  3. Add the hash to config.json under web.admin.password_hash")
+	log.Println("  4. Start the server: gomail -config config.json")
 }
 
 func hashPasswordBcrypt(password string) (string, error) {

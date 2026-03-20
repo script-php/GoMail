@@ -1,74 +1,73 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
-
-	"github.com/BurntSushi/toml"
 )
 
-// Config holds all server configuration parsed from config.toml.
+// Config holds all server configuration parsed from config.json.
 type Config struct {
-	Server   ServerConfig   `toml:"server"`
-	SMTP     SMTPConfig     `toml:"smtp"`
-	TLS      TLSConfig      `toml:"tls"`
-	DKIM     DKIMConfig     `toml:"dkim"`
-	Store    StoreConfig    `toml:"store"`
-	Web      WebConfig      `toml:"web"`
-	Delivery DeliveryConfig `toml:"delivery"`
-	DNS      DNSConfig      `toml:"dns"`
-	Security SecurityConfig `toml:"security"`
-	Logging  LoggingConfig  `toml:"logging"`
+	Server   ServerConfig   `json:"server"`
+	SMTP     SMTPConfig     `json:"smtp"`
+	TLS      TLSConfig      `json:"tls"`
+	DKIM     DKIMConfig     `json:"dkim"`
+	Store    StoreConfig    `json:"store"`
+	Web      WebConfig      `json:"web"`
+	Delivery DeliveryConfig `json:"delivery"`
+	DNS      DNSConfig      `json:"dns"`
+	Security SecurityConfig `json:"security"`
+	Logging  LoggingConfig  `json:"logging"`
 }
 
 type ServerConfig struct {
-	Hostname   string `toml:"hostname"`
-	Domain     string `toml:"domain"`
-	AdminEmail string `toml:"admin_email"`
+	Hostname   string `json:"hostname"`
+	Domain     string `json:"domain"`
+	AdminEmail string `json:"admin_email"`
 }
 
 type SMTPConfig struct {
-	ListenAddr     string          `toml:"listen_addr"`
-	MaxMessageSize int64           `toml:"max_message_size"`
-	MaxRecipients  int             `toml:"max_recipients"`
-	ReadTimeout    int             `toml:"read_timeout"`
-	WriteTimeout   int             `toml:"write_timeout"`
-	MaxConnections int             `toml:"max_connections"`
-	RateLimit      RateLimitConfig `toml:"ratelimit"`
+	ListenAddr     string          `json:"listen_addr"`
+	MaxMessageSize int64           `json:"max_message_size"`
+	MaxRecipients  int             `json:"max_recipients"`
+	ReadTimeout    int             `json:"read_timeout"`
+	WriteTimeout   int             `json:"write_timeout"`
+	MaxConnections int             `json:"max_connections"`
+	RateLimit      RateLimitConfig `json:"ratelimit"`
 }
 
 type RateLimitConfig struct {
-	ConnectionsPerMinute int `toml:"connections_per_minute"`
-	MessagesPerMinute    int `toml:"messages_per_minute"`
+	ConnectionsPerMinute int `json:"connections_per_minute"`
+	MessagesPerMinute    int `json:"messages_per_minute"`
 }
 
 type TLSConfig struct {
-	Mode       string `toml:"mode"`
-	CertFile   string `toml:"cert_file"`
-	KeyFile    string `toml:"key_file"`
-	ACMEEmail  string `toml:"acme_email"`
-	ACMEDir    string `toml:"acme_dir"`
-	MinVersion string `toml:"min_version"`
+	Mode       string `json:"mode"`
+	CertFile   string `json:"cert_file"`
+	KeyFile    string `json:"key_file"`
+	ACMEEmail  string `json:"acme_email"`
+	ACMEDir    string `json:"acme_dir"`
+	MinVersion string `json:"min_version"`
 }
 
 type DKIMConfig struct {
-	Selector  string `toml:"selector"`
-	KeyPath   string `toml:"key_path"`
-	Algorithm string `toml:"algorithm"`
+	Selector  string `json:"selector"`
+	KeyPath   string `json:"key_path"`
+	Algorithm string `json:"algorithm"`
 }
 
 type StoreConfig struct {
-	DBPath          string `toml:"db_path"`
-	AttachmentsPath string `toml:"attachments_path"`
+	DBPath          string `json:"db_path"`
+	AttachmentsPath string `json:"attachments_path"`
 }
 
 type WebConfig struct {
-	ListenAddr    string         `toml:"listen_addr"`
-	HTTPAddr      string         `toml:"http_addr"`
-	EnableTLS     *bool          `toml:"enable_tls"`
-	SessionSecret string         `toml:"session_secret"`
-	SessionMaxAge int            `toml:"session_max_age"`
-	Admin         WebAdminConfig `toml:"admin"`
+	ListenAddr    string         `json:"listen_addr"`
+	HTTPAddr      string         `json:"http_addr"`
+	EnableTLS     *bool          `json:"enable_tls"`
+	SessionSecret string         `json:"session_secret"`
+	SessionMaxAge int            `json:"session_max_age"`
+	Admin         WebAdminConfig `json:"admin"`
 }
 
 // IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).
@@ -80,30 +79,30 @@ func (w *WebConfig) IsTLSEnabled() bool {
 }
 
 type WebAdminConfig struct {
-	Username     string `toml:"username"`
-	PasswordHash string `toml:"password_hash"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
 }
 
 type DeliveryConfig struct {
-	QueueWorkers   int   `toml:"queue_workers"`
-	RetryIntervals []int `toml:"retry_intervals"`
-	MaxRetries     int   `toml:"max_retries"`
+	QueueWorkers   int   `json:"queue_workers"`
+	RetryIntervals []int `json:"retry_intervals"`
+	MaxRetries     int   `json:"max_retries"`
 }
 
 type DNSConfig struct {
-	CacheTTL int `toml:"cache_ttl"`
+	CacheTTL int `json:"cache_ttl"`
 }
 
 type SecurityConfig struct {
-	CSRFKey string `toml:"csrf_key"`
+	CSRFKey string `json:"csrf_key"`
 }
 
 type LoggingConfig struct {
-	Level  string `toml:"level"`
-	Format string `toml:"format"`
+	Level  string `json:"level"`
+	Format string `json:"format"`
 }
 
-// Load reads and parses config.toml from the given path.
+// Load reads and parses config.json from the given path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -111,7 +110,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 

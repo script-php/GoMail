@@ -38,7 +38,7 @@ After running `gomail -setup`, paste the content from `keys/dkim_dns_record.txt`
 mail._domainkey.example.com.  IN  TXT  "v=DKIM1; k=ed25519; p=<BASE64_PUBLIC_KEY>"
 ```
 
-**Note:** The selector (`mail`) matches `dkim.selector` in config.toml.
+**Note:** The selector (`mail`) matches `dkim.selector` in config.json.
 
 ## 6. DMARC Record
 Policy for what receivers should do with failed SPF/DKIM checks.

@@ -25,7 +25,7 @@ go build -o gomail .
 ./gomail -hash-password 'your-password'   # Generate password hash
 ```
 
-Edit `config.toml`:
+Edit `config.json`:
 - Set `server.hostname` and `server.domain`
 - Set `web.admin.password_hash` to the bcrypt hash
 - Set `tls.acme_email` for Let's Encrypt
@@ -46,7 +46,7 @@ Type=simple
 User=gomail
 Group=gomail
 WorkingDirectory=/opt/gomail
-ExecStart=/opt/gomail/gomail -config /opt/gomail/config.toml
+ExecStart=/opt/gomail/gomail -config /opt/gomail/config.json
 Restart=always
 RestartSec=5
 
@@ -78,7 +78,7 @@ sudo useradd -r -s /bin/false gomail
 
 # Copy files
 sudo mkdir -p /opt/gomail
-sudo cp gomail config.toml /opt/gomail/
+sudo cp gomail config.json /opt/gomail/
 sudo cp -r web/templates web/static /opt/gomail/web/
 sudo mkdir -p /opt/gomail/data /opt/gomail/keys
 sudo chown -R gomail:gomail /opt/gomail
@@ -121,12 +121,13 @@ GoMail uses Let's Encrypt by default (`tls.mode = "autocert"`).
 - Certificates are auto-renewed
 - Stored in the `tls.acme_dir` path
 
-For manual certificates:
-```toml
-[tls]
-mode = "manual"
-cert_file = "/path/to/fullchain.pem"
-key_file = "/path/to/privkey.pem"
+For manual certificates, set in `config.json`:
+```json
+"tls": {
+  "mode": "manual",
+  "cert_file": "/path/to/fullchain.pem",
+  "key_file": "/path/to/privkey.pem"
+}
 ```
 
 ## Updating
@@ -145,4 +146,4 @@ Back up these paths regularly:
 - `data/mail.db` — The SQLite database with all messages
 - `data/attachments/` — Attachment files
 - `keys/` — DKIM signing keys
-- `config.toml` — Configuration
+- `config.json` — Configuration

@@ -22,7 +22,7 @@ dkim_dns.txt
 attachments/
 
 # Config with secrets
-config.toml
+config.json
 
 # OS files
 .DS_Store
