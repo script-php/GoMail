@@ -1,0 +1,38 @@
+{{define "base.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} - GoMail</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    {{if .Section}}
+    <nav class="sidebar">
+        <div class="logo">
+            <h1>GoMail</h1>
+        </div>
+        <ul class="nav-links">
+            <li class="{{if eq .Section "compose"}}active{{end}}">
+                <a href="/compose">&#9998; Compose</a>
+            </li>
+            <li class="{{if eq .Section "inbox" "inbound"}}active{{end}}">
+                <a href="/inbox">&#9993; Inbox
+                    {{if .Unread}}<span class="badge">{{.Unread}}</span>{{end}}
+                </a>
+            </li>
+            <li class="{{if eq .Section "sent" "outbound"}}active{{end}}">
+                <a href="/sent">&#10148; Sent</a>
+            </li>
+        </ul>
+        <div class="nav-footer">
+            <a href="/logout" class="logout-link">Logout</a>
+        </div>
+    </nav>
+    {{end}}
+    <main class="{{if .Section}}with-sidebar{{end}}">
+        {{template "content" .}}
+    </main>
+    <script src="/static/app.js"></script>
+</body>
+</html>{{end}}

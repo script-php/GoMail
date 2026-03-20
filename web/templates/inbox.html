@@ -1,0 +1,69 @@
+{{define "content"}}
+<div class="content-header">
+    <h2>{{.Title}} <span class="count">({{.Total}})</span></h2>
+</div>
+
+<div class="message-list">
+    {{if .Messages}}
+    <table>
+        <thead>
+            <tr>
+                <th class="col-star"></th>
+                <th class="col-from">{{if eq .Section "sent"}}To{{else}}From{{end}}</th>
+                <th class="col-subject">Subject</th>
+                <th class="col-auth">Auth</th>
+                <th class="col-size">Size</th>
+                <th class="col-date">Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Messages}}
+            <tr class="message-row {{if not .IsRead}}unread{{end}}" data-id="{{.ID}}">
+                <td class="col-star">
+                    <button class="star-btn {{if .IsStarred}}starred{{end}}"
+                            onclick="toggleStar({{.ID}}, event)">
+                        {{if .IsStarred}}&#9733;{{else}}&#9734;{{end}}
+                    </button>
+                </td>
+                <td class="col-from">
+                    <a href="/message/{{.ID}}">
+                        {{if eq $.Section "sent"}}{{truncate .ToAddr 40}}{{else}}{{truncate .FromAddr 40}}{{end}}
+                    </a>
+                    {{if .HasAttachments}}<span class="attachment-icon" title="Has attachments">&#128206;</span>{{end}}
+                </td>
+                <td class="col-subject">
+                    <a href="/message/{{.ID}}">{{truncate .Subject 80}}</a>
+                </td>
+                <td class="col-auth">
+                    <span class="auth-badge spf-{{.SPFResult}}" title="SPF: {{.SPFResult}}">S</span>
+                    <span class="auth-badge dkim-{{.DKIMResult}}" title="DKIM: {{.DKIMResult}}">D</span>
+                    <span class="auth-badge dmarc-{{.DMARCResult}}" title="DMARC: {{.DMARCResult}}">M</span>
+                </td>
+                <td class="col-size">{{formatSize .Size}}</td>
+                <td class="col-date" title="{{.ReceivedAt.Format "2006-01-02 15:04:05"}}">
+                    {{.ReceivedAt.Format "Jan 02 15:04"}}
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+
+    {{if gt .TotalPages 1}}
+    <div class="pagination">
+        {{if gt .Page 1}}
+        <a href="?page={{subtract .Page 1}}">&laquo; Previous</a>
+        {{end}}
+        <span>Page {{.Page}} of {{.TotalPages}}</span>
+        {{if lt .Page .TotalPages}}
+        <a href="?page={{add .Page 1}}">Next &raquo;</a>
+        {{end}}
+    </div>
+    {{end}}
+
+    {{else}}
+    <div class="empty-state">
+        <p>No messages yet.</p>
+    </div>
+    {{end}}
+</div>
+{{end}}

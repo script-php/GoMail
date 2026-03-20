@@ -1,0 +1,39 @@
+# Build output
+gomail
+
+# Database
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# TLS keys and certificates
+keys/
+*.pem
+*.key
+*.crt
+
+# DKIM keys
+dkim_private.pem
+dkim_public.pem
+dkim_dns.txt
+
+# Attachments storage
+attachments/
+
+# Config with secrets
+config.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Go
+vendor/
