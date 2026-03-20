@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -63,7 +64,7 @@ func main() {
 	defer db.Close()
 	log.Println("[main] database opened")
 
-	// Initialize TLS
+	// Initialize TLS (skip for mode "none")
 	certMgr, err := tlsconfig.NewCertManager(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize TLS: %v", err)
@@ -86,10 +87,15 @@ func main() {
 		log.Println("[main] warning: DKIM key not found; run with -setup to generate")
 	}
 
-	// Get TLS config for SMTP
-	smtpTLS, err := certMgr.GetCertificateForSMTP(cfg.Server.Hostname)
-	if err != nil {
-		log.Printf("[main] warning: SMTP TLS config: %v (STARTTLS will be unavailable)", err)
+	// Get TLS config for SMTP (nil when mode=none)
+	var smtpTLS *tls.Config
+	if cfg.TLS.Mode != "none" {
+		smtpTLS, err = certMgr.GetCertificateForSMTP(cfg.Server.Hostname)
+		if err != nil {
+			log.Printf("[main] warning: SMTP TLS config: %v (STARTTLS will be unavailable)", err)
+		}
+	} else {
+		log.Println("[main] SMTP STARTTLS disabled (tls.mode=none)")
 	}
 
 	// Start SMTP inbound server

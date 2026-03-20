@@ -1,0 +1,73 @@
+{
+  "_comment": "GoMail LOCAL TESTING config — no root, no TLS, high ports",
+
+  "server": {
+    "hostname": "localhost",
+    "domain": "localhost",
+    "admin_email": "admin@localhost"
+  },
+
+  "smtp": {
+    "listen_addr": ":2525",
+    "max_message_size": 26214400,
+    "max_recipients": 100,
+    "read_timeout": 60,
+    "write_timeout": 60,
+    "max_connections": 100,
+    "ratelimit": {
+      "connections_per_minute": 60,
+      "messages_per_minute": 30
+    }
+  },
+
+  "tls": {
+    "mode": "none",
+    "cert_file": "",
+    "key_file": "",
+    "acme_email": "",
+    "acme_dir": "./data/certs",
+    "min_version": "1.2"
+  },
+
+  "dkim": {
+    "selector": "mail",
+    "key_path": "./keys/dkim_private.pem",
+    "algorithm": "ed25519"
+  },
+
+  "store": {
+    "db_path": "./data/mail.db",
+    "attachments_path": "./data/attachments"
+  },
+
+  "web": {
+    "listen_addr": ":8443",
+    "http_addr": ":8080",
+    "enable_tls": false,
+    "session_secret": "local-testing-secret-not-for-production-use-1234",
+    "session_max_age": 86400,
+    "admin": {
+      "username": "admin",
+      "password_hash": "$2a$10$xKUZqLFPijh5HM52Di6XlOwHMc0ZRwaVOEaZGT/4RnR86dN055.J."
+    }
+  },
+
+  "delivery": {
+    "queue_workers": 2,
+    "retry_intervals": [60, 300, 900],
+    "max_retries": 3
+  },
+
+  "dns": {
+    "cache_ttl": 300
+  },
+
+  "security": {
+    "csrf_key": "local-testing-csrf-key-not-for-prod"
+  },
+
+  "logging": {
+    "level": "debug",
+    "format": "text"
+  }
+}

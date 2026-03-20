@@ -150,8 +150,8 @@ func (c *Config) Validate() error {
 	if c.TLS.Mode == "" {
 		c.TLS.Mode = "autocert"
 	}
-	if c.TLS.Mode != "autocert" && c.TLS.Mode != "manual" {
-		return fmt.Errorf("tls.mode must be 'autocert' or 'manual'")
+	if c.TLS.Mode != "autocert" && c.TLS.Mode != "manual" && c.TLS.Mode != "none" {
+		return fmt.Errorf("tls.mode must be 'autocert', 'manual', or 'none'")
 	}
 	if c.TLS.Mode == "manual" {
 		if c.TLS.CertFile == "" || c.TLS.KeyFile == "" {

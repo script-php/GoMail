@@ -29,6 +29,11 @@ func NewCertManager(cfg *config.Config) (*CertManager, error) {
 	cm := &CertManager{Mode: cfg.TLS.Mode}
 
 	switch cfg.TLS.Mode {
+	case "none":
+		// No TLS — for local testing or behind a reverse proxy
+		cm.TLSConfig = baseTLS
+		log.Println("[tls] TLS disabled (mode=none)")
+
 	case "autocert":
 		if err := os.MkdirAll(cfg.TLS.ACMEDir, 0700); err != nil {
 			return nil, fmt.Errorf("creating ACME dir: %w", err)
