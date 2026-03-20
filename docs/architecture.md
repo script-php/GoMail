@@ -63,7 +63,20 @@ main.go                          Entry point, wires everything together
   │     ├── server.go            HTTP routing and server setup
   │     ├── middleware.go         Logging, rate limiting, HTTPS redirect
   │     ├── handlers/            Request handlers
+  │     │   ├── auth.go          Login/logout
+  │     │   ├── inbox.go         List inbox/sent messages
+  │     │   ├── message.go       View message, toggle star, delete
+  │     │   ├── compose.go       Compose form and send (validates local recipients)
+  │     │   ├── admin.go         Domain/account CRUD, DKIM key gen, DNS display
+  │     │   └── helpers.go       Shared helper functions
   │     ├── templates/           HTML templates
+  │     │   ├── base.html        Main layout with sidebar
+  │     │   ├── inbox.html       Message list
+  │     │   ├── message.html     Message detail view
+  │     │   ├── compose.html     Compose form
+  │     │   ├── login.html       Login form
+  │     │   ├── admin_*.html     Admin panel pages
+  │     │   └── base.html        Layout shared by all
   │     └── static/              CSS and JavaScript
   │
   ├── mta_sts/                   MTA-STS policy management
@@ -125,3 +138,140 @@ Browser → TCP:443 → HTTPS Server
 - **Strict CSP, HSTS, X-Frame-Options** headers
 - **Rate limiting** on SMTP and web
 - **Session cookies** with HttpOnly, Secure, SameSite
+- **Recipient validation** — SMTP rejects mail to non-existent accounts at RCPT TO time
+
+## Multi-Domain Architecture
+
+GoMail supports multiple domains on a single server instance. Each domain can have multiple email accounts.
+
+### Domain Management
+- Domains stored in `domains` table with DKIM keys
+- SMTP inbound checks recipient domain against active domains
+- Web login accepts email addresses (format: `user@domain`)
+- Admin panel CRUD for add/remove domains
+
+### Per-Domain DKIM
+- Each domain has its own Ed25519 or RSA key pair
+- Keys stored encrypted in database
+- Outbound delivery worker looks up domain and signs with correct key
+- DKIM selector and algorithm configurable per domain
+
+### Account Isolation
+- Accounts belong to a domain (foreign key: `account.domain_id`)
+- Session stores email address, not username
+- Messages filtered by `account_id`, can't see other accounts' mail
+- Web UI shows only current user's emails
+
+### Database Schema
+
+```sql
+domains
+  ├─ id (PRIMARY KEY)
+  ├─ domain (name, unique)
+  ├─ is_active
+  ├─ dkim_selector
+  ├─ dkim_algorithm (ed25519|rsa)
+  ├─ dkim_private_key (PEM format)
+  ├─ dkim_public_key (PEM format)
+  └─ created_at
+
+accounts
+  ├─ id (PRIMARY KEY)
+  ├─ domain_id (FOREIGN KEY → domains)
+  ├─ email (unique)
+  ├─ display_name
+  ├─ password_hash (bcrypt)
+  ├─ is_admin
+  ├─ is_active
+  ├─ quota_bytes
+  └─ created_at
+
+messages
+  ├─ id (PRIMARY KEY)
+  ├─ account_id (FOREIGN KEY → accounts)
+  ├─ message_id (RFC 5322 Message-ID)
+  ├─ direction (inbound|outbound)
+  ├─ mail_from
+  ├─ rcpt_to (JSON array)
+  ├─ from_addr (parsed From: header)
+  ├─ to_addr (parsed To: header)
+  ├─ subject
+  ├─ text_body
+  ├─ html_body
+  ├─ raw_headers
+  ├─ raw_message (full RFC 5322)
+  ├─ is_read
+  ├─ is_starred
+  ├─ sпf_result / dkim_result / dmarc_result
+  ├─ auth_results (full header)
+  └─ received_at
+
+outbound_queue
+  ├─ id (PRIMARY KEY)
+  ├─ message_id (FOREIGN KEY → messages)
+  ├─ mail_from
+  ├─ rcpt_to
+  ├─ raw_message (DKIM-signed)
+  ├─ status (pending|sending|sent|failed)
+  ├─ attempts
+  ├─ max_attempts
+  ├─ next_retry
+  └─ last_error
+
+attachments
+  ├─ id (PRIMARY KEY)
+  ├─ message_id (FOREIGN KEY → messages)
+  ├─ filename
+  ├─ content_type
+  ├─ size
+  ├─ file_path (on disk)
+  └─ created_at
+```
+
+## Local Delivery
+
+When sending between accounts on the same server, GoMail uses local delivery instead of SMTP:
+
+```
+Sender (admin@example.com)
+    ↓
+Compose form
+    ↓
+Recipient validation (account exists on local domain?)
+    ↓
+Build RFC 5322 message
+    ↓
+DKIM sign
+    ↓
+Enqueue for delivery
+    ↓
+Delivery worker detects local recipient
+    ↓
+Parse message, extract subject/body/headers
+    ↓
+Store directly in recipient's inbox (no SMTP)
+    ↓
+No internet delay, instant delivery
+```
+
+Benefits:
+- **Fast** — No network latency
+- **Free** — No external connections
+- **Reliable** — No MX lookup failures
+- **Private** — Mail never leaves your server
+
+## Admin Panel Architecture
+
+The admin panel (`/admin/*` routes) provides full domain/account management:
+
+- **RequireAdmin middleware** — Checks `account.IsAdmin` flag
+- **Domain management** — Add domains, generate DKIM keys, view DNS records
+- **Account management** — Create accounts, assign to domains, set quotas
+- **DNS helper** — Displays all required DNS records (MX, A, SPF, DKIM, DMARC, MTA-STS, TLS-RPT, PTR)
+
+Admin actions:
+1. Add new domain → generates default DKIM selector/algorithm
+2. Generate DKIM keys → creates Ed25519/RSA pair, stores in DB
+3. View DNS records → admin panel displays required DNS for each record type
+4. Create account → assign to domain, set password, quota, admin flag
+5. Disable account → sets `is_active=0`, prevents login and mail acceptance
