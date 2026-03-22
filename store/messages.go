@@ -137,7 +137,19 @@ func (db *DB) CreateAccount(a *Account) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("creating account: %w", err)
 	}
-	return result.LastInsertId()
+	
+	accountID, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	
+	// Create default folders for the account
+	if err := db.DefaultFolders(accountID); err != nil {
+		// Log error but don't fail account creation
+		fmt.Printf("[warn] failed to create default folders for account %d: %v\n", accountID, err)
+	}
+	
+	return accountID, nil
 }
 
 // GetAccount returns an account by ID.
@@ -257,12 +269,12 @@ func (db *DB) CountAccounts() (int, error) {
 func (db *DB) SaveMessage(m *Message) (int64, error) {
 	result, err := db.Exec(`
 		INSERT INTO messages (
-			account_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
+			account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
 			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
 			raw_message, size, has_attachments, is_read, is_starred,
 			spf_result, dkim_result, dmarc_result, auth_results, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.AccountID, m.MessageID, m.Direction, m.MailFrom, m.RcptTo, m.FromAddr, m.ToAddr,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.AccountID, m.FolderID, m.MessageID, m.Direction, m.MailFrom, m.RcptTo, m.FromAddr, m.ToAddr,
 		m.CcAddr, m.ReplyTo, m.Subject, m.TextBody, m.HTMLBody, m.RawHeaders,
 		m.RawMessage, m.Size, boolToInt(m.HasAttachments), boolToInt(m.IsRead),
 		boolToInt(m.IsStarred), m.SPFResult, m.DKIMResult, m.DMARCResult,
@@ -279,12 +291,12 @@ func (db *DB) GetMessage(id, accountID int64) (*Message, error) {
 	m := &Message{}
 	var hasAttach, isRead, isStarred, isDeleted int
 	err := db.QueryRow(`
-		SELECT id, account_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
+		SELECT id, account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
 			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
 			size, has_attachments, is_read, is_starred, is_deleted,
 			spf_result, dkim_result, dmarc_result, auth_results, received_at, created_at
 		FROM messages WHERE id = ? AND account_id = ?`, id, accountID).Scan(
-		&m.ID, &m.AccountID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo, &m.FromAddr,
+		&m.ID, &m.AccountID, &m.FolderID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo, &m.FromAddr,
 		&m.ToAddr, &m.CcAddr, &m.ReplyTo, &m.Subject, &m.TextBody, &m.HTMLBody,
 		&m.RawHeaders, &m.Size, &hasAttach, &isRead, &isStarred, &isDeleted,
 		&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.AuthResults,
@@ -368,10 +380,43 @@ func (db *DB) MarkStarred(id int64, starred bool) error {
 	return err
 }
 
-// DeleteMessage soft-deletes a message.
+// DeleteMessage soft-deletes a message by moving it to trash folder.
 func (db *DB) DeleteMessage(id int64) error {
-	_, err := db.Exec(`UPDATE messages SET is_deleted = 1 WHERE id = ?`, id)
-	return err
+	// First, get the message to find the account
+	m := &Message{}
+	err := db.QueryRow(`SELECT account_id, folder_id FROM messages WHERE id = ?`, id).Scan(&m.AccountID, &m.FolderID)
+	if err != nil {
+		return fmt.Errorf("getting message for delete: %w", err)
+	}
+
+	// Get trash folder for this account
+	trashFolder, err := db.GetFolderByType(m.AccountID, "trash")
+	if err != nil {
+		return fmt.Errorf("getting trash folder: %w", err)
+	}
+	if trashFolder == nil {
+		return fmt.Errorf("trash folder not found for account %d", m.AccountID)
+	}
+
+	// Update counts for old folder if it exists
+	if m.FolderID != nil {
+		db.UpdateFolderCounts(*m.FolderID)
+	}
+
+	// Move message to trash and mark as deleted
+	_, err = db.Exec(`
+		UPDATE messages 
+		SET folder_id = ?, is_deleted = 1 
+		WHERE id = ?
+	`, trashFolder.ID, id)
+	if err != nil {
+		return fmt.Errorf("deleting message: %w", err)
+	}
+
+	// Update trash folder counts
+	db.UpdateFolderCounts(trashFolder.ID)
+
+	return nil
 }
 
 // --- Attachment CRUD ---

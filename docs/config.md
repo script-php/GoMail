@@ -66,7 +66,9 @@ GoMail is configured via a single `config.json` file in JSON format.
   },
 
   "security": {
-    "csrf_key": "random-string-min-32-chars"
+    "csrf_key": "random-string-min-32-chars",
+    "auth_enforcement": "observe",
+    "quarantine_folder": "Spam"
   },
 
   "logging": {
@@ -154,6 +156,8 @@ GoMail is configured via a single `config.json` file in JSON format.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `csrf_key` | string | `` | Secret for CSRF token generation (min 32 chars, auto-generated if empty) |
+| `auth_enforcement` | string | `observe` | Enforce email authentication policies: `none` (skip checks), `observe` (check, don't enforce), `quarantine` (failed auth → Spam folder), `reject` (reject at SMTP) |
+| `quarantine_folder` | string | `Spam` | Mailbox folder name for quarantined emails (when auth_enforcement=quarantine) |
 
 ### logging
 
@@ -161,6 +165,57 @@ GoMail is configured via a single `config.json` file in JSON format.
 |-----|------|---------|-------------|
 | `level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `format` | string | `text` | Log format: `text` or `json` |
+
+## Authentication & Spam Policy
+
+### auth_enforcement Modes
+
+GoMail validates SPF, DKIM, and DMARC signatures on all inbound emails. The `auth_enforcement` setting controls how strict the server is:
+
+| Mode | Behavior | Policy Result | When to Use |
+|------|----------|-------|-----------|
+| `none` | Skip all auth checks | All emails accepted | Testing, development |
+| `observe` | Check and log, deliver all | Logged for monitoring | Initial deployment, learning phase |
+| `quarantine` | Check, route failures to Spam | DMARC p=quarantine → Spam folder | Most installations, gradual enforcement |
+| `reject` | Reject invalid emails at SMTP | DMARC p=reject → 550 error | Strict security, post-DMARC validation |
+
+#### Example: Quarantine Mode
+
+```json
+{
+  "security": {
+    "auth_enforcement": "quarantine",
+    "quarantine_folder": "Spam"
+  }
+}
+```
+
+When an email arrives:
+- **Passes SPF & DKIM** → Goes to Inbox
+- **Fails SPF/DKIM, DMARC p=reject** → Rejected (550 error, never stored)
+- **Fails SPF/DKIM, DMARC p=quarantine** → Stored in Spam folder
+- **Fails SPF/DKIM, no DMARC policy** → Goes to Inbox (permissive default)
+
+### Recommended Configuration Progression
+
+1. **Week 1 - Observe**: `auth_enforcement: "observe"` — Monitor logs, understand rejection rates
+2. **Week 2 - Quarantine**: `auth_enforcement: "quarantine"` — Route failures to Spam, users can review
+3. **Month 2 - Reject**: `auth_enforcement: "reject"` — Strict enforcement, only after confirming legitimate mail passes
+
+### Mailbox Folders
+
+Each account automatically has:
+
+| Folder | Type | Purpose |
+|--------|------|---------|
+| Inbox | System | Inbound messages (default) |
+| Sent | System | Outbound messages sent from this account |
+| Spam | System | Quarantined emails (failed authentication) |
+| Drafts | System | Unsaved compose drafts (future) |
+| Trash | System | Deleted messages (future) |
+| Custom | User | User-created folders (future) |
+
+The `quarantine_folder` config setting only affects folder name; internally it's always the `spam` type.
 
 ## Environment Variables
 

@@ -33,6 +33,7 @@ type Account struct {
 type Message struct {
 	ID             int64     `json:"id"`
 	AccountID      int64     `json:"account_id"`
+	FolderID       *int64    `json:"folder_id,omitempty"`  // NULL = inbox (for legacy compatibility)
 	MessageID      string    `json:"message_id"`
 	Direction      string    `json:"direction"` // "inbound" or "outbound"
 	MailFrom       string    `json:"mail_from"`

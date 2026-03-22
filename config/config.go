@@ -93,7 +93,9 @@ type DNSConfig struct {
 }
 
 type SecurityConfig struct {
-	CSRFKey string `json:"csrf_key"`
+	CSRFKey            string `json:"csrf_key"`
+	AuthEnforcement    string `json:"auth_enforcement"`    // "none", "observe", "quarantine", "reject"
+	QuarantineFolder   string `json:"quarantine_folder"`   // Folder name for failed auth emails (default: "Spam")
 }
 
 type LoggingConfig struct {
@@ -192,6 +194,12 @@ func (c *Config) Validate() error {
 	}
 	if c.DNS.CacheTTL <= 0 {
 		c.DNS.CacheTTL = 300
+	}
+	if c.Security.AuthEnforcement == "" {
+		c.Security.AuthEnforcement = "observe"  // observe, quarantine, reject, none
+	}
+	if c.Security.QuarantineFolder == "" {
+		c.Security.QuarantineFolder = "Spam"
 	}
 	return nil
 }

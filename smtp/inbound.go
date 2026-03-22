@@ -224,6 +224,21 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	// Deliver to each recipient
 	for _, rcpt := range rcptTo {
+		// Enforce DMARC policy before delivery
+		if dmarcResult.Result == "fail" {
+			switch dmarcResult.Policy {
+			case "reject":
+				log.Printf("[smtp] DMARC p=reject: rejecting mail from %s (auth check failed)", fromDomain)
+				continue // Skip delivery for this recipient
+			case "quarantine":
+				log.Printf("[smtp] DMARC p=quarantine: accepting but marking suspicious from %s", fromDomain)
+				// Continue delivery below, but marked as suspicious
+			case "none":
+				log.Printf("[smtp] DMARC p=none: accepting in observation mode from %s", fromDomain)
+				// Continue delivery
+			}
+		}
+
 		// Look up the account for this recipient
 		account, err := s.db.GetAccountByEmail(rcpt)
 		if err != nil {
@@ -237,8 +252,36 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 		accountID := account.ID
 
+		// Determine folder based on auth failure and direction
+		var folderID *int64
+		
+		if dmarcResult.Result == "fail" && (dmarcResult.Policy == "quarantine" || dmarcResult.Policy == "reject") {
+			// Get spam folder for quarantined mail
+			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
+			if err != nil {
+				log.Printf("[smtp] error getting spam folder: %v", err)
+			} else if spamFolder != nil {
+				folderID = &spamFolder.ID
+				log.Printf("[smtp] quarantining mail from %s to spam folder=%d (DMARC %s)", fromDomain, spamFolder.ID, dmarcResult.Policy)
+			} else {
+				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
+			}
+		} else {
+			// Normal inbound messages go to Inbox folder
+			inboxFolder, err := s.db.GetFolderByType(accountID, "inbox")
+			if err != nil {
+				log.Printf("[smtp] error getting inbox folder for account %d: %v", accountID, err)
+			} else if inboxFolder != nil {
+				folderID = &inboxFolder.ID
+				log.Printf("[smtp] assigning inbound mail to inbox folder=%d for account %d", inboxFolder.ID, accountID)
+			} else {
+				log.Printf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID)
+			}
+		}
+
 		msg := &store.Message{
 			AccountID:      accountID,
+			FolderID:       folderID,
 			MessageID:      messageID,
 			Direction:      "inbound",
 			MailFrom:       mailFrom,
@@ -261,10 +304,22 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			ReceivedAt:     time.Now(),
 		}
 
+		// Log what folder_id will be saved
+		if folderID != nil {
+			log.Printf("[smtp] saving message subject=%q with folder_id=%d (rcpt=%s)", parsed.Subject, *folderID, rcpt)
+		} else {
+			log.Printf("[smtp] saving message subject=%q with folder_id=NULL (rcpt=%s)", parsed.Subject, rcpt)
+		}
+
 		msgID, err := s.db.SaveMessage(msg)
 		if err != nil {
 			log.Printf("[smtp] saving message for %s: %v", rcpt, err)
 			continue
+		}
+
+		// Update folder counts
+		if folderID != nil {
+			s.db.UpdateFolderCounts(*folderID)
 		}
 
 		// Save attachments

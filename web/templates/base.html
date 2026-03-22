@@ -16,6 +16,17 @@
             <li class="{{if eq .Section "compose"}}active{{end}}">
                 <a href="/compose">&#9998; Compose</a>
             </li>
+            {{if .Folders}}
+            {{range .Folders}}
+            <li class="{{if eq $.ActiveFolder .ID}}active{{end}}">
+                <a href="/folder/{{.ID}}">
+                    {{if eq .FolderType "inbox"}}&#9993;{{else if eq .FolderType "sent"}}&#10148;{{else if eq .FolderType "spam"}}&#9888;{{else if eq .FolderType "drafts"}}&#128317;{{else if eq .FolderType "trash"}}🗑{{else}}&#128193;{{end}}
+                    {{.Name}}
+                    {{if gt .UnreadCount 0}}<span class="badge">{{.UnreadCount}}</span>{{end}}
+                </a>
+            </li>
+            {{end}}
+            {{else}}
             <li class="{{if eq .Section "inbox" "inbound"}}active{{end}}">
                 <a href="/inbox">&#9993; Inbox
                     {{if .Unread}}<span class="badge">{{.Unread}}</span>{{end}}
@@ -24,6 +35,7 @@
             <li class="{{if eq .Section "sent" "outbound"}}active{{end}}">
                 <a href="/sent">&#10148; Sent</a>
             </li>
+            {{end}}
             {{if and .Account .Account.IsAdmin}}
             <li class="nav-divider"></li>
             <li class="{{if eq .Section "admin"}}active{{end}}">

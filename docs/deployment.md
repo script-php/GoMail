@@ -821,3 +821,102 @@ sudo sysctl -w net.ipv4.tcp_max_syn_backlog=2048
 - Limited capabilities (only CAP_NET_BIND_SERVICE)
 - PrivateTmp, ProtectHome
 - Resource limits
+
+## Email Authentication & Spam Protection
+
+### Auth Enforcement Policy
+
+GoMail validates SPF, DKIM, and DMARC for inbound emails. The server can be configured to enforce these policies:
+
+**Config Option: security.auth_enforcement**
+
+```json
+{
+  "security": {
+    "auth_enforcement": "observe",     // observe, quarantine, reject
+    "quarantine_folder": "Spam"
+  }
+}
+```
+
+**Modes:**
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `none` | No auth checks (not recommended) | Testing only |
+| `observe` | Check auth, log results, but deliver all emails | Monitoring mode, learning phase |
+| `quarantine` | Failed auth → move to Spam folder | Development, gradual rollout |
+| `reject` | Failed auth → reject at SMTP level (550 error) | Strict, production with proper DMARC |
+
+**Recommended Progression:**
+
+1. Start new server in `observe` mode
+2. Monitor logs for `[smtp] DMARC: fail` patterns (1-2 weeks)
+3. Upgrade to `quarantine` once confident in DMARC setup
+4. Use `reject` only after confirming DMARC p=reject in DNS
+
+### Folder System
+
+Each account now has default mailbox folders:
+
+- **Inbox** — Inbound mail (default)
+- **Sent** — Outbound messages
+- **Spam** — Failed authentication or quarantined mail
+- **Drafts** — Unsent compositions (future)
+- **Trash** — Deleted messages (future)
+
+**When DMARC-Policy Says Quarantine:**
+
+If DMARC p=quarantine and auth fails:
+```
+Email received from: villain@bad-domain.com
+DKIM signature: FAIL
+SPF check: FAIL  
+DMARC policy: quarantine
+
+Result: Email stored in "Spam" folder, not Inbox
+User sees: "New message in Spam folder"
+```
+
+**When DMARC-Policy Says Reject:**
+
+If DMARC p=reject and auth fails:
+```
+Email received from: imposter@example.com
+DKIM mismatch: Message claims to be from @example.com but signed with different key
+
+Result: REJECTED at SMTP time
+Sender sees: "550 DMARC policy reject [code]"
+Email never reaches inbox
+```
+
+### Managing Spam Folder
+
+**Web UI:**
+1. Login to https://mail.example.com
+2. Left sidebar shows all folders
+3. Click "Spam" to view quarantined emails
+4. Whitelist trusted senders (future feature)
+5. Permanently delete or move to Inbox
+
+**Database Query - Spam Volume:**
+```bash
+sqlite3 /path/to/mail.db
+SELECT folder.name AS folder, 
+  COUNT(msg.id) AS count,
+  SUM(msg.size) / 1024 / 1024 AS size_mb
+FROM messages msg
+JOIN folders folder ON msg.folder_id = folder.id
+WHERE folder.folder_type = 'spam'
+GROUP BY folder.id;
+```
+
+**Empty Spam After 30 Days:**
+```bash
+sqlite3 /path/to/mail.db << EOF
+DELETE FROM messages WHERE folder_id = (
+  SELECT id FROM folders WHERE folder_type = 'spam'
+) AND created_at < date('now', '-30 days');
+VACUUM;
+EOF
+```

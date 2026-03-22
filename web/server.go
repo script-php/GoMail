@@ -78,6 +78,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
 	mux.Handle("/inbox", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
 	mux.Handle("/sent", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Sent)))
+	mux.Handle("/folder/{folderID}", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.FolderView)))
 	mux.Handle("/message/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.View)))
 	mux.Handle("/message/delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Delete)))
 	mux.Handle("/message/star/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.ToggleStar)))

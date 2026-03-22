@@ -49,6 +49,7 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
 
 	// Check for reply
 	replyTo := r.URL.Query().Get("reply")
@@ -68,6 +69,7 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 		"Section":   "compose",
 		"Prefill":   prefill,
 		"Account":   account,
+		"Folders":   folders,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

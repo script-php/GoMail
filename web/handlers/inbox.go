@@ -78,6 +78,7 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 
 	total, _ := h.db.CountMessages(account.ID, "inbound")
 	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
 
 	data := map[string]interface{}{
 		"Title":      "Inbox",
@@ -89,6 +90,7 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
 		"Section":    "inbox",
 		"Account":    account,
+		"Folders":    folders,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -120,6 +122,7 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 
 	total, _ := h.db.CountMessages(account.ID, "outbound")
 	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
 
 	data := map[string]interface{}{
 		"Title":      "Sent",
@@ -131,6 +134,7 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
 		"Section":    "sent",
 		"Account":    account,
+		"Folders":    folders,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -148,4 +152,65 @@ func (h *InboxHandler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"unread": count})
+}
+
+// FolderView shows messages in a specific folder by folder ID.
+func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	// Extract folder ID from URL path: /folder/{folderID}
+	folderIDStr := r.PathValue("folderID")
+	folderID, err := strconv.ParseInt(folderIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid folder ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get folder and verify it belongs to this account
+	folder, err := h.db.GetFolderByID(folderID)
+	if err != nil || folder == nil || folder.AccountID != account.ID {
+		http.Error(w, "Folder not found", http.StatusNotFound)
+		return
+	}
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	perPage := 50
+
+	// List messages in folder
+	messages, err := h.db.ListMessagesInFolder(folderID, perPage, (page-1)*perPage)
+	if err != nil {
+		log.Printf("[web] folder view error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	total := folder.TotalCount
+	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
+
+	data := map[string]interface{}{
+		"Title":       folder.Name,
+		"Messages":    messages,
+		"Page":        page,
+		"TotalPages":  (total + perPage - 1) / perPage,
+		"Total":       total,
+		"Unread":      unread,
+		"CSRFToken":   h.sessionMgr.GenerateCSRFToken(r),
+		"Section":     "folder",
+		"Account":     account,
+		"Folders":     folders,
+		"ActiveFolder": folderID,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[web] template error: %v", err)
+	}
 }

@@ -201,7 +201,7 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		ReplyTo:        parsed.ReplyTo,
 		Subject:        parsed.Subject,
 		TextBody:       parsed.TextBody,
-		HTMLBody:        parsed.HTMLBody,
+		HTMLBody:       parsed.HTMLBody,
 		RawHeaders:     parsed.RawHeaders,
 		RawMessage:     entry.RawMessage,
 		Size:           int64(len(entry.RawMessage)),
@@ -213,9 +213,23 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		ReceivedAt:     time.Now(),
 	}
 
+	// Assign to inbox folder
+	inboxFolder, err := w.db.GetFolderByType(account.ID, "inbox")
+	if err != nil {
+		return fmt.Errorf("getting inbox folder: %w", err)
+	}
+	if inboxFolder != nil {
+		msg.FolderID = &inboxFolder.ID
+	}
+
 	msgID, err := w.db.SaveMessage(msg)
 	if err != nil {
 		return fmt.Errorf("saving message for %s: %w", rcpt, err)
+	}
+
+	// Update folder counts
+	if msg.FolderID != nil {
+		w.db.UpdateFolderCounts(*msg.FolderID)
 	}
 
 	// Save attachments

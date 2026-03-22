@@ -25,9 +25,23 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at    DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Mailbox folders for organizing messages
+CREATE TABLE IF NOT EXISTS folders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name        TEXT    NOT NULL,                   -- Inbox, Sent, Spam, Drafts, Trash, or custom
+    folder_type TEXT    NOT NULL DEFAULT 'custom',  -- inbox, sent, spam, drafts, trash, custom
+    is_default  INTEGER NOT NULL DEFAULT 0,         -- System folders
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    total_count  INTEGER NOT NULL DEFAULT 0,
+    created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(account_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id      INTEGER NOT NULL DEFAULT 0 REFERENCES accounts(id) ON DELETE CASCADE,
+    folder_id       INTEGER REFERENCES folders(id) ON DELETE SET NULL,  -- NULL means inbox (legacy)
     message_id      TEXT    NOT NULL,                  -- RFC 5322 Message-ID
     direction       TEXT    NOT NULL DEFAULT 'inbound', -- 'inbound' or 'outbound'
     mail_from       TEXT    NOT NULL,               -- Envelope sender
@@ -89,7 +103,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_domains_domain         ON domains(domain);
 CREATE INDEX IF NOT EXISTS idx_accounts_email         ON accounts(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_domain        ON accounts(domain_id);
+CREATE INDEX IF NOT EXISTS idx_folders_account        ON folders(account_id);
+CREATE INDEX IF NOT EXISTS idx_folders_type           ON folders(folder_type);
 CREATE INDEX IF NOT EXISTS idx_messages_account       ON messages(account_id);
+CREATE INDEX IF NOT EXISTS idx_messages_folder        ON messages(folder_id);
 CREATE INDEX IF NOT EXISTS idx_messages_direction     ON messages(direction);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at   ON messages(received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_is_deleted    ON messages(is_deleted);

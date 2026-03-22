@@ -86,12 +86,18 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 	if !msg.IsRead {
 		h.db.MarkRead(id)
 		msg.IsRead = true
+		
+		// Update folder counts since message is now read
+		if msg.FolderID != nil {
+			h.db.UpdateFolderCounts(*msg.FolderID)
+		}
 	}
 
 	// Get attachments
 	attachments, _ := h.db.GetAttachments(id)
 
 	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
 
 	data := map[string]interface{}{
 		"Title":       msg.Subject,
@@ -101,6 +107,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		"CSRFToken":   h.sessionMgr.GenerateCSRFToken(r),
 		"Section":     msg.Direction,
 		"Account":     account,
+		"Folders":     folders,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

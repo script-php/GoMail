@@ -72,8 +72,9 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	// Store the outbound message in the messages table
 	rcptJSON, _ := json.Marshal(to)
 
-	// Parse the message to extract subject, body, headers for the sent view
-	parsed, _ := parser.Parse(rawMessage)
+	// Parse the SIGNED message to extract subject, body, headers for the sent view
+	// (includes DKIM-Signature header if signing succeeded)
+	parsed, _ := parser.Parse(signedMessage)
 	var subject, textBody, htmlBody, rawHeaders, toAddr, ccAddr string
 	if parsed != nil {
 		subject = parsed.Subject
@@ -106,9 +107,20 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 		ReceivedAt: time.Now(),
 	}
 
+	// Assign outbound message to Sent folder
+	sentFolder, err := q.db.GetFolderByType(accountID, "sent")
+	if err == nil && sentFolder != nil {
+		msg.FolderID = &sentFolder.ID
+	}
+
 	msgID, err := q.db.SaveMessage(msg)
 	if err != nil {
 		return fmt.Errorf("saving outbound message: %w", err)
+	}
+
+	// Update sent folder counts
+	if msg.FolderID != nil {
+		q.db.UpdateFolderCounts(*msg.FolderID)
 	}
 
 	// Create a queue entry for each recipient
