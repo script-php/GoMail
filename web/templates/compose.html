@@ -33,6 +33,17 @@
         </div>
 
         <div class="form-group">
+            <label for="priority">Priority</label>
+            <select id="priority" name="priority">
+                <option value="1">Highest</option>
+                <option value="2">High</option>
+                <option value="3" selected>Normal</option>
+                <option value="4">Low</option>
+                <option value="5">Lowest</option>
+            </select>
+        </div>
+
+        <div class="form-group">
             <label for="body">Message</label>
             <textarea id="body" name="body" rows="18" required
                       placeholder="Write your message..."></textarea>

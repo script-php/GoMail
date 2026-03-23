@@ -100,6 +100,10 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	cc := r.FormValue("cc")
 	subject := r.FormValue("subject")
 	body := r.FormValue("body")
+	priority := r.FormValue("priority")
+	if priority == "" {
+		priority = "3" // Default to Normal
+	}
 
 	if to == "" || subject == "" || body == "" {
 		http.Error(w, "To, Subject, and Body are required", http.StatusBadRequest)
@@ -155,6 +159,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
+	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
