@@ -35,7 +35,6 @@ GoMail is configured via a single `config.json` file in JSON format.
   "dkim": {
     "default_selector": "mail",
     "default_algorithm": "ed25519",
-    "keys_dir": "./keys"
   },
 
   "store": {

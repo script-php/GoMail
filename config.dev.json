@@ -1,0 +1,70 @@
+{
+  "_comment": "GoMail Configuration — all settings for your mail server DEVELOPMENT",
+
+  "server": {
+    "hostname": "mail.example.com"
+  },
+
+  "smtp": {
+    "listen_addr": ":25",
+    "max_message_size": 26214400,
+    "max_recipients": 100,
+    "read_timeout": 60,
+    "write_timeout": 60,
+    "max_connections": 100,
+    "ratelimit": {
+      "connections_per_minute": 30,
+      "messages_per_minute": 10
+    }
+  },
+
+  "tls": {
+    "mode": "autocert",
+    "cert_file": "",
+    "key_file": "",
+    "acme_email": "admin@example.com",
+    "acme_dir": "./data/certs",
+    "min_version": "1.2"
+  },
+
+  "dkim": {
+    "default_selector": "mail",
+    "default_algorithm": "ed25519"
+  },
+
+  "store": {
+    "db_path": "./data/mail.db",
+    "attachments_path": "./data/attachments"
+  },
+
+  "web": {
+    "listen_addr": ":443",
+    "http_addr": ":80",
+    "enable_tls": true,
+    "session_secret": "change-me-to-a-random-64-char-string",
+    "session_max_age": 86400,
+    "bootstrap_admin": {
+      "email": "admin@example.com",
+      "password_hash": ""
+    }
+  },
+
+  "delivery": {
+    "queue_workers": 4,
+    "retry_intervals": [60, 300, 900, 3600, 14400, 86400],
+    "max_retries": 6
+  },
+
+  "dns": {
+    "cache_ttl": 300
+  },
+
+  "security": {
+    "csrf_key": "change-me-to-another-random-32-char-string"
+  },
+
+  "logging": {
+    "level": "info",
+    "format": "text"
+  }
+}

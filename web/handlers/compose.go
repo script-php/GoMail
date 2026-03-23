@@ -147,6 +147,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	var msg strings.Builder
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
+	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
 	if cc != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", cc))
