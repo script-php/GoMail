@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS messages (
     dkim_result     TEXT    NOT NULL DEFAULT '',     -- pass/fail/none
     dmarc_result    TEXT    NOT NULL DEFAULT '',     -- pass/fail/none
     auth_results    TEXT    NOT NULL DEFAULT '',     -- Authentication-Results header
+    mdn_requested   INTEGER NOT NULL DEFAULT 0,     -- Boolean: sender requested read receipt
+    mdn_address     TEXT    NOT NULL DEFAULT '',     -- Disposition-Notification-To address
+    mdn_sent        INTEGER NOT NULL DEFAULT 0,     -- Boolean: MDN has been sent
     received_at     DATETIME NOT NULL DEFAULT (datetime('now')),
     created_at      DATETIME NOT NULL DEFAULT (datetime('now'))
 );

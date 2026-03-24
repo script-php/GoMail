@@ -101,6 +101,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	subject := r.FormValue("subject")
 	body := r.FormValue("body")
 	priority := r.FormValue("priority")
+	readReceipt := r.FormValue("read_receipt") == "1"
 	if priority == "" {
 		priority = "3" // Default to Normal
 	}
@@ -160,6 +161,9 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
 	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
+	if readReceipt {
+		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
+	}
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")

@@ -210,6 +210,8 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		DKIMResult:     "none",
 		DMARCResult:    "none",
 		AuthResults:    "local-delivery",
+		MDNRequested:   parsed.MDNRequestedBy != "",
+		MDNAddress:     parsed.MDNRequestedBy,
 		ReceivedAt:     time.Now(),
 	}
 

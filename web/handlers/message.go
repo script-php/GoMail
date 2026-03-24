@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 
+	"gomail/config"
+	"gomail/delivery"
+	"gomail/mdn"
 	"gomail/security"
 	"gomail/store"
 )
@@ -17,12 +20,14 @@ import (
 // MessageHandler handles viewing individual messages.
 type MessageHandler struct {
 	db         *store.DB
+	cfg        *config.Config
+	queue      *delivery.Queue
 	sessionMgr *security.SessionManager
 	templates  *template.Template
 }
 
 // NewMessageHandler creates a message handler.
-func NewMessageHandler(db *store.DB, sm *security.SessionManager) *MessageHandler {
+func NewMessageHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *MessageHandler {
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
@@ -56,6 +61,8 @@ func NewMessageHandler(db *store.DB, sm *security.SessionManager) *MessageHandle
 
 	return &MessageHandler{
 		db:         db,
+		cfg:        cfg,
+		queue:      queue,
 		sessionMgr: sm,
 		templates:  tmpl,
 	}
@@ -82,6 +89,9 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[web] View message: id=%d, MDNRequested=%v, MDNAddress=%s, MDNSent=%v, Config.MDN.Enabled=%s, Config.MDN.Mode=%s",
+		id, msg.MDNRequested, msg.MDNAddress, msg.MDNSent, h.cfg.MDN.Enabled, h.cfg.MDN.Mode)
+
 	// Mark as read
 	if !msg.IsRead {
 		h.db.MarkRead(id)
@@ -90,6 +100,12 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		// Update folder counts since message is now read
 		if msg.FolderID != nil {
 			h.db.UpdateFolderCounts(*msg.FolderID)
+		}
+
+		// Handle MDN (Message Disposition Notification) if requested
+		if msg.MDNRequested && !msg.MDNSent && h.cfg.MDN.Enabled == "yes" {
+			log.Printf("[web] MDN handling - mode=%s, address=%s", h.cfg.MDN.Mode, msg.MDNAddress)
+			h.handleMDN(msg, account)
 		}
 	}
 
@@ -108,6 +124,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		"Section":     msg.Direction,
 		"Account":     account,
 		"Folders":     folders,
+		"MDNMode":     h.cfg.MDN.Mode,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -188,6 +205,96 @@ func (h *MessageHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	h.db.MarkRead(id)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// handleMDN handles Message Disposition Notification based on config mode
+func (h *MessageHandler) handleMDN(msg *store.Message, account *store.Account) {
+	if msg.MDNAddress == "" {
+		log.Printf("[web] handleMDN: no MDN address")
+		return
+	}
+
+	log.Printf("[web] handleMDN: mode=%s, checking auto mode", h.cfg.MDN.Mode)
+	// In auto mode, send MDN immediately
+	if h.cfg.MDN.Mode == "auto" {
+		log.Printf("[web] handleMDN: sending MDN in auto mode")
+		h.sendMDN(msg, account)
+	} else {
+		log.Printf("[web] handleMDN: manual mode, no auto-send")
+	}
+	// In manual mode, MDN will be shown in template and user can send/deny via API
+}
+
+// sendMDN generates and sends an MDN response
+func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) {
+	log.Printf("[web] sendMDN: starting for msg=%d, recipient=%s", msg.ID, msg.MDNAddress)
+	// Generate MDN message
+	mdnBody := mdn.GenerateMDN(
+		msg.MessageID,
+		msg.Subject,
+		account.Email,
+		msg.MDNAddress,
+		h.cfg.Server.Hostname,
+	)
+
+	log.Printf("[web] sendMDN: MDN body generated, enqueueing for delivery")
+	// Enqueue MDN for delivery
+	if err := h.queue.Enqueue(account.Email, []string{msg.MDNAddress}, []byte(mdnBody), account.ID); err != nil {
+		log.Printf("[web] MDN enqueue error: %v", err)
+		return
+	}
+
+	// Mark MDN as sent
+	h.db.MarkMDNSent(msg.ID)
+	log.Printf("[web] MDN sent for message %d to %s", msg.ID, msg.MDNAddress)
+}
+
+// SendMDN handles the API endpoint for manually sending MDN
+func (h *MessageHandler) SendMDN(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/send-mdn/")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid message ID", http.StatusBadRequest)
+		return
+	}
+
+	msg, err := h.db.GetMessage(id, account.ID)
+	if err != nil || msg == nil {
+		http.Error(w, "Message not found", http.StatusNotFound)
+		return
+	}
+
+	if !msg.MDNRequested {
+		http.Error(w, "No MDN requested for this message", http.StatusBadRequest)
+		return
+	}
+
+	if msg.MDNSent {
+		http.Error(w, "MDN already sent", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[web] SendMDN API: sending MDN for message %d", id)
+	h.sendMDN(msg, account)
+
+	// Redirect back to the message
+	http.Redirect(w, r, "/message/"+idStr, http.StatusSeeOther)
 }
 
 // DownloadAttachment serves an attachment file.

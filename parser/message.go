@@ -23,6 +23,7 @@ type ParsedMessage struct {
 	RawHeaders  string
 	Attachments []ParsedAttachment
 	Headers     mail.Header
+	MDNRequestedBy string // Disposition-Notification-To address
 }
 
 // ParsedAttachment holds a decoded attachment from a MIME message.
@@ -47,6 +48,7 @@ func Parse(raw []byte) (*ParsedMessage, error) {
 		Cc:        msg.Header.Get("Cc"),
 		ReplyTo:   msg.Header.Get("Reply-To"),
 		Subject:   msg.Header.Get("Subject"),
+		MDNRequestedBy: cleanAddress(msg.Header.Get("Disposition-Notification-To")),
 	}
 
 	// Parse date
@@ -92,6 +94,17 @@ func Parse(raw []byte) (*ParsedMessage, error) {
 	}
 
 	return parsed, nil
+}
+
+// cleanAddress extracts email address from angle brackets or returns as-is.
+func cleanAddress(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if idx := strings.LastIndex(addr, "<"); idx >= 0 {
+		if end := strings.Index(addr[idx:], ">"); end >= 0 {
+			return addr[idx+1 : idx+end]
+		}
+	}
+	return addr
 }
 
 // cleanMessageID strips angle brackets from Message-ID.

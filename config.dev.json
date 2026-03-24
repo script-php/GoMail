@@ -63,8 +63,14 @@
     "csrf_key": "change-me-to-another-random-32-char-string"
   },
 
+  "mdn": {
+    "enabled": "yes",
+    "mode": "auto"
+  },
+
   "logging": {
     "level": "info",
     "format": "text"
   }
+
 }

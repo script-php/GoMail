@@ -214,6 +214,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	authResults := authBuilder.Build()
 
+	// --- Check for MDN request ---
+	mdnRequested := parsed.MDNRequestedBy != ""
+	mdnAddress := parsed.MDNRequestedBy
+	if mdnRequested {
+		log.Printf("[smtp] MDN requested for %s to %s", parsed.MessageID, mdnAddress)
+	}
+
 	// --- Store the message for each recipient's account ---
 	rcptJSON, _ := json.Marshal(rcptTo)
 
@@ -301,6 +308,8 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			DKIMResult:     dkimResult,
 			DMARCResult:    string(dmarcResult.Result),
 			AuthResults:    authResults,
+			MDNRequested:   mdnRequested,
+			MDNAddress:     mdnAddress,
 			ReceivedAt:     time.Now(),
 		}
 

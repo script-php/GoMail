@@ -38,6 +38,32 @@
                 <span class="{{authClass .Message.DMARCResult}}">DMARC: {{formatAuth .Message.DMARCResult}}</span>
             </div>
             {{end}}
+
+            <!-- DEBUG: MDNRequested={{.Message.MDNRequested}}, MDNMode={{.MDNMode}}, MDNAddress={{.Message.MDNAddress}}, MDNSent={{.Message.MDNSent}} -->
+
+            {{if .Message.MDNRequested}}
+            <div class="meta-row">
+                <!-- DEBUG: MDNMode={{.MDNMode}}, MDNSent={{.Message.MDNSent}} -->
+                {{if eq .MDNMode "auto"}}
+                    <div class="alert alert-success" style="margin-top: 10px;">
+                        ✓ <strong>Read receipt sent automatically</strong>
+                    </div>
+                {{else}}
+                    <div class="alert alert-info" style="margin-top: 10px;">
+                        📬 <strong>Read Receipt Requested:</strong> The sender requested a read receipt notification.
+                        {{if not .Message.MDNSent}}
+                        <form method="POST" action="/api/send-mdn/{{.Message.ID}}" class="inline-form" style="display:inline;">
+                            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                            <button type="submit" class="btn btn-sm btn-primary">Send Receipt</button>
+                        </form>
+                        <button type="submit" class="btn btn-sm btn-secondary" onclick="dismissMDNNotice({{.Message.ID}})">Deny</button>
+                        {{else}}
+                        <span style="color: green;">✓ Receipt sent</span>
+                        {{end}}
+                    </div>
+                {{end}}
+            </div>
+            {{end}}
         </div>
     </div>
 

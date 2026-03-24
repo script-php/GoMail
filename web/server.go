@@ -72,7 +72,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Protected routes
 	inboxHandler := handlers.NewInboxHandler(s.db, s.sessionMgr)
-	messageHandler := handlers.NewMessageHandler(s.db, s.sessionMgr)
+	messageHandler := handlers.NewMessageHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 	composeHandler := handlers.NewComposeHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 
 	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
@@ -88,6 +88,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// API endpoints for JS
 	mux.Handle("/api/mark-read/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.MarkRead)))
+	mux.Handle("/api/send-mdn/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.SendMDN)))
 	mux.Handle("/api/unread-count", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.UnreadCount)))
 
 	// Admin panel (requires admin role)

@@ -272,13 +272,13 @@ func (db *DB) SaveMessage(m *Message) (int64, error) {
 			account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
 			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
 			raw_message, size, has_attachments, is_read, is_starred,
-			spf_result, dkim_result, dmarc_result, auth_results, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			spf_result, dkim_result, dmarc_result, auth_results, mdn_requested, mdn_address, mdn_sent, received_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.AccountID, m.FolderID, m.MessageID, m.Direction, m.MailFrom, m.RcptTo, m.FromAddr, m.ToAddr,
 		m.CcAddr, m.ReplyTo, m.Subject, m.TextBody, m.HTMLBody, m.RawHeaders,
 		m.RawMessage, m.Size, boolToInt(m.HasAttachments), boolToInt(m.IsRead),
 		boolToInt(m.IsStarred), m.SPFResult, m.DKIMResult, m.DMARCResult,
-		m.AuthResults, m.ReceivedAt,
+		m.AuthResults, boolToInt(m.MDNRequested), m.MDNAddress, boolToInt(m.MDNSent), m.ReceivedAt,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("saving message: %w", err)
@@ -289,17 +289,17 @@ func (db *DB) SaveMessage(m *Message) (int64, error) {
 // GetMessage retrieves a single message by ID, scoped to an account.
 func (db *DB) GetMessage(id, accountID int64) (*Message, error) {
 	m := &Message{}
-	var hasAttach, isRead, isStarred, isDeleted int
+	var hasAttach, isRead, isStarred, isDeleted, mdnRequested, mdnSent int
 	err := db.QueryRow(`
 		SELECT id, account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
 			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
 			size, has_attachments, is_read, is_starred, is_deleted,
-			spf_result, dkim_result, dmarc_result, auth_results, received_at, created_at
+			spf_result, dkim_result, dmarc_result, auth_results, mdn_requested, mdn_address, mdn_sent, received_at, created_at
 		FROM messages WHERE id = ? AND account_id = ?`, id, accountID).Scan(
 		&m.ID, &m.AccountID, &m.FolderID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo, &m.FromAddr,
 		&m.ToAddr, &m.CcAddr, &m.ReplyTo, &m.Subject, &m.TextBody, &m.HTMLBody,
 		&m.RawHeaders, &m.Size, &hasAttach, &isRead, &isStarred, &isDeleted,
-		&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.AuthResults,
+		&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.AuthResults, &mdnRequested, &m.MDNAddress, &mdnSent,
 		&m.ReceivedAt, &m.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -312,6 +312,8 @@ func (db *DB) GetMessage(id, accountID int64) (*Message, error) {
 	m.IsRead = isRead == 1
 	m.IsStarred = isStarred == 1
 	m.IsDeleted = isDeleted == 1
+	m.MDNRequested = mdnRequested == 1
+	m.MDNSent = mdnSent == 1
 	return m, nil
 }
 
@@ -377,6 +379,12 @@ func (db *DB) MarkRead(id int64) error {
 // MarkStarred toggles the starred status.
 func (db *DB) MarkStarred(id int64, starred bool) error {
 	_, err := db.Exec(`UPDATE messages SET is_starred = ? WHERE id = ?`, boolToInt(starred), id)
+	return err
+}
+
+// MarkMDNSent marks a message as having its MDN sent.
+func (db *DB) MarkMDNSent(id int64) error {
+	_, err := db.Exec(`UPDATE messages SET mdn_sent = 1 WHERE id = ?`, id)
 	return err
 }
 

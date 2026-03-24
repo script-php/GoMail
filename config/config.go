@@ -17,6 +17,7 @@ type Config struct {
 	Delivery DeliveryConfig `json:"delivery"`
 	DNS      DNSConfig      `json:"dns"`
 	Security SecurityConfig `json:"security"`
+	MDN      MDNConfig      `json:"mdn"`
 	Logging  LoggingConfig  `json:"logging"`
 }
 
@@ -98,6 +99,11 @@ type SecurityConfig struct {
 	QuarantineFolder   string `json:"quarantine_folder"`   // Folder name for failed auth emails (default: "Spam")
 }
 
+type MDNConfig struct {
+	Enabled string `json:"enabled"`  // "yes" or "no" (default: "no")
+	Mode    string `json:"mode"`     // "auto" or "manual" (default: "manual")
+}
+
 type LoggingConfig struct {
 	Level  string `json:"level"`
 	Format string `json:"format"`
@@ -118,6 +124,9 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config validation: %w", err)
 	}
+
+	// Debug logging for MDN config
+	fmt.Printf("[config] Loaded MDN config: Enabled=%s, Mode=%s\n", cfg.MDN.Enabled, cfg.MDN.Mode)
 
 	return &cfg, nil
 }
@@ -200,6 +209,21 @@ func (c *Config) Validate() error {
 	}
 	if c.Security.QuarantineFolder == "" {
 		c.Security.QuarantineFolder = "Spam"
+	}
+	if c.MDN.Enabled == "" {
+		c.MDN.Enabled = "no"
+	}
+	if c.MDN.Mode == "" {
+		fmt.Printf("[config] MDN.Mode was empty, setting to default 'manual'\n")
+		c.MDN.Mode = "manual"
+	} else {
+		fmt.Printf("[config] MDN.Mode was already set to: %s\n", c.MDN.Mode)
+	}
+	if c.MDN.Enabled != "yes" && c.MDN.Enabled != "no" {
+		return fmt.Errorf("mdn.enabled must be 'yes' or 'no'")
+	}
+	if c.MDN.Mode != "auto" && c.MDN.Mode != "manual" {
+		return fmt.Errorf("mdn.mode must be 'auto' or 'manual'")
 	}
 	return nil
 }

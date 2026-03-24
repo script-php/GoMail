@@ -56,6 +56,9 @@ type Message struct {
 	DKIMResult     string    `json:"dkim_result"`
 	DMARCResult    string    `json:"dmarc_result"`
 	AuthResults    string    `json:"auth_results"`
+	MDNRequested   bool      `json:"mdn_requested"`    // Sender requested read receipt
+	MDNAddress     string    `json:"mdn_address"`      // Where to send MDN
+	MDNSent        bool      `json:"mdn_sent"`         // Whether MDN was sent
 	ReceivedAt     time.Time `json:"received_at"`
 	CreatedAt      time.Time `json:"created_at"`
 }
