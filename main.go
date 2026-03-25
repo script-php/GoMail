@@ -119,7 +119,16 @@ func main() {
 			}
 		}()
 	} else {
-		// No TLS: plain HTTP web interface (e.g. behind Cloudflare / reverse proxy)
+		// No TLS: plain HTTP web interface (e.g. behind nginx / reverse proxy)
+		// If autocert is enabled, integrate it into the web server for ACME challenges
+		log.Printf("[main] web.enable_tls=false, checking autocert: mode=%s, hasMgr=%v", cfg.TLS.Mode, certMgr.AutocertMgr != nil)
+		if cfg.TLS.Mode == "autocert" && certMgr.AutocertMgr != nil {
+			webServer.IntegrateAutocert(certMgr.AutocertMgr)
+			log.Printf("[main] autocert integrated for /.well-known/acme-challenge/ (proxy port 80 through nginx)")
+		} else if cfg.TLS.Mode == "autocert" {
+			log.Printf("[main] WARNING: autocert mode but no AutocertMgr (check acme_dir and acme_email config)")
+		}
+
 		go func() {
 			if err := webServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("HTTP server error: %v", err)

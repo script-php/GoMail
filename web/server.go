@@ -10,6 +10,7 @@ import (
 	"gomail/security"
 	"gomail/store"
 	"gomail/web/handlers"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // Server is the HTTP/HTTPS web server for the mail interface.
@@ -65,6 +66,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	policy := mta_sts.DefaultPolicy(s.cfg.Server.Hostname)
 	mux.HandleFunc("/.well-known/mta-sts.txt", handlers.MTASTSHandler(policy))
 
+	// ACME challenge endpoint (let autocert handler deal with it)
+	// This must NOT require authentication so Let's Encrypt can validate
+	mux.HandleFunc("/.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
+		// The autocert.Manager.HTTPHandler wrapper handles actual challenges
+		// If we get here without a valid challenge, return 404
+		log.Printf("[web] ACME fallback route hit: %s (no active challenge)", r.RequestURI)
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("No ACME challenge at this path"))
+	})
+
 	// Auth routes (no session required)
 	authHandler := handlers.NewAuthHandler(s.db, s.sessionMgr)
 	mux.HandleFunc("/login", authHandler.LoginPage)
@@ -105,6 +116,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // GetHTTPServer returns the underlying http.Server for TLS configuration.
 func (s *Server) GetHTTPServer() *http.Server {
 	return s.httpServer
+}
+
+// IntegrateAutocert wraps the HTTP server handler with ACME challenge support.
+// Used when running behind a reverse proxy (nginx handles port 80, proxies to GoMail).
+func (s *Server) IntegrateAutocert(autocertMgr *autocert.Manager) {
+	log.Printf("[web] autocert wrapper integrated - /.well-known/acme-challenge/ will be intercepted")
+	s.httpServer.Handler = autocertMgr.HTTPHandler(s.httpServer.Handler)
 }
 
 // ListenAndServeTLS starts the HTTPS server with the given TLS config.
