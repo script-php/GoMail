@@ -161,6 +161,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
 	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
+	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
 	if readReceipt {
 		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
 	}
@@ -200,4 +201,18 @@ func parseRecipients(s string) []string {
 		}
 	}
 	return result
+}
+
+// priorityToText converts X-Priority numeric value to RFC 2156 Priority text value
+func priorityToText(xPriority string) string {
+	switch xPriority {
+	case "1", "2":
+		return "urgent"
+	case "3":
+		return "normal"
+	case "4", "5":
+		return "non-urgent"
+	default:
+		return "normal" // Default to normal
+	}
 }
