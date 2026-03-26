@@ -151,6 +151,14 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msgID := fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), account.DomainName)
 
 	var msg strings.Builder
+	// Received header (originating from web interface)
+	msg.WriteString(fmt.Sprintf("Received: from %s (web interface)\r\n\tby %s\r\n\twith HTTP\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		"webmail",
+		h.cfg.Server.Hostname,
+		msgID,
+		to,
+		time.Now().Format(time.RFC1123Z),
+	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))

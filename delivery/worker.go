@@ -182,6 +182,16 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		return fmt.Errorf("parsing message: %w", err)
 	}
 
+	// Add inbound Received header for local delivery (for consistency with external emails)
+	receivedHeader := fmt.Sprintf("Received: from %s\r\n\tby %s\r\n\twith local\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		"localhost",
+		w.cfg.Server.Hostname,
+		fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname),
+		rcpt,
+		time.Now().Format(time.RFC1123Z),
+	)
+	rawMessageWithReceived := append([]byte(receivedHeader), entry.RawMessage...)
+
 	messageID := parsed.MessageID
 	if messageID == "" {
 		messageID = fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname)
@@ -203,8 +213,8 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		TextBody:       parsed.TextBody,
 		HTMLBody:       parsed.HTMLBody,
 		RawHeaders:     parsed.RawHeaders,
-		RawMessage:     entry.RawMessage,
-		Size:           int64(len(entry.RawMessage)),
+		RawMessage:     rawMessageWithReceived,
+		Size:           int64(len(rawMessageWithReceived)),
 		HasAttachments: len(parsed.Attachments) > 0,
 		SPFResult:      "none",
 		DKIMResult:     "none",

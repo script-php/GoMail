@@ -186,6 +186,22 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	log.Printf("[smtp] processing message from=%s to=%v ip=%s size=%d",
 		mailFrom, rcptTo, clientIP, len(rawMessage))
 
+	// --- Add Received header ---
+	receivedHeader := fmt.Sprintf("Received: from %s\r\n\tby %s\r\n\twith SMTP%s\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		clientIP,
+		s.cfg.Server.Hostname,
+		func() string {
+			if sess.tls {
+				return "S"
+			}
+			return ""
+		}(),
+		fmt.Sprintf("%d.%s@%s", time.Now().UnixNano(), clientIP, s.cfg.Server.Hostname),
+		strings.Join(rcptTo, ">, <"),
+		time.Now().Format(time.RFC1123Z),
+	)
+	rawMessage = append([]byte(receivedHeader), rawMessage...)
+
 	// --- Authentication checks ---
 	authBuilder := auth.NewAuthResultsBuilder(s.cfg.Server.Hostname)
 
