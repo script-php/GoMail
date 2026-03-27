@@ -1,11 +1,18 @@
 package security
 
-import "net/http"
+import (
+	"net/http"
+
+	"gomail/config"
+)
 
 // SecureHeaders applies security-related HTTP headers to all responses.
 // When tlsEnabled is false, HSTS is omitted (no point forcing HTTPS when not using it).
 func SecureHeaders(next http.Handler, tlsEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Server header identifies the server software
+		w.Header().Set("Server", config.UserAgent())
+
 		// HSTS: only when TLS is enabled
 		if tlsEnabled {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")

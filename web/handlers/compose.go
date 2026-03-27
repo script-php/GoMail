@@ -150,10 +150,13 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	from := account.Email
 	msgID := fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), account.DomainName)
 
+	// Extract real client IP (handles reverse proxies: nginx, Cloudflare, etc.)
+	clientIP := getRealClientIP(r)
+
 	var msg strings.Builder
-	// Received header (originating from web interface)
-	msg.WriteString(fmt.Sprintf("Received: from %s (web interface)\r\n\tby %s\r\n\twith HTTP\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
-		"webmail",
+	// Received header (originating from web interface) - similar to Postfix/Exim
+	msg.WriteString(fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		clientIP,
 		h.cfg.Server.Hostname,
 		msgID,
 		to,
@@ -161,6 +164,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
+	msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
 	if cc != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", cc))
@@ -168,6 +172,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
+	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
 	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
 	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
 	if readReceipt {

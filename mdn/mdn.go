@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"gomail/config"
 )
 
 // GenerateMDN creates a Message Disposition Notification (RFC 3798) in simple text format
@@ -14,13 +16,20 @@ func GenerateMDN(originalMessageID, originalSubject, recipientEmail, senderEmail
 
 	var msg strings.Builder
 
-	// Headers
+	// Received header - GoMail auto-generated MDN
+	msg.WriteString(fmt.Sprintf("Received: by %s (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		hostname,
+		mdnMessageID,
+		senderEmail,
+		now.Format(time.RFC1123Z),
+	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", recipientEmail))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", senderEmail))
 	msg.WriteString(fmt.Sprintf("Subject: Read: %s\r\n", originalSubject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", now.Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", mdnMessageID))
 	msg.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", originalMessageID))
+	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
@@ -49,12 +58,19 @@ func GenerateMDNMultipart(originalMessageID, originalSubject, recipientEmail, se
 	var msg strings.Builder
 
 	// Headers
+	msg.WriteString(fmt.Sprintf("Received: by %s (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+		hostname,
+		mdnMessageID,
+		senderEmail,
+		now.Format(time.RFC1123Z),
+	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", recipientEmail))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", senderEmail))
 	msg.WriteString(fmt.Sprintf("Subject: Read: %s\r\n", originalSubject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", now.Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", mdnMessageID))
 	msg.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", originalMessageID))
+	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString(fmt.Sprintf("Content-Type: multipart/report; report-type=disposition-notification; boundary=\"%s\"\r\n", boundary))
 	msg.WriteString("X-Mailer: GoMail\r\n")

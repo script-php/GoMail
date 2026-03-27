@@ -44,7 +44,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("[main] GoMail starting (hostname=%s)", cfg.Server.Hostname)
+	log.Printf("[main] GoMail %s starting (hostname=%s)", config.Version(), cfg.Server.Hostname)
 
 	// Initialize DNS cache
 	dns.InitCache(cfg.DNS.CacheTTL)
