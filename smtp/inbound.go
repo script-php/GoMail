@@ -230,6 +230,16 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	authResults := authBuilder.Build()
 
+	// --- Add ARC-Authentication-Results header ---
+	// This records authentication results for chain preservation
+	arcAuthResults := auth.ARCAuthenticationResults(
+		s.cfg.Server.Hostname,
+		string(spfResult),
+		string(dkimResult),
+		string(dmarcResult.Result),
+	)
+	rawMessage = append([]byte(arcAuthResults+"\r\n"), rawMessage...)
+
 	// --- Check for MDN request ---
 	mdnRequested := parsed.MDNRequestedBy != ""
 	mdnAddress := parsed.MDNRequestedBy

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"gomail/auth"
 	"gomail/config"
 	"gomail/parser"
 	"gomail/smtp"
@@ -111,13 +112,17 @@ func (w *Worker) processQueue() {
 
 	// Deliver outside the lock
 	var deliveryErr error
+	
+	// Prepare message with ARC headers
+	messageWithARC := w.addARCHeaders(entry.RawMessage, entry.MailFrom, parseRecipientDomain(entry.RcptTo))
+	
 	if w.isLocalRecipient(entry.RcptTo) {
 		deliveryErr = w.deliverLocal(entry)
 	} else {
 		deliveryErr = smtp.SendMail(
 			entry.MailFrom,
 			entry.RcptTo,
-			entry.RawMessage,
+			messageWithARC,
 			w.cfg.Server.Hostname,
 			w.tlsCfg,
 		)
@@ -262,3 +267,76 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		msgID, entry.MailFrom, rcpt, parsed.Subject)
 	return nil
 }
+
+// addARCHeaders attempts to add ARC headers to the message if DKIM key is available
+// Returns the modified message or original if ARC signing fails (non-fatal)
+func (w *Worker) addARCHeaders(msg []byte, mailFrom, rcptDomain string) []byte {
+	// Extract sender domain
+	parts := strings.SplitN(mailFrom, "@", 2)
+	if len(parts) != 2 {
+		return msg // Can't extract domain, return original
+	}
+	senderDomain := parts[1]
+
+	// Get domain config including DKIM info
+	domain, err := w.db.GetDomainByName(senderDomain)
+	if err != nil || domain == nil {
+		// Silently skip if domain not found (not an error for Arc, optional feature)
+		return msg
+	}
+
+	// Check if domain has DKIM key
+	if domain.DKIMPrivateKey == "" || domain.DKIMSelector == "" {
+		// No DKIM key, skip ARC signing (ARC requires valid crypto keys)
+		return msg
+	}
+
+	// Load DKIM signer
+	algorithm := "rsa"
+	if domain.DKIMAlgorithm != "" {
+		algorithm = domain.DKIMAlgorithm
+	}
+
+	signer, err := auth.NewDKIMSignerFromPEM(senderDomain, domain.DKIMSelector, []byte(domain.DKIMPrivateKey), algorithm)
+	if err != nil {
+		log.Printf("[delivery] warning: failed to load DKIM key for ARC: %v", err)
+		return msg
+	}
+
+	// Generate ARC chain
+	// For outbound messages, always use instance=1 (this is the originating hop)
+	// For forwarded messages, use instance returned by auth.NextArcInstance()
+	arcHeaders, err := auth.ARCChainSigner(
+		senderDomain,
+		domain.DKIMSelector,
+		signer.PrivateKey,
+		"pass",   // SPF (originating from GoMail, trusted)
+		"pass",   // DKIM (will sign this message)
+		"pass",   // DMARC
+		w.cfg.Server.Hostname,
+		string(msg),
+		1, // instance: initial sending is i=1
+	)
+	if err != nil {
+		log.Printf("[delivery] warning: ARC signing failed: %v", err)
+		return msg // Return original on ARC signing failure
+	}
+
+	// Prepend ARC headers to message (in order: auth-results, message-signature, seal)
+	// Remove any trailing whitespace and rebuild with ARC headers first
+	arcHeadersStr := strings.Join(arcHeaders, "\r\n") + "\r\n"
+	modifiedMsg := append([]byte(arcHeadersStr), msg...)
+
+	return modifiedMsg
+}
+
+// parseRecipientDomain extracts the domain from an email address
+func parseRecipientDomain(email string) string {
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return ""
+}
+
+
