@@ -175,6 +175,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
 	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
 	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
+	msg.WriteString(fmt.Sprintf("Importance: %s\r\n", priorityToImportance(priority)))
 	if readReceipt {
 		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
 	}
@@ -225,6 +226,20 @@ func priorityToText(xPriority string) string {
 		return "normal"
 	case "4", "5":
 		return "non-urgent"
+	default:
+		return "normal" // Default to normal
+	}
+}
+
+// priorityToImportance converts X-Priority numeric value to RFC 2156 Importance header value
+func priorityToImportance(xPriority string) string {
+	switch xPriority {
+	case "1", "2":
+		return "high"
+	case "3":
+		return "normal"
+	case "4", "5":
+		return "low"
 	default:
 		return "normal" // Default to normal
 	}
