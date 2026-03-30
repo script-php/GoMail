@@ -9,6 +9,7 @@ import (
 	"gomail/mta_sts"
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 	"gomail/web/handlers"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -58,9 +59,10 @@ func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue) *Server 
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
-	// Static files
-	fs := http.FileServer(http.Dir("web/static"))
-	mux.Handle("/static/", http.StripPrefix("/static/", fs))
+	// Static files (from embedded filesystem)
+	mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
+		templates.ServeStatic(w, r)
+	})
 
 	// MTA-STS well-known endpoint
 	policy := mta_sts.DefaultPolicy(s.cfg.Server.Hostname)
@@ -85,6 +87,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	inboxHandler := handlers.NewInboxHandler(s.db, s.sessionMgr)
 	messageHandler := handlers.NewMessageHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 	composeHandler := handlers.NewComposeHandler(s.cfg, s.db, s.queue, s.sessionMgr)
+	forwardHandler := handlers.NewForwardHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 
 	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
 	mux.Handle("/inbox", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
@@ -93,6 +96,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/message/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.View)))
 	mux.Handle("/message/delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Delete)))
 	mux.Handle("/message/star/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.ToggleStar)))
+	mux.Handle("/forward/", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.ForwardPage)))
+	mux.Handle("/forward-send", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.Send)))
 	mux.Handle("/compose", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.ComposePage)))
 	mux.Handle("/send", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.Send)))
 	mux.Handle("/attachment/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.DownloadAttachment)))

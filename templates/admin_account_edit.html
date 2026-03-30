@@ -1,0 +1,72 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>{{if .IsNew}}Add Account{{else}}Edit Account: {{.Acct.Email}}{{end}}</h2>
+        <a href="/admin/accounts" class="btn">&larr; Back to Accounts</a>
+    </div>
+
+    {{if .Message}}
+    <div class="alert alert-success">{{.Message}}</div>
+    {{end}}
+    {{if .Error}}
+    <div class="alert alert-error">{{.Error}}</div>
+    {{end}}
+
+    <form method="POST" class="admin-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+        <div class="form-group">
+            <label for="domain_id">Domain</label>
+            <select id="domain_id" name="domain_id" required>
+                <option value="">Select a domain...</option>
+                {{range .Domains}}
+                <option value="{{.ID}}" {{if eq .ID $.Acct.DomainID}}selected{{end}}>{{.Domain}}</option>
+                {{end}}
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="email">Email Address</label>
+            <input type="email" id="email" name="email" value="{{.Acct.Email}}"
+                   placeholder="user@example.com" required>
+        </div>
+
+        <div class="form-group">
+            <label for="display_name">Display Name</label>
+            <input type="text" id="display_name" name="display_name" value="{{.Acct.DisplayName}}"
+                   placeholder="John Doe">
+        </div>
+
+        <div class="form-group">
+            <label for="password">Password {{if not .IsNew}}(leave blank to keep current){{end}}</label>
+            <input type="password" id="password" name="password"
+                   {{if .IsNew}}required{{end}} autocomplete="new-password">
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="quota_mb">Quota (MB)</label>
+                <input type="number" id="quota_mb" name="quota_mb"
+                       value="{{if .Acct.QuotaBytes}}{{divide .Acct.QuotaBytes 1048576}}{{else}}1024{{end}}"
+                       min="0" step="1">
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="is_admin" value="1" {{if .Acct.IsAdmin}}checked{{end}}>
+                Administrator (can manage domains and accounts)
+            </label>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="is_active" value="1" {{if .Acct.IsActive}}checked{{end}}>
+                Account is active
+            </label>
+        </div>
+
+        <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Account{{else}}Save Changes{{end}}</button>
+    </form>
+</div>
+{{end}}

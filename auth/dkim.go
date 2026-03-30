@@ -137,28 +137,44 @@ func GenerateDKIMKeyPair(algorithm string) (string, string, string, error) {
 func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 	// Split headers and body
 	headerEnd := bytes.Index(message, []byte("\r\n\r\n"))
+	separatorLen := 4
 	if headerEnd == -1 {
 		headerEnd = bytes.Index(message, []byte("\n\n"))
+		separatorLen = 2
 		if headerEnd == -1 {
 			return nil, fmt.Errorf("cannot find end of headers")
 		}
 	}
 
-	headers := string(message[:headerEnd])
-	body := message[headerEnd:]
+	body := message[headerEnd+separatorLen:]  // Skip the separator
 
-	// Canonicalize body (simple: ensure trailing CRLF)
-	bodyCanon := canonicalizeBodySimple(body)
-
-	// Body hash
-	bodyHash := sha256.Sum256(bodyCanon)
-	bh := base64.StdEncoding.EncodeToString(bodyHash[:])
+	// Canonicalize body (relaxed: handle whitespace properly for transit)
+	bodyCanonBytes := bodyHashFunc(false, body) // false = not simple, so relaxed
+	bh := base64.StdEncoding.EncodeToString(bodyCanonBytes)
 
 	// Headers to sign
 	signHeaders := []string{"from", "to", "subject", "date", "message-id"}
 	var signedHeaderNames []string
 
-	headerLines := parseHeaderLines(headers)
+	// Parse headers properly without destroying CRLF
+	var headerLines []*headerRaw
+	lines := bytes.Split(message[:headerEnd], []byte{'\n'})
+	for _, line := range lines {
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' {
+			continue // Skip continuation lines for header names
+		}
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx == -1 {
+			continue
+		}
+		keyStr := strings.TrimSpace(string(line[:colonIdx]))
+		headerLines = append(headerLines, &headerRaw{
+			key:  keyStr,
+			lkey: strings.ToLower(keyStr),
+		})
+	}
+
 	for _, sh := range signHeaders {
 		for _, hl := range headerLines {
 			if strings.EqualFold(hl.key, sh) {
@@ -178,7 +194,7 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 	expiration := timestamp + 7*86400 // 7 days
 
 	dkimHeader := fmt.Sprintf(
-		"DKIM-Signature: v=1; a=%s; c=relaxed/simple; d=%s; s=%s; t=%d; x=%d; h=%s; bh=%s; b=",
+		"DKIM-Signature: v=1; a=%s; c=relaxed/relaxed; d=%s; s=%s; t=%d; x=%d; h=%s; bh=%s; b=",
 		algo, s.Domain, s.Selector, timestamp, expiration,
 		strings.Join(signedHeaderNames, ":"), bh,
 	)
@@ -188,14 +204,20 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 	for _, sh := range signedHeaderNames {
 		for _, hl := range headerLines {
 			if strings.EqualFold(hl.key, sh) {
-				dataToSign.WriteString(canonicalizeHeaderRelaxed(hl.raw))
-				dataToSign.WriteString("\r\n")
+				canonized, err := relaxedCanonicalHeader(string(hl.raw))
+				if err == nil {
+					dataToSign.WriteString(canonized)
+					dataToSign.WriteString("\r\n")
+				}
 				break
 			}
 		}
 	}
 	// Add DKIM-Signature header itself (without b= value, no trailing CRLF)
-	dataToSign.WriteString(canonicalizeHeaderRelaxed(dkimHeader))
+	canonized, err := relaxedCanonicalHeader(dkimHeader)
+	if err == nil {
+		dataToSign.WriteString(canonized)
+	}
 
 	// Sign
 	hash := sha256.Sum256(dataToSign.Bytes())
@@ -227,35 +249,30 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 }
 
 // VerifyDKIM performs basic DKIM verification on an inbound message.
-// Returns "pass", "fail", or "none".
+// VerifyDKIM verifies a DKIM signature on an email message.
+// Returns: (status, detail) where status is "pass", "fail", or "none"
 func VerifyDKIM(message []byte) (string, string) {
-	headerEnd := bytes.Index(message, []byte("\r\n\r\n"))
-	if headerEnd == -1 {
-		headerEnd = bytes.Index(message, []byte("\n\n"))
-		if headerEnd == -1 {
-			return "none", "no headers found"
-		}
+	// Parse the message into headers and body using proper line-ending preservation
+	hdrs, bodyOffset, err := parseMessageHeaders(message)
+	if err != nil {
+		return "none", "malformed headers"
 	}
 
-	headers := string(message[:headerEnd])
-	body := message[headerEnd:]
-
 	// Find DKIM-Signature header
-	headerLines := parseHeaderLines(headers)
-	var dkimSig string
-	for _, hl := range headerLines {
-		if strings.EqualFold(hl.key, "DKIM-Signature") {
-			dkimSig = hl.value
+	var dkimSig *headerRaw
+	for _, h := range hdrs {
+		if strings.EqualFold(h.key, "dkim-signature") {
+			dkimSig = h
 			break
 		}
 	}
 
-	if dkimSig == "" {
+	if dkimSig == nil {
 		return "none", "no DKIM-Signature header"
 	}
 
-	// Parse DKIM tag=value pairs
-	tags := parseDKIMTags(dkimSig)
+	// Parse DKIM tags
+	tags := parseDKIMTags(dkimSig.value)
 
 	domain := tags["d"]
 	selector := tags["s"]
@@ -263,37 +280,54 @@ func VerifyDKIM(message []byte) (string, string) {
 	headersToVerify := tags["h"]
 	bodyHashB64 := tags["bh"]
 	sigB64 := tags["b"]
+	canonMethod := tags["c"]
 
 	if domain == "" || selector == "" || sigB64 == "" {
 		return "fail", "missing required DKIM tags"
 	}
 
-	// Verify body hash
-	bodyCanon := canonicalizeBodySimple(body)
-	bodyHash := sha256.Sum256(bodyCanon)
-	expectedBH := base64.StdEncoding.EncodeToString(bodyHash[:])
+	// Parse canonicalization (default: simple/simple)
+	headerSimple := true
+	bodySimple := true
+	if canonMethod != "" {
+		parts := strings.Split(canonMethod, "/")
+		if len(parts) >= 1 {
+			headerSimple = strings.EqualFold(strings.TrimSpace(parts[0]), "simple")
+		}
+		if len(parts) >= 2 {
+			bodySimple = strings.EqualFold(strings.TrimSpace(parts[1]), "simple")
+		}
+	}
+
+	// Extract body and verify body hash
+	body := message[bodyOffset:]
+	bodyHash := bodyHashFunc(bodySimple, body)
+	expectedBH := base64.StdEncoding.EncodeToString(bodyHash)
 	if bodyHashB64 != expectedBH {
 		return "fail", "body hash mismatch"
 	}
 
-	// Lookup public key
+	// Get public key from DNS
 	pubKeyRecord := fmt.Sprintf("%s._domainkey.%s", selector, domain)
 	txtRecords, err := net.LookupTXT(pubKeyRecord)
 	if err != nil {
-		return "fail", fmt.Sprintf("DNS lookup failed for %s: %v", pubKeyRecord, err)
+		return "fail", fmt.Sprintf("DNS lookup failed: %v", err)
+	}
+
+	if len(txtRecords) == 0 {
+		return "fail", "no DKIM public key in DNS"
 	}
 
 	var pubKeyB64 string
 	for _, txt := range txtRecords {
-		if strings.Contains(txt, "p=") {
-			dkimTags := parseDKIMTags(txt)
-			pubKeyB64 = dkimTags["p"]
+		dkimTags := parseDKIMTags(txt)
+		if pubKeyB64 = dkimTags["p"]; pubKeyB64 != "" {
 			break
 		}
 	}
 
 	if pubKeyB64 == "" {
-		return "fail", "no public key in DNS"
+		return "fail", "no public key in DNS record"
 	}
 
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
@@ -301,54 +335,67 @@ func VerifyDKIM(message []byte) (string, string) {
 		return "fail", "invalid public key encoding"
 	}
 
-	// Reconstruct signed data
+	// Build the data to be signed. Use MOX's approach:
+	// Store headers in reverse order map, then pull from them as needed.
+	revHdrs := make(map[string][]*headerRaw)
+	for _, h := range hdrs {
+		lkey := strings.ToLower(h.key)
+		// Prepend to list (reverse order)
+		revHdrs[lkey] = append([]*headerRaw{h}, revHdrs[lkey]...)
+	}
+
 	var dataToSign bytes.Buffer
-	signHeaderNames := strings.Split(headersToVerify, ":")
-	for _, sh := range signHeaderNames {
-		sh = strings.TrimSpace(sh)
-		for _, hl := range headerLines {
-			if strings.EqualFold(hl.key, sh) {
-				dataToSign.WriteString(canonicalizeHeaderRelaxed(hl.raw))
-				dataToSign.WriteString("\r\n")
-				break
-			}
+	headersToSign := strings.Split(headersToVerify, ":")
+
+	for _, headerName := range headersToSign {
+		headerName = strings.TrimSpace(headerName)
+		lkey := strings.ToLower(headerName)
+
+		hdrsForKey := revHdrs[lkey]
+		if len(hdrsForKey) == 0 {
+			continue
 		}
+
+		// Take first from list and remove it
+		h := hdrsForKey[0]
+		revHdrs[lkey] = hdrsForKey[1:]
+
+		// Canonicalize header
+		hval := string(h.raw)
+		if !headerSimple {
+			hval, _ = relaxedCanonicalHeader(hval)
+		}
+
+		dataToSign.WriteString(hval)
+		dataToSign.WriteString("\r\n")
 	}
 
-	// Add DKIM-Signature with empty b=
-	for _, hl := range headerLines {
-		if strings.EqualFold(hl.key, "DKIM-Signature") {
-			stripped := stripDKIMB(hl.raw)
-			dataToSign.WriteString(canonicalizeHeaderRelaxed(stripped))
-			break
-		}
+	// Add DKIM-Signature header with b= value removed
+	dkimVerifySig := stripDKIMBValue(string(dkimSig.raw))
+	if !headerSimple {
+		dkimVerifySig, _ = relaxedCanonicalHeader(dkimVerifySig)
 	}
+	dataToSign.WriteString(dkimVerifySig)
 
+	// Verify signature
 	hash := sha256.Sum256(dataToSign.Bytes())
-
 	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
 	if err != nil {
 		return "fail", "invalid signature encoding"
 	}
 
-	// Verify based on algorithm
+	// Determine algorithm and verify
 	switch {
 	case strings.Contains(algo, "ed25519"):
-		if len(pubKeyBytes) == ed25519.PublicKeySize {
+		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+		if err == nil {
+			if edPub, ok := key.(ed25519.PublicKey); ok {
+				if ed25519.Verify(edPub, hash[:], sigBytes) {
+					return "pass", "DKIM signature valid"
+				}
+			}
+		} else if len(pubKeyBytes) == ed25519.PublicKeySize {
 			if ed25519.Verify(ed25519.PublicKey(pubKeyBytes), hash[:], sigBytes) {
-				return "pass", "DKIM signature valid"
-			}
-		} else {
-			// Try parsing as PKIX
-			key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
-			if err != nil {
-				return "fail", "cannot parse ed25519 public key"
-			}
-			edPub, ok := key.(ed25519.PublicKey)
-			if !ok {
-				return "fail", "key is not ed25519"
-			}
-			if ed25519.Verify(edPub, hash[:], sigBytes) {
 				return "pass", "DKIM signature valid"
 			}
 		}
@@ -398,109 +445,295 @@ func GenerateDKIMKeys(keyDir string) error {
 
 // --- Helper functions ---
 
-type headerLine struct {
-	key   string
-	value string
-	raw   string
+type headerRaw struct {
+	key   string   // Original case
+	lkey  string   // Lowercase key
+	value string   // Value (unfolded)
+	raw   []byte   // Complete header including key, colon, and original formatting
 }
 
-func parseHeaderLines(headers string) []headerLine {
-	var lines []headerLine
-	// Normalize line endings
-	headers = strings.ReplaceAll(headers, "\r\n", "\n")
-	rawLines := strings.Split(headers, "\n")
+// parseMessageHeaders parses headers from a message, preserving CRLF structure.
+// Returns headers slice and byte offset where body starts.
+func parseMessageHeaders(message []byte) ([]*headerRaw, int, error) {
+	// Find header/body boundary
+	headerEnd := bytes.Index(message, []byte("\r\n\r\n"))
+	if headerEnd == -1 {
+		headerEnd = bytes.Index(message, []byte("\n\n"))
+		if headerEnd == -1 {
+			return nil, 0, fmt.Errorf("no header/body boundary found")
+		}
+		// For \n\n boundary, body starts after
+		return parseHeadersFromBytes(message[:headerEnd]), headerEnd + 2, nil
+	}
 
-	var current string
-	for _, line := range rawLines {
-		if line == "" {
+	// Parse headers with proper CRLF preservation
+	hdrs := parseHeadersFromBytes(message[:headerEnd])
+	return hdrs, headerEnd + 4, nil
+}
+
+func parseHeadersFromBytes(headerBytes []byte) []*headerRaw {
+	var hdrs []*headerRaw
+	i := 0
+	
+	for i < len(headerBytes) {
+		// Check for empty line (end of headers)
+		if i+1 <= len(headerBytes) && headerBytes[i] == '\r' && i+1 < len(headerBytes) && headerBytes[i+1] == '\n' {
+			break
+		}
+		if headerBytes[i] == '\n' {
+			break
+		}
+		
+		// Read this complete header line (including continuations)
+		lineStart := i
+		lineEnd := i
+		
+		// Scan to end of header, including folded lines
+		for i < len(headerBytes) {
+			// Look for CRLF
+			if i+1 < len(headerBytes) && headerBytes[i] == '\r' && headerBytes[i+1] == '\n' {
+				lineEnd = i + 2
+				i = lineEnd
+				// Check if next line is continuation (starts with space or tab)
+				if i < len(headerBytes) && (headerBytes[i] == ' ' || headerBytes[i] == '\t') {
+					continue
+				}
+				break
+			}
+			// Look for LF only
+			if headerBytes[i] == '\n' {
+				lineEnd = i + 1
+				i = lineEnd
+				// Check if next line is continuation
+				if i < len(headerBytes) && (headerBytes[i] == ' ' || headerBytes[i] == '\t') {
+					continue
+				}
+				break
+			}
+			i++
+		}
+		
+		// If we reached EOF without finding line ending, use rest of buffer
+		if lineEnd == lineStart {
+			lineEnd = len(headerBytes)
+		}
+		
+		if lineEnd <= lineStart {
+			break
+		}
+		
+		// Extract line and trim line endings
+		line := bytes.TrimRight(headerBytes[lineStart:lineEnd], "\r\n")
+		
+		if len(line) == 0 {
+			break
+		}
+		
+		// Find colon
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx == -1 {
 			continue
 		}
-		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
-			// Continuation line
-			current += "\r\n" + line
-			continue
+		
+		keyPart := strings.TrimSpace(string(line[:colonIdx]))
+		valuePart := strings.TrimSpace(string(line[colonIdx+1:]))
+		
+		hdrs = append(hdrs, &headerRaw{
+			key:   keyPart,
+			lkey:  strings.ToLower(keyPart),
+			value: valuePart,
+			raw:   line,
+		})
+	}
+	
+	return hdrs
+}
+
+// bodyHashFunc calculates body hash according to RFC 6376
+// Returns []byte specifically (not [32]byte)
+func bodyHashFunc(simpleCanon bool, body []byte) []byte {
+	if simpleCanon {
+		return bodyHashSimple(body)
+	}
+	return bodyHashRelaxed(body)
+}
+
+// bodyHashSimple implements simple body canonicalization (RFC 6376 section 3.7.1)
+// Ensure body ends with exactly one trailing CRLF
+func bodyHashSimple(body []byte) []byte {
+	// Trim all CRLF/LF from end
+	body = bytes.TrimRight(body, "\r\n")
+	if len(body) == 0 {
+		h := sha256.Sum256([]byte("\r\n"))
+		return h[:]
+	}
+	// Add exactly one CRLF
+	result := append(body, '\r', '\n')
+	h := sha256.Sum256(result)
+	return h[:]
+}
+
+// bodyHashRelaxed implements relaxed body canonicalization (RFC 6376 section 3.7.2)
+func bodyHashRelaxed(body []byte) []byte {
+	// Split into lines
+	lines := bytes.Split(body, []byte("\n"))
+
+	var processed [][]byte
+	for _, line := range lines {
+		// Remove trailing \r if present
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
 		}
-		if current != "" {
-			lines = append(lines, makeHeaderLine(current))
+
+		// Remove trailing whitespace
+		line = bytes.TrimRight(line, " \t")
+
+		// Collapse internal whitespace
+		if len(line) > 0 {
+			line = collapseWSP(line)
 		}
-		current = line
+
+		processed = append(processed, line)
 	}
-	if current != "" {
-		lines = append(lines, makeHeaderLine(current))
+
+	// Remove all trailing empty lines
+	for len(processed) > 0 && len(processed[len(processed)-1]) == 0 {
+		processed = processed[:len(processed)-1]
 	}
-	return lines
+
+	if len(processed) == 0 {
+		h := sha256.Sum256([]byte("\r\n"))
+		return h[:]
+	}
+
+	// Rejoin with CRLF
+	result := bytes.Join(processed, []byte("\r\n"))
+	result = append(result, '\r', '\n')
+	h := sha256.Sum256(result)
+	return h[:]
 }
 
-func makeHeaderLine(raw string) headerLine {
-	idx := strings.IndexByte(raw, ':')
+// collapseWSP replaces sequences of space/tab with a single space
+func collapseWSP(line []byte) []byte {
+	var result []byte
+	prev := byte(0)
+	for _, b := range line {
+		if b == ' ' || b == '\t' {
+			if prev != ' ' {
+				result = append(result, ' ')
+				prev = ' '
+			}
+		} else {
+			result = append(result, b)
+			prev = b
+		}
+	}
+	return result
+}
+
+// relaxedCanonicalHeader returns a relaxed canonical form of a header.
+// From RFC 6376 section 3.7.2:
+// - Ignore all whitespace at end of lines
+// - Reduce all sequences of WSP within a line to a single SP
+// Returns with CRLF if present in original, without if not.
+func relaxedCanonicalHeader(header string) (string, error) {
+	// Split on first colon
+	idx := strings.Index(header, ":")
 	if idx == -1 {
-		return headerLine{raw: raw}
+		return "", fmt.Errorf("invalid header: no colon")
 	}
-	return headerLine{
-		key:   strings.TrimSpace(raw[:idx]),
-		value: strings.TrimSpace(raw[idx+1:]),
-		raw:   raw,
-	}
-}
 
-func canonicalizeBodySimple(body []byte) []byte {
-	// Simple canonicalization: ensure body ends with single CRLF
-	b := bytes.TrimRight(body, "\r\n")
-	if len(b) == 0 {
-		return []byte("\r\n")
-	}
-	return append(b, '\r', '\n')
-}
-
-func canonicalizeHeaderRelaxed(header string) string {
-	idx := strings.IndexByte(header, ':')
-	if idx == -1 {
-		return header
-	}
 	key := strings.ToLower(strings.TrimSpace(header[:idx]))
 	value := header[idx+1:]
-	// Unfold and compress whitespace
+
+	// Unfold (remove line breaks)
 	value = strings.ReplaceAll(value, "\r\n", "")
 	value = strings.ReplaceAll(value, "\n", "")
-	value = strings.Join(strings.Fields(value), " ")
-	value = strings.TrimSpace(value)
-	return key + ":" + value
+
+	// Replace sequences of WSP with single space
+	value = collapseWhitespace(value)
+
+	// Trim leading and trailing whitespace from value
+	value = strings.Trim(value, " \t")
+
+	return key + ":" + value, nil
+}
+
+// collapseWhitespace replaces sequences of space/tab with single space
+func collapseWhitespace(s string) string {
+	var result []byte
+	prev := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' {
+			if prev != ' ' {
+				result = append(result, ' ')
+				prev = ' '
+			}
+		} else {
+			result = append(result, c)
+			prev = c
+		}
+	}
+	return string(result)
+}
+
+// stripDKIMBValue removes the value from the "b=" field in a DKIM-Signature header.
+// Returns the header with "b=" but no value.
+func stripDKIMBValue(header string) string {
+	// Find "b="
+	bIdx := strings.Index(header, "b=")
+	if bIdx == -1 {
+		// No b= field, return as-is
+		return header
+	}
+
+	// Find the end of the b= value (next semicolon or end of line)
+	rest := header[bIdx+2:]
+	semiIdx := strings.IndexByte(rest, ';')
+
+	if semiIdx == -1 {
+		// b= goes to the end, remove everything after
+		return header[:bIdx+2]
+	}
+
+	// b= value ends at semicolon
+	return header[:bIdx+2] + rest[semiIdx:]
 }
 
 func parseDKIMTags(s string) map[string]string {
 	tags := make(map[string]string)
-	// Remove whitespace from the value
+	// Remove all newlines and folding
 	s = strings.ReplaceAll(s, "\r\n", "")
 	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+
+	// Split on semicolons
 	parts := strings.Split(s, ";")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
 		idx := strings.IndexByte(part, '=')
 		if idx == -1 {
 			continue
 		}
+
 		key := strings.TrimSpace(part[:idx])
 		value := strings.TrimSpace(part[idx+1:])
-		// Remove whitespace from value (e.g., multiline base64)
+		// Remove internal whitespace from value
 		value = strings.Join(strings.Fields(value), "")
 		tags[key] = value
 	}
+
 	return tags
 }
 
 func stripDKIMB(header string) string {
-	// Remove the b= value from DKIM-Signature for verification
-	idx := strings.Index(header, "b=")
-	if idx == -1 {
-		return header
-	}
-	// Find the end of b= value (next ; or end of string)
-	rest := header[idx+2:]
-	semiIdx := strings.IndexByte(rest, ';')
-	if semiIdx == -1 {
-		return header[:idx+2]
-	}
-	return header[:idx+2] + rest[semiIdx:]
+	// This function name is misleading - just use stripDKIMBValue
+	return stripDKIMBValue(header)
 }
 
 // Ensure sorted unused

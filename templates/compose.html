@@ -1,0 +1,65 @@
+{{define "content"}}
+<div class="content-header">
+    <h2>Compose</h2>
+</div>
+
+<div class="compose-form">
+    <form method="POST" action="/send">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+        <div class="form-group">
+            <label for="from">From</label>
+            <input type="text" id="from" value="{{.From}}" disabled>
+        </div>
+
+        <div class="form-group">
+            <label for="to">To</label>
+            <input type="email" id="to" name="to" required
+                   placeholder="recipient@example.com"
+                   value="{{if .Prefill}}{{index .Prefill "to"}}{{end}}">
+        </div>
+
+        <div class="form-group">
+            <label for="cc">Cc</label>
+            <input type="text" id="cc" name="cc"
+                   placeholder="cc@example.com (optional)">
+        </div>
+
+        <div class="form-group">
+            <label for="subject">Subject</label>
+            <input type="text" id="subject" name="subject" required
+                   placeholder="Subject"
+                   value="{{if .Prefill}}{{index .Prefill "subject"}}{{end}}">
+        </div>
+
+        <div class="form-group">
+            <label for="priority">Priority</label>
+            <select id="priority" name="priority">
+                <option value="1">Highest</option>
+                <option value="2">High</option>
+                <option value="3" selected>Normal</option>
+                <option value="4">Low</option>
+                <option value="5">Lowest</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="read_receipt" name="read_receipt" value="1">
+                Request read receipt
+            </label>
+        </div>
+
+        <div class="form-group">
+            <label for="body">Message</label>
+            <textarea id="body" name="body" rows="18" required
+                      placeholder="Write your message..."></textarea>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Send</button>
+            <a href="/inbox" class="btn btn-secondary">Cancel</a>
+        </div>
+    </form>
+</div>
+{{end}}

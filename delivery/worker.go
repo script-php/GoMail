@@ -117,7 +117,7 @@ func (w *Worker) processQueue() {
 	messageWithARC := w.addARCHeaders(entry.RawMessage, entry.MailFrom, parseRecipientDomain(entry.RcptTo))
 	
 	if w.isLocalRecipient(entry.RcptTo) {
-		deliveryErr = w.deliverLocal(entry)
+		deliveryErr = w.deliverLocal(entry, messageWithARC)
 	} else {
 		deliveryErr = smtp.SendMail(
 			entry.MailFrom,
@@ -167,7 +167,7 @@ func (w *Worker) isLocalRecipient(rcpt string) bool {
 }
 
 // deliverLocal delivers a message directly to a local account's mailbox.
-func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
+func (w *Worker) deliverLocal(entry *store.QueueEntry, messageWithARC []byte) error {
 	rcpt := entry.RcptTo
 
 	account, err := w.db.GetAccountByEmail(rcpt)
@@ -181,8 +181,8 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		return fmt.Errorf("account %s is inactive", rcpt)
 	}
 
-	// Parse the message
-	parsed, err := parser.Parse(entry.RawMessage)
+	// Parse the message (use ARC-enhanced version)
+	parsed, err := parser.Parse(messageWithARC)
 	if err != nil {
 		return fmt.Errorf("parsing message: %w", err)
 	}
@@ -195,7 +195,19 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		rcpt,
 		time.Now().Format(time.RFC1123Z),
 	)
-	rawMessageWithReceived := append([]byte(receivedHeader), entry.RawMessage...)
+	rawMessageWithReceived := append([]byte(receivedHeader), messageWithARC...)
+
+	// Extract raw headers directly from messageWithARC to preserve duplicate headers (like multiple ARC-* headers)
+	// Don't use parsed.RawHeaders because parser loses duplicate header support
+	var rawHeaders strings.Builder
+	lines := strings.Split(string(messageWithARC), "\r\n")
+	for _, line := range lines {
+		if line == "" {
+			break // End of headers
+		}
+		rawHeaders.WriteString(line)
+		rawHeaders.WriteString("\r\n")
+	}
 
 	messageID := parsed.MessageID
 	if messageID == "" {
@@ -217,7 +229,7 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		Subject:        parsed.Subject,
 		TextBody:       parsed.TextBody,
 		HTMLBody:       parsed.HTMLBody,
-		RawHeaders:     parsed.RawHeaders,
+		RawHeaders:     rawHeaders.String(),
 		RawMessage:     rawMessageWithReceived,
 		Size:           int64(len(rawMessageWithReceived)),
 		HasAttachments: len(parsed.Attachments) > 0,
@@ -263,8 +275,8 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry) error {
 		}
 	}
 
-	log.Printf("[delivery] local delivery: id=%d from=%s to=%s subject=%s",
-		msgID, entry.MailFrom, rcpt, parsed.Subject)
+	log.Printf("[delivery] local delivery: id=%d from=%s to=%s subject=%s (rawmessage_size=%d)",
+		msgID, entry.MailFrom, rcpt, parsed.Subject, len(rawMessageWithReceived))
 	return nil
 }
 
@@ -306,6 +318,10 @@ func (w *Worker) addARCHeaders(msg []byte, mailFrom, rcptDomain string) []byte {
 	// Generate ARC chain
 	// For outbound messages, always use instance=1 (this is the originating hop)
 	// For forwarded messages, use instance returned by auth.NextArcInstance()
+	instance := auth.NextArcInstance(msg)
+	highest := auth.GetHighestArcInstance(msg)
+	log.Printf("[delivery] ARC chain: detecting instance for message size=%d, highest_found=%d, next_instance=%d", len(msg), highest, instance)
+	
 	arcHeaders, err := auth.ARCChainSigner(
 		senderDomain,
 		domain.DKIMSelector,
@@ -315,11 +331,16 @@ func (w *Worker) addARCHeaders(msg []byte, mailFrom, rcptDomain string) []byte {
 		"pass",   // DMARC
 		w.cfg.Server.Hostname,
 		string(msg),
-		1, // instance: initial sending is i=1
+		instance, // instance: i=1 for new, i=2+ for forwarding
 	)
 	if err != nil {
 		log.Printf("[delivery] warning: ARC signing failed: %v", err)
 		return msg // Return original on ARC signing failure
+	}
+
+	log.Printf("[delivery] ARC chain: generated %d headers at instance=%d", len(arcHeaders), instance)
+	for i, h := range arcHeaders {
+		log.Printf("[delivery] ARC chain header %d: %.100s...", i+1, h)
 	}
 
 	// Prepend ARC headers to message (in order: auth-results, message-signature, seal)
@@ -327,6 +348,7 @@ func (w *Worker) addARCHeaders(msg []byte, mailFrom, rcptDomain string) []byte {
 	arcHeadersStr := strings.Join(arcHeaders, "\r\n") + "\r\n"
 	modifiedMsg := append([]byte(arcHeadersStr), msg...)
 
+	log.Printf("[delivery] ARC headers prepended, new message size=%d", len(modifiedMsg))
 	return modifiedMsg
 }
 

@@ -1,0 +1,117 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>{{if .IsNew}}Add Domain{{else}}Edit Domain: {{.Domain.Domain}}{{end}}</h2>
+        <a href="/admin/domains" class="btn">&larr; Back to Domains</a>
+    </div>
+
+    {{if .Message}}
+    <div class="alert alert-success">{{.Message}}</div>
+    {{end}}
+    {{if .Error}}
+    <div class="alert alert-error">{{.Error}}</div>
+    {{end}}
+
+    <form method="POST" class="admin-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+        <div class="form-group">
+            <label for="domain">Domain Name</label>
+            <input type="text" id="domain" name="domain" value="{{.Domain.Domain}}"
+                   placeholder="example.com" required {{if not .IsNew}}readonly{{end}}>
+            {{if not .IsNew}}<small>Domain name cannot be changed after creation.</small>{{end}}
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="dkim_selector">DKIM Selector</label>
+                <input type="text" id="dkim_selector" name="dkim_selector"
+                       value="{{.Domain.DKIMSelector}}" placeholder="mail">
+            </div>
+            <div class="form-group">
+                <label for="dkim_algorithm">DKIM Algorithm</label>
+                <select id="dkim_algorithm" name="dkim_algorithm">
+                    <option value="ed25519" {{if eq .Domain.DKIMAlgorithm "ed25519"}}selected{{end}}>Ed25519 (recommended)</option>
+                    <option value="rsa" {{if eq .Domain.DKIMAlgorithm "rsa"}}selected{{end}}>RSA-2048</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="is_active" value="1" {{if .Domain.IsActive}}checked{{end}}>
+                Domain is active (accepts and sends mail)
+            </label>
+        </div>
+
+        <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Domain{{else}}Save Changes{{end}}</button>
+    </form>
+
+    {{if not .IsNew}}
+    <!-- DKIM Key Management -->
+    <div class="admin-section">
+        <h3>DKIM Keys</h3>
+        {{if .Domain.DKIMPublicKey}}
+        <div class="alert alert-success">DKIM keys are configured.</div>
+        {{else}}
+        <div class="alert alert-warning">No DKIM keys generated. Click below to generate.</div>
+        {{end}}
+        <form method="POST" action="/admin/domain/dkim/{{.Domain.ID}}" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="btn btn-primary"
+                    {{if .Domain.DKIMPublicKey}}onclick="return confirm('This will replace existing DKIM keys. Are you sure?')"{{end}}>
+                {{if .Domain.DKIMPublicKey}}Regenerate DKIM Keys{{else}}Generate DKIM Keys{{end}}
+            </button>
+        </form>
+    </div>
+
+    <!-- DNS Records -->
+    <div class="admin-section">
+        <h3>DNS Records</h3>
+        <p>Configure these DNS records for <strong>{{.Domain.Domain}}</strong> at your DNS provider:</p>
+
+        <table class="dns-table">
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Name</th>
+                    <th>Value</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .DNSRecords}}
+                <tr>
+                    <td><code>{{.Type}}</code></td>
+                    <td><code class="dns-name">{{.Name}}</code></td>
+                    <td>
+                        <div class="dns-value-wrap">
+                            <code class="dns-value">{{.Value}}</code>
+                            <button type="button" class="btn btn-sm copy-btn" onclick="copyToClipboard(this, '{{.Value}}')">Copy</button>
+                        </div>
+                    </td>
+                    <td class="dns-comment">{{.Comment}}</td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Accounts quick link -->
+    <div class="admin-section">
+        <h3>Accounts</h3>
+        <a href="/admin/accounts?domain={{.Domain.ID}}" class="btn">Manage Accounts for {{.Domain.Domain}}</a>
+        <a href="/admin/account/edit/new?domain={{.Domain.ID}}" class="btn btn-primary">+ Add Account</a>
+    </div>
+    {{end}}
+</div>
+
+<script>
+function copyToClipboard(btn, text) {
+    navigator.clipboard.writeText(text).then(function() {
+        btn.textContent = 'Copied!';
+        setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
+    });
+}
+</script>
+{{end}}

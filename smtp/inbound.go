@@ -230,15 +230,33 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	authResults := authBuilder.Build()
 
-	// --- Add ARC-Authentication-Results header ---
-	// This records authentication results for chain preservation
-	arcAuthResults := auth.ARCAuthenticationResults(
-		s.cfg.Server.Hostname,
-		string(spfResult),
-		string(dkimResult),
-		string(dmarcResult.Result),
-	)
-	rawMessage = append([]byte(arcAuthResults+"\r\n"), rawMessage...)
+	// --- Validate ARC Chain (if present) ---
+	arcValidation := auth.ValidateARCChain(rawMessage)
+	switch arcValidation.Status {
+	case "pass":
+		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d", 
+			arcValidation.HighestValid)
+	case "fail":
+		log.Printf("[smtp] ARC ✗ FAIL: %s", arcValidation.Details)
+	case "permerror":
+		log.Printf("[smtp] ARC ⚠ PERMERROR: permanent error - %s", arcValidation.Details)
+	case "temperror":
+		log.Printf("[smtp] ARC ⏱ TEMPERROR: temporary error - %s", arcValidation.Details)
+	case "none":
+		log.Printf("[smtp] ARC - NONE: no ARC headers (original email)")
+	default:
+		log.Printf("[smtp] ARC ? UNKNOWN: status=%s", arcValidation.Status)
+	}
+
+	// Determine if this email should be quarantined due to ARC failure
+	arcFailed := arcValidation.Status == "fail" || arcValidation.Status == "permerror"
+	if arcFailed {
+		log.Printf("[smtp] ARC validation failed - will quarantine to spam: %s", arcValidation.Details)
+	}
+
+	// NOTE: Do NOT add ARC headers for inbound original emails.
+	// ARC headers are only added when FORWARDING/RELAYING messages.
+	// For original emails with no prior ARC chain, store without modification.
 
 	// --- Check for MDN request ---
 	mdnRequested := parsed.MDNRequestedBy != ""
@@ -257,18 +275,19 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	// Deliver to each recipient
 	for _, rcpt := range rcptTo {
-		// Enforce DMARC policy before delivery
+		// Note: DMARC enforcement is now done per-recipient via folder assignment below
+		// p=reject and p=quarantine both result in messages going to spam folder
+		// p=none messages go to inbox normally
+		
+		// Check if DMARC failed for this domain
 		if dmarcResult.Result == "fail" {
 			switch dmarcResult.Policy {
 			case "reject":
-				log.Printf("[smtp] DMARC p=reject: rejecting mail from %s (auth check failed)", fromDomain)
-				continue // Skip delivery for this recipient
+				log.Printf("[smtp] DMARC p=reject: accepting but quarantining mail from %s (auth check failed)", fromDomain)
 			case "quarantine":
 				log.Printf("[smtp] DMARC p=quarantine: accepting but marking suspicious from %s", fromDomain)
-				// Continue delivery below, but marked as suspicious
 			case "none":
 				log.Printf("[smtp] DMARC p=none: accepting in observation mode from %s", fromDomain)
-				// Continue delivery
 			}
 		}
 
@@ -288,8 +307,20 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// Determine folder based on auth failure and direction
 		var folderID *int64
 		
-		if dmarcResult.Result == "fail" && (dmarcResult.Policy == "quarantine" || dmarcResult.Policy == "reject") {
-			// Get spam folder for quarantined mail
+		if arcFailed {
+			// ARC validation failed - quarantine to spam
+			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
+			if err != nil {
+				log.Printf("[smtp] error getting spam folder: %v", err)
+			} else if spamFolder != nil {
+				folderID = &spamFolder.ID
+				log.Printf("[smtp] ARC failed: quarantining to spam folder=%d (reason: %s)", 
+					spamFolder.ID, arcValidation.Details)
+			} else {
+				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
+			}
+		} else if dmarcResult.Result == "fail" && (dmarcResult.Policy == "quarantine" || dmarcResult.Policy == "reject") {
+			// DMARC quarantine/reject - move to spam
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
 				log.Printf("[smtp] error getting spam folder: %v", err)
@@ -333,7 +364,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			SPFResult:      string(spfResult),
 			DKIMResult:     dkimResult,
 			DMARCResult:    string(dmarcResult.Result),
-			AuthResults:    authResults,
+			AuthResults:    authResults + "\nARC-Validation: " + arcValidation.Status,
 			MDNRequested:   mdnRequested,
 			MDNAddress:     mdnAddress,
 			ReceivedAt:     time.Now(),

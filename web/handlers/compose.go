@@ -5,15 +5,14 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"gomail/auth"
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 )
 
 // ComposeHandler handles composing and sending messages.
@@ -27,10 +26,7 @@ type ComposeHandler struct {
 
 // NewComposeHandler creates a compose handler.
 func NewComposeHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *ComposeHandler {
-	tmpl := template.Must(template.ParseFiles(
-		filepath.Join("web", "templates", "base.html"),
-		filepath.Join("web", "templates", "compose.html"),
-	))
+	tmpl := templates.LoadSimpleTemplate("base", "compose")
 
 	return &ComposeHandler{
 		cfg:        cfg,
@@ -180,17 +176,6 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if readReceipt {
 		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
 	}
-	
-	// Add ARC headers (Authentication chain preservation)
-	// These identify the message as originating from GoMail web interface
-	// Full ARC-Message-Signature and ARC-Seal with cryptographic signing happen during delivery
-	arcAuthResults := auth.ARCAuthenticationResults(
-		h.cfg.Server.Hostname,
-		"pass",    // SPF result from web interface
-		"none",    // DKIM (will be added during delivery)
-		"none",    // DMARC (not applicable for composed mail)
-	)
-	msg.WriteString(arcAuthResults + "\r\n")
 	
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")

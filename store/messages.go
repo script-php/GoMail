@@ -292,13 +292,13 @@ func (db *DB) GetMessage(id, accountID int64) (*Message, error) {
 	var hasAttach, isRead, isStarred, isDeleted, mdnRequested, mdnSent int
 	err := db.QueryRow(`
 		SELECT id, account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
-			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
+			cc_addr, reply_to, subject, text_body, html_body, raw_headers, raw_message,
 			size, has_attachments, is_read, is_starred, is_deleted,
 			spf_result, dkim_result, dmarc_result, auth_results, mdn_requested, mdn_address, mdn_sent, received_at, created_at
 		FROM messages WHERE id = ? AND account_id = ?`, id, accountID).Scan(
 		&m.ID, &m.AccountID, &m.FolderID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo, &m.FromAddr,
 		&m.ToAddr, &m.CcAddr, &m.ReplyTo, &m.Subject, &m.TextBody, &m.HTMLBody,
-		&m.RawHeaders, &m.Size, &hasAttach, &isRead, &isStarred, &isDeleted,
+		&m.RawHeaders, &m.RawMessage, &m.Size, &hasAttach, &isRead, &isStarred, &isDeleted,
 		&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.AuthResults, &mdnRequested, &m.MDNAddress, &mdnSent,
 		&m.ReceivedAt, &m.CreatedAt,
 	)

@@ -6,11 +6,11 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strconv"
 
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 )
 
 // InboxHandler handles inbox and sent message listing.
@@ -43,10 +43,7 @@ func NewInboxHandler(db *store.DB, sm *security.SessionManager) *InboxHandler {
 		"subtract": func(a, b int) int { return a - b },
 	}
 
-	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		filepath.Join("web", "templates", "base.html"),
-		filepath.Join("web", "templates", "inbox.html"),
-	))
+	tmpl := templates.LoadTemplate(funcMap, "base", "inbox")
 
 	return &InboxHandler{
 		db:         db,

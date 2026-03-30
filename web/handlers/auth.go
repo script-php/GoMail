@@ -4,12 +4,12 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"path/filepath"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 )
 
 // AuthHandler handles login/logout.
@@ -21,10 +21,8 @@ type AuthHandler struct {
 
 // NewAuthHandler creates an auth handler.
 func NewAuthHandler(db *store.DB, sm *security.SessionManager) *AuthHandler {
-	tmpl := template.Must(template.ParseFiles(
-		filepath.Join("web", "templates", "base.html"),
-		filepath.Join("web", "templates", "login.html"),
-	))
+	// Use embedded templates
+	tmpl := templates.LoadSimpleTemplate("base", "login")
 	return &AuthHandler{
 		db:         db,
 		sessionMgr: sm,

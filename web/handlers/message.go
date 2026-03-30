@@ -15,6 +15,7 @@ import (
 	"gomail/mdn"
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 )
 
 // MessageHandler handles viewing individual messages.
@@ -54,10 +55,7 @@ func NewMessageHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, 
 		},
 	}
 
-	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		filepath.Join("web", "templates", "base.html"),
-		filepath.Join("web", "templates", "message.html"),
-	))
+	tmpl := templates.LoadTemplate(funcMap, "base", "message")
 
 	return &MessageHandler{
 		db:         db,

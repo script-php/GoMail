@@ -5,7 +5,6 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -15,6 +14,7 @@ import (
 	"gomail/config"
 	"gomail/security"
 	"gomail/store"
+	"gomail/templates"
 )
 
 // AdminHandler handles the admin panel for domains and accounts.
@@ -51,20 +51,10 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		},
 	}
 
-	base := filepath.Join("web", "templates", "base.html")
-
-	tmplDomains := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		base, filepath.Join("web", "templates", "admin_domains.html"),
-	))
-	tmplDomainEdit := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		base, filepath.Join("web", "templates", "admin_domain_edit.html"),
-	))
-	tmplAccounts := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		base, filepath.Join("web", "templates", "admin_accounts.html"),
-	))
-	tmplAccountEdit := template.Must(template.New("").Funcs(funcMap).ParseFiles(
-		base, filepath.Join("web", "templates", "admin_account_edit.html"),
-	))
+	tmplDomains := templates.LoadTemplate(funcMap, "base", "admin_domains")
+	tmplDomainEdit := templates.LoadTemplate(funcMap, "base", "admin_domain_edit")
+	tmplAccounts := templates.LoadTemplate(funcMap, "base", "admin_accounts")
+	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit")
 
 	return &AdminHandler{
 		cfg:             cfg,
