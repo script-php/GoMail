@@ -44,9 +44,9 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config) 
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
 func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config) error {
-	// Connect to port 25
+	// Connect to port 25 (IPv4 only)
 	addr := host + ":25"
-	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+	conn, err := net.DialTimeout("tcp4", addr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", addr, err)
 	}

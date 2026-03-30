@@ -135,49 +135,27 @@ func GenerateDKIMKeyPair(algorithm string) (string, string, string, error) {
 
 // Sign adds a DKIM-Signature header to the message and returns the signed message.
 func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
-	// Split headers and body
-	headerEnd := bytes.Index(message, []byte("\r\n\r\n"))
-	separatorLen := 4
-	if headerEnd == -1 {
-		headerEnd = bytes.Index(message, []byte("\n\n"))
-		separatorLen = 2
-		if headerEnd == -1 {
-			return nil, fmt.Errorf("cannot find end of headers")
-		}
+	// Parse headers from message
+	headers, bodyOffset, err := parseMessageHeaders(message)
+	if err != nil {
+		return nil, fmt.Errorf("parsing headers: %w", err)
 	}
 
-	body := message[headerEnd+separatorLen:]  // Skip the separator
+	// Extract body
+	body := message[bodyOffset:]
 
-	// Canonicalize body (relaxed: handle whitespace properly for transit)
+	// Canonicalize body (relaxed canonicalization)
 	bodyCanonBytes := bodyHashFunc(false, body) // false = not simple, so relaxed
 	bh := base64.StdEncoding.EncodeToString(bodyCanonBytes)
 
-	// Headers to sign
+	// Headers to sign (in order)
 	signHeaders := []string{"from", "to", "subject", "date", "message-id"}
 	var signedHeaderNames []string
 
-	// Parse headers properly without destroying CRLF
-	var headerLines []*headerRaw
-	lines := bytes.Split(message[:headerEnd], []byte{'\n'})
-	for _, line := range lines {
-		line = bytes.TrimRight(line, "\r")
-		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' {
-			continue // Skip continuation lines for header names
-		}
-		colonIdx := bytes.IndexByte(line, ':')
-		if colonIdx == -1 {
-			continue
-		}
-		keyStr := strings.TrimSpace(string(line[:colonIdx]))
-		headerLines = append(headerLines, &headerRaw{
-			key:  keyStr,
-			lkey: strings.ToLower(keyStr),
-		})
-	}
-
+	// Find which headers are present in the message
 	for _, sh := range signHeaders {
-		for _, hl := range headerLines {
-			if strings.EqualFold(hl.key, sh) {
+		for _, h := range headers {
+			if strings.EqualFold(h.key, sh) {
 				signedHeaderNames = append(signedHeaderNames, sh)
 				break
 			}
@@ -199,25 +177,24 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 		strings.Join(signedHeaderNames, ":"), bh,
 	)
 
-	// Build canonical header data for signing
+	// Build canonical header data for signing (like RFC 6376 specifies)
 	var dataToSign bytes.Buffer
 	for _, sh := range signedHeaderNames {
-		for _, hl := range headerLines {
-			if strings.EqualFold(hl.key, sh) {
-				canonized, err := relaxedCanonicalHeader(string(hl.raw))
-				if err == nil {
-					dataToSign.WriteString(canonized)
-					dataToSign.WriteString("\r\n")
-				}
+		for _, h := range headers {
+			if strings.EqualFold(h.key, sh) {
+				// Convert raw bytes to string for canonicalization
+				rawStr := strings.TrimSpace(h.key) + ":" + h.value
+				canonical, _ := relaxedCanonicalHeader(rawStr)
+				dataToSign.WriteString(canonical)
+				dataToSign.WriteString("\r\n")
 				break
 			}
 		}
 	}
-	// Add DKIM-Signature header itself (without b= value, no trailing CRLF)
-	canonized, err := relaxedCanonicalHeader(dkimHeader)
-	if err == nil {
-		dataToSign.WriteString(canonized)
-	}
+	
+	// Add DKIM-Signature header itself (without b= value, no trailing CRLF on last header)
+	dkimCanonical, _ := relaxedCanonicalHeader(dkimHeader)
+	dataToSign.WriteString(dkimCanonical)
 
 	// Sign
 	hash := sha256.Sum256(dataToSign.Bytes())

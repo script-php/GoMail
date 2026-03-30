@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -26,9 +27,8 @@ type ARCMessageSignatureInput struct {
 	Selector      string        // s= (selector)
 	Domain        string        // d= (domain)
 	PrivateKey    crypto.Signer // RSA or Ed25519 private key
-	CanonicalBody string        // Canonicalized message body
-	Headers       map[string]string
-	BodyHash      string // base64-encoded SHA256 hash of body
+	Message       []byte        // Full message (headers + body) for header extraction
+	BodyHash      string        // base64-encoded SHA256 hash of body
 }
 
 // getAlgorithm returns the algorithm name based on key type
@@ -52,22 +52,47 @@ func ARCMessageSignature(input *ARCMessageSignatureInput) (string, error) {
 
 	algorithm := getAlgorithm(input.PrivateKey)
 
-	// Build signature input (b= is empty during signing)
-	sigHeaders := []string{
+	// Parse headers from message to find actual headers to include
+	allHeaders, _, _ := parseMessageHeaders(input.Message)
+
+	// List of headers to include in signature (order matters)
+	headersToSign := []string{"from", "to", "subject", "date", "message-id"}
+
+	// Build the canonical header data by extracting and canonicalizing each header
+	// Use the exact raw header line as it appears in the message
+	var dataToSign bytes.Buffer
+	for _, headerName := range headersToSign {
+		// Find this header in the message
+		for _, h := range allHeaders {
+			if strings.EqualFold(h.key, headerName) {
+				// Use raw header line and apply relaxed canonicalization
+				canonical, _ := relaxedCanonicalHeader(string(h.raw))
+				dataToSign.WriteString(canonical)
+				dataToSign.WriteString("\r\n")
+				break
+			}
+		}
+	}
+
+	// Build signature tags (b= is empty during signing)
+	sigTags := []string{
 		fmt.Sprintf("i=%d", input.Instance),
 		fmt.Sprintf("a=%s", algorithm),
 		"c=relaxed/relaxed",
 		fmt.Sprintf("d=%s", input.Domain),
 		fmt.Sprintf("s=%s", input.Selector),
-		"h=from:to:subject:date:message-id",
+		"h=" + strings.Join(headersToSign, ":"),
 		fmt.Sprintf("bh=%s", input.BodyHash),
 		"b=", // Empty during signing
 	}
 
-	signatureData := strings.Join(sigHeaders, "; ")
+	// Add the signature field itself (without trailing CRLF)
+	sigHeader := strings.Join(sigTags, "; ")
+	canonical, _ := relaxedCanonicalHeader("ARC-Message-Signature: " + sigHeader)
+	dataToSign.WriteString(canonical)
 
 	// Sign the data
-	hash := sha256.Sum256([]byte(signatureData))
+	hash := sha256.Sum256(dataToSign.Bytes())
 	signature, err := input.PrivateKey.Sign(rand.Reader, hash[:], crypto.SHA256)
 	if err != nil {
 		return "", fmt.Errorf("signing failed: %w", err)
@@ -75,9 +100,9 @@ func ARCMessageSignature(input *ARCMessageSignatureInput) (string, error) {
 
 	// Replace empty b= with actual signature
 	encodedSig := base64.StdEncoding.EncodeToString(signature)
-	sigHeaders[len(sigHeaders)-1] = fmt.Sprintf("b=%s", encodedSig)
+	sigTags[len(sigTags)-1] = fmt.Sprintf("b=%s", encodedSig)
 
-	return fmt.Sprintf("ARC-Message-Signature: %s", strings.Join(sigHeaders, "; ")), nil
+	return fmt.Sprintf("ARC-Message-Signature: %s", strings.Join(sigTags, "; ")), nil
 }
 
 // ARCSealInput represents data for ARC-Seal generation
@@ -86,15 +111,17 @@ type ARCSealInput struct {
 	Selector              string        // s=
 	Domain                string        // d=
 	PrivateKey            crypto.Signer // RSA or Ed25519 private key
-	AuthenticationResults string        // The full ARC-Authentication-Results header line
-	MessageSignature      string        // The full ARC-Message-Signature header line
+	AuthenticationResults string        // Full ARC-Authentication-Results header line (including header name)
+	MessageSignature      string        // Full ARC-Message-Signature header line (including header name)
 	Timestamp             time.Time
 	CVValue               string // cv= value (none, pass, fail)
 }
 
-// ARCSeal generates the ARC-Seal header
-// Supports both RSA-2048 and Ed25519 keys
-// This seals the entire ARC chain
+// ARCSeal generates the ARC-Seal header per RFC 8617 Section 5.1.1.
+// The ARC-Seal does NOT sign regular message headers.
+// It only covers the ARC header set: ARC-Authentication-Results,
+// ARC-Message-Signature, and the ARC-Seal itself (with b= empty).
+// The ARC-Seal does NOT have an h= tag.
 func ARCSeal(input *ARCSealInput) (string, error) {
 	if input.PrivateKey == nil {
 		return "", fmt.Errorf("private key required")
@@ -109,22 +136,45 @@ func ARCSeal(input *ARCSealInput) (string, error) {
 		cvValue = "none" // Default for i=1
 	}
 
-	// Build seal input (cv=none for first seal, would be pass/fail for subsequent)
-	sealHeaders := []string{
+	// Build seal tags (b= is empty during signing)
+	// Per RFC 8617: ARC-Seal does NOT have an h= tag
+	sealTags := []string{
 		fmt.Sprintf("i=%d", input.Instance),
 		fmt.Sprintf("a=%s", algorithm),
 		fmt.Sprintf("t=%d", timestamp),
-		fmt.Sprintf("cv=%s", cvValue), // Chain validation value
+		fmt.Sprintf("cv=%s", cvValue),
 		fmt.Sprintf("d=%s", input.Domain),
 		fmt.Sprintf("s=%s", input.Selector),
-		"h=from:to:subject:date:message-id:arc-authentication-results:arc-message-signature",
 		"b=", // Empty during signing
 	}
 
-	sealData := strings.Join(sealHeaders, "; ")
+	// Per RFC 8617 Section 5.1.1: For instance i, the data to sign is
+	// all ARC header fields for instances 1..i in order, with ARC-Seal
+	// for the current instance last (with b= empty).
+	//
+	// For i=1 the order is:
+	//   ARC-Authentication-Results: i=1
+	//   ARC-Message-Signature: i=1
+	//   ARC-Seal: i=1 (b= empty) -- no trailing CRLF
+	var dataToSign bytes.Buffer
+
+	// 1. ARC-Authentication-Results (canonicalized)
+	canonical, _ := relaxedCanonicalHeader(input.AuthenticationResults)
+	dataToSign.WriteString(canonical)
+	dataToSign.WriteString("\r\n")
+
+	// 2. ARC-Message-Signature (canonicalized, including its full b= value)
+	canonical, _ = relaxedCanonicalHeader(input.MessageSignature)
+	dataToSign.WriteString(canonical)
+	dataToSign.WriteString("\r\n")
+
+	// 3. ARC-Seal itself (canonicalized, b= empty, NO trailing CRLF)
+	sealHeader := "ARC-Seal: " + strings.Join(sealTags, "; ")
+	canonical, _ = relaxedCanonicalHeader(sealHeader)
+	dataToSign.WriteString(canonical)
 
 	// Sign the data
-	hash := sha256.Sum256([]byte(sealData))
+	hash := sha256.Sum256(dataToSign.Bytes())
 	signature, err := input.PrivateKey.Sign(rand.Reader, hash[:], crypto.SHA256)
 	if err != nil {
 		return "", fmt.Errorf("seal signing failed: %w", err)
@@ -132,9 +182,9 @@ func ARCSeal(input *ARCSealInput) (string, error) {
 
 	// Replace empty b= with actual signature
 	encodedSig := base64.StdEncoding.EncodeToString(signature)
-	sealHeaders[len(sealHeaders)-1] = fmt.Sprintf("b=%s", encodedSig)
+	sealTags[len(sealTags)-1] = fmt.Sprintf("b=%s", encodedSig)
 
-	return fmt.Sprintf("ARC-Seal: %s", strings.Join(sealHeaders, "; ")), nil
+	return fmt.Sprintf("ARC-Seal: %s", strings.Join(sealTags, "; ")), nil
 }
 
 // BodyHash computes the base64-encoded SHA256 hash of email body for ARC
@@ -155,17 +205,33 @@ func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, d
 		return nil, fmt.Errorf("private key required for ARC signing")
 	}
 
-	// 1. Generate Authentication Results
-	authResults := fmt.Sprintf("ARC-Authentication-Results: i=%d; %s;\r\n\tspf=%s;\r\n\tdkim=%s;\r\n\tdmarc=%s",
+	// Extract just the body from the full message for body hash calculation
+	// bodyContent contains the entire message (headers + body)
+	msgBytes := []byte(bodyContent)
+	headerEnd := bytes.Index(msgBytes, []byte("\r\n\r\n"))
+	separatorLen := 4
+	if headerEnd == -1 {
+		headerEnd = bytes.Index(msgBytes, []byte("\n\n"))
+		separatorLen = 2
+		if headerEnd == -1 {
+			return nil, fmt.Errorf("no header/body boundary found in message")
+		}
+	}
+	
+	bodyOnly := msgBytes[headerEnd+separatorLen:]
+
+	// 1. Generate Authentication Results (full header line)
+	authResultsHeader := fmt.Sprintf("ARC-Authentication-Results: i=%d; %s;\r\n\tspf=%s;\r\n\tdkim=%s;\r\n\tdmarc=%s",
 		instance, hostname, spf, dkim, dmarc)
 
-	// 2. Generate Message Signature
-	bodyHash := BodyHash(bodyContent)
+	// 2. Generate Message Signature using the full message for header extraction
+	bodyHash := BodyHash(string(bodyOnly))
 	msgSigInput := &ARCMessageSignatureInput{
 		Instance:   instance,
 		Selector:   selector,
 		Domain:     domain,
 		PrivateKey: privKey,
+		Message:    msgBytes, // Pass full message for header extraction
 		BodyHash:   bodyHash,
 	}
 	msgSig, err := ARCMessageSignature(msgSigInput)
@@ -186,17 +252,17 @@ func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, d
 		Selector:              selector,
 		Domain:                domain,
 		PrivateKey:            privKey,
-		AuthenticationResults: authResults,
-		MessageSignature:      msgSig,
+		AuthenticationResults: authResultsHeader, // Full header line with header name
+		MessageSignature:      msgSig,            // Full header line with header name
 		Timestamp:             time.Now(),
-		CVValue:               cvValue, // Will be used if we add it to ARCSealInput
+		CVValue:               cvValue,
 	}
 	seal, err := ARCSeal(sealInput)
 	if err != nil {
 		return nil, fmt.Errorf("generating ARC-Seal: %w", err)
 	}
 
-	return []string{authResults, msgSig, seal}, nil
+	return []string{authResultsHeader, msgSig, seal}, nil
 }
 
 // ExtractArcHeaders pulls all ARC headers from raw message

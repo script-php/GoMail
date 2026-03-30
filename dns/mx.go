@@ -2,6 +2,7 @@ package dns
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
@@ -20,11 +21,17 @@ func LookupMX(domain string) ([]MXRecord, error) {
 
 	// Check cache first
 	if cached, ok := globalCache.Get("mx:" + domain); ok {
-		return cached.([]MXRecord), nil
+		records := cached.([]MXRecord)
+		log.Printf("[dns] MX cache hit for %s: %d records", domain, len(records))
+		for _, r := range records {
+			log.Printf("[dns]   MX %s pref=%d", r.Host, r.Pref)
+		}
+		return records, nil
 	}
 
 	mxRecords, err := net.LookupMX(domain)
 	if err != nil || len(mxRecords) == 0 {
+		log.Printf("[dns] MX lookup for %s returned err=%v, count=%d, falling back to A/AAAA", domain, err, len(mxRecords))
 		// Fallback: try A/AAAA
 		addrs, err2 := net.LookupHost(domain)
 		if err2 != nil {
@@ -34,6 +41,7 @@ func LookupMX(domain string) ([]MXRecord, error) {
 			return nil, fmt.Errorf("MX+A lookup for %s: %w", domain, err2)
 		}
 		if len(addrs) > 0 {
+			log.Printf("[dns] using A/AAAA fallback for %s: %s", domain, addrs[0])
 			records := []MXRecord{{Host: domain, Pref: 0}}
 			globalCache.Set("mx:"+domain, records)
 			return records, nil
@@ -53,6 +61,11 @@ func LookupMX(domain string) ([]MXRecord, error) {
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].Pref < records[j].Pref
 	})
+
+	log.Printf("[dns] MX lookup for %s: %d records", domain, len(records))
+	for _, r := range records {
+		log.Printf("[dns]   MX %s pref=%d", r.Host, r.Pref)
+	}
 
 	globalCache.Set("mx:"+domain, records)
 	return records, nil
