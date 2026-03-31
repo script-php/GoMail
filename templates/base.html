@@ -4,53 +4,90 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}} - GoMail</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body{{if not .Section}} class="login-page"{{end}}>
     {{if .Section}}
-    <nav class="sidebar">
-        <div class="logo">
-            <h1>GoMail</h1>
+    <!-- Top Header Bar -->
+    <header class="top-header">
+        <button class="menu-toggle" onclick="toggleSidebar()" aria-label="Toggle menu">
+            <svg viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+        </button>
+        <a href="/inbox" class="header-logo">
+            <div class="logo-icon">G</div>
+            <span>GoMail</span>
+        </a>
+        <div class="header-search">
+            <div class="search-bar">
+                <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+                <input type="text" placeholder="Search mail" aria-label="Search mail">
+            </div>
         </div>
+        <div class="header-actions">
+            {{if .Account}}
+            <a href="/logout" class="header-account" title="Sign out">
+                <span class="header-email">{{.Account.Email}}</span>
+                <div class="avatar">{{avatarInitial .Account.Email}}</div>
+            </a>
+            {{end}}
+        </div>
+    </header>
+
+    <!-- Sidebar Overlay (mobile) -->
+    <div class="sidebar-overlay" onclick="closeSidebar()"></div>
+
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar">
+        <a href="/compose" class="compose-btn">
+            <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#202124"/></svg>
+            <span>Compose</span>
+        </a>
         <ul class="nav-links">
-            <li class="{{if eq .Section "compose"}}active{{end}}">
-                <a href="/compose">&#9998; Compose</a>
-            </li>
             {{if .Folders}}
             {{range .Folders}}
             <li class="{{if eq $.ActiveFolder .ID}}active{{end}}">
                 <a href="/folder/{{.ID}}">
-                    {{if eq .FolderType "inbox"}}&#9993;{{else if eq .FolderType "sent"}}&#10148;{{else if eq .FolderType "spam"}}&#9888;{{else if eq .FolderType "drafts"}}&#128317;{{else if eq .FolderType "trash"}}🗑{{else}}&#128193;{{end}}
-                    {{.Name}}
+                    <span class="nav-icon">{{if eq .FolderType "inbox"}}&#9993;{{else if eq .FolderType "sent"}}&#10148;{{else if eq .FolderType "spam"}}&#9888;{{else if eq .FolderType "drafts"}}&#128221;{{else if eq .FolderType "trash"}}&#128465;{{else}}&#128193;{{end}}</span>
+                    <span class="nav-text">{{.Name}}</span>
                     {{if gt .UnreadCount 0}}<span class="badge">{{.UnreadCount}}</span>{{end}}
                 </a>
             </li>
             {{end}}
             {{else}}
             <li class="{{if eq .Section "inbox" "inbound"}}active{{end}}">
-                <a href="/inbox">&#9993; Inbox
+                <a href="/inbox">
+                    <span class="nav-icon">&#9993;</span>
+                    <span class="nav-text">Inbox</span>
                     {{if .Unread}}<span class="badge">{{.Unread}}</span>{{end}}
                 </a>
             </li>
             <li class="{{if eq .Section "sent" "outbound"}}active{{end}}">
-                <a href="/sent">&#10148; Sent</a>
+                <a href="/sent">
+                    <span class="nav-icon">&#10148;</span>
+                    <span class="nav-text">Sent</span>
+                </a>
             </li>
             {{end}}
             {{if and .Account .Account.IsAdmin}}
             <li class="nav-divider"></li>
             <li class="{{if eq .Section "admin"}}active{{end}}">
-                <a href="/admin/domains">&#9881; Admin</a>
+                <a href="/admin/domains">
+                    <span class="nav-icon">&#9881;</span>
+                    <span class="nav-text">Admin</span>
+                </a>
             </li>
             {{end}}
         </ul>
-        <div class="nav-footer">
-            {{if .Account}}<div class="nav-user">{{.Account.Email}}</div>{{end}}
-            <a href="/logout" class="logout-link">Logout</a>
-        </div>
     </nav>
     {{end}}
+
     <main class="{{if .Section}}with-sidebar{{end}}">
-        {{template "content" .}}
+        <div class="content-area">
+            {{template "content" .}}
+        </div>
     </main>
     <script src="/static/app.js"></script>
 </body>

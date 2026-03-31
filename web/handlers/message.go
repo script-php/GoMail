@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -32,6 +33,16 @@ func NewMessageHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, 
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
+		},
+		"formatSize": func(size int64) string {
+			switch {
+			case size >= 1048576:
+				return fmt.Sprintf("%.1f MB", float64(size)/1048576)
+			case size >= 1024:
+				return fmt.Sprintf("%.1f KB", float64(size)/1024)
+			default:
+				return fmt.Sprintf("%d B", size)
+			}
 		},
 		"formatAuth": func(result string) string {
 			switch result {

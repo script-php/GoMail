@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"strings"
 )
 
 //go:embed *.html *.css *.js
@@ -38,6 +39,16 @@ func ServeStatic(w http.ResponseWriter, r *http.Request) {
 func LoadTemplate(funcMap template.FuncMap, names ...string) *template.Template {
 	if funcMap == nil {
 		funcMap = template.FuncMap{}
+	}
+
+	// Add default functions available to all templates
+	if _, ok := funcMap["avatarInitial"]; !ok {
+		funcMap["avatarInitial"] = func(email string) string {
+			if email == "" {
+				return "?"
+			}
+			return strings.ToUpper(string(email[0]))
+		}
 	}
 
 	tmpl := template.New("").Funcs(funcMap)

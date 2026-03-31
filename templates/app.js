@@ -1,6 +1,28 @@
-// GoMail - Minimal client-side JavaScript
+// GoMail — Client-side JavaScript
 
-// Toggle star on a message
+// ===== SIDEBAR TOGGLE (mobile) =====
+function toggleSidebar() {
+    var sidebar = document.getElementById('sidebar');
+    var overlay = document.querySelector('.sidebar-overlay');
+    if (sidebar) {
+        sidebar.classList.toggle('open');
+        if (overlay) overlay.classList.toggle('active');
+    }
+}
+
+function closeSidebar() {
+    var sidebar = document.getElementById('sidebar');
+    var overlay = document.querySelector('.sidebar-overlay');
+    if (sidebar) sidebar.classList.remove('open');
+    if (overlay) overlay.classList.remove('active');
+}
+
+// Close sidebar on ESC
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeSidebar();
+});
+
+// ===== STAR TOGGLE =====
 function toggleStar(messageId, event) {
     event.preventDefault();
     event.stopPropagation();
@@ -9,9 +31,9 @@ function toggleStar(messageId, event) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
     })
-    .then(r => r.json())
-    .then(data => {
-        const btn = event.target;
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        var btn = event.target.closest('.star-btn') || event.target;
         if (data.starred) {
             btn.classList.add('starred');
             btn.innerHTML = '&#9733;';
@@ -20,50 +42,66 @@ function toggleStar(messageId, event) {
             btn.innerHTML = '&#9734;';
         }
     })
-    .catch(err => console.error('Star toggle failed:', err));
+    .catch(function(err) { console.error('Star toggle failed:', err); });
 }
 
-// Mark message as read via AJAX
+// ===== CHECKBOX: SELECT ALL =====
+function toggleAllCheckboxes(masterCb) {
+    var checkboxes = document.querySelectorAll('.email-row .email-checkbox input[type="checkbox"]');
+    checkboxes.forEach(function(cb) { cb.checked = masterCb.checked; });
+}
+
+// ===== MARK READ =====
 function markRead(messageId) {
-    fetch('/api/mark-read/' + messageId, {
-        method: 'POST'
-    }).catch(err => console.error('Mark read failed:', err));
+    fetch('/api/mark-read/' + messageId, { method: 'POST' })
+        .catch(function(err) { console.error('Mark read failed:', err); });
 }
 
-// Poll for unread count every 30 seconds
+// ===== MDN DISMISS =====
+function dismissMDNNotice(messageId) {
+    var notices = document.querySelectorAll('.mdn-notice');
+    notices.forEach(function(n) { n.style.display = 'none'; });
+}
+
+// ===== POLL UNREAD COUNT =====
 function pollUnread() {
     fetch('/api/unread-count')
-        .then(r => r.json())
-        .then(data => {
-            const badges = document.querySelectorAll('.badge');
-            badges.forEach(badge => {
-                if (data.unread > 0) {
-                    badge.textContent = data.unread;
-                    badge.style.display = 'inline';
-                } else {
-                    badge.style.display = 'none';
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var badges = document.querySelectorAll('.nav-links .badge');
+            badges.forEach(function(badge) {
+                var li = badge.closest('li');
+                if (li && li.querySelector('a[href="/inbox"], a[href*="inbox"]')) {
+                    if (data.unread > 0) {
+                        badge.textContent = data.unread;
+                        badge.style.display = '';
+                    } else {
+                        badge.style.display = 'none';
+                    }
                 }
             });
         })
-        .catch(() => {}); // Silently fail
+        .catch(function() {}); // Silently fail
 }
 
-// Auto-refresh unread count
-if (document.querySelector('.sidebar')) {
-    setInterval(pollUnread, 30000);
-}
-
-// Click row to navigate to message
+// ===== EMAIL ROW CLICK =====
 document.addEventListener('DOMContentLoaded', function() {
-    document.querySelectorAll('.message-row').forEach(row => {
-        row.style.cursor = 'pointer';
+    // Make email rows clickable
+    document.querySelectorAll('.email-row').forEach(function(row) {
         row.addEventListener('click', function(e) {
-            // Don't navigate if clicking star button
+            // Don't navigate if clicking star, checkbox, or link
             if (e.target.classList.contains('star-btn')) return;
+            if (e.target.closest('.star-btn')) return;
+            if (e.target.type === 'checkbox') return;
             if (e.target.tagName === 'A') return;
 
-            const id = this.dataset.id;
-            window.location.href = '/message/' + id;
+            var id = this.dataset.id;
+            if (id) window.location.href = '/message/' + id;
         });
     });
+
+    // Start polling if sidebar exists (logged in)
+    if (document.querySelector('.sidebar')) {
+        setInterval(pollUnread, 30000);
+    }
 });
