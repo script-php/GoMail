@@ -78,6 +78,7 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 		}
 		d.IsActive = isActive == 1
 		domains = append(domains, d)
+
 	}
 	return domains, rows.Err()
 }

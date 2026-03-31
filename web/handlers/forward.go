@@ -188,13 +188,26 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// Build forwarded message
 	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
-		clientIP,
-		h.cfg.Server.Hostname,
-		msgID2,
-		to,
-		time.Now().Format(time.RFC1123Z),
-	))
+	
+	// Build Received header - show IP only if explicitly enabled
+	var receivedLine string
+	if h.cfg.Mail.StripOriginatingIP {
+		receivedLine = fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
+			clientIP,
+			h.cfg.Server.Hostname,
+			msgID2,
+			to,
+			time.Now().Format(time.RFC1123Z),
+		)
+	} else {
+		receivedLine = fmt.Sprintf("Received: from webmail\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
+			h.cfg.Server.Hostname,
+			msgID2,
+			to,
+			time.Now().Format(time.RFC1123Z),
+		)
+	}
+	msg.WriteString(receivedLine + "\r\n")
 
 	// Add Resent- headers (RFC 5322 forwarding convention)
 	msg.WriteString(fmt.Sprintf("Resent-From: %s\r\n", from))
@@ -217,7 +230,11 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// User agent
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
-	msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
+	
+	// Include X-Originating-IP unless disabled in config
+	if !h.cfg.Mail.StripOriginatingIP {
+		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
+	}
 
 	// ADD ARC HEADERS WITH CHAIN SUPPORT
 	// Extract existing ARC chain from original message

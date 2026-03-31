@@ -151,17 +151,34 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	clientIP := getRealClientIP(r)
 
 	var msg strings.Builder
-	// Received header (originating from web interface) - similar to Postfix/Exim
-	msg.WriteString(fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
-		clientIP,
-		h.cfg.Server.Hostname,
-		msgID,
-		to,
-		time.Now().Format(time.RFC1123Z),
-	))
+	
+	// Build Received header - show IP only if explicitly enabled
+	var receivedLine string
+	if h.cfg.Mail.StripOriginatingIP {
+		receivedLine = fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
+			clientIP,
+			h.cfg.Server.Hostname,
+			msgID,
+			to,
+			time.Now().Format(time.RFC1123Z),
+		)
+	} else {
+		receivedLine = fmt.Sprintf("Received: from webmail\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
+			h.cfg.Server.Hostname,
+			msgID,
+			to,
+			time.Now().Format(time.RFC1123Z),
+		)
+	}
+	msg.WriteString(receivedLine + "\r\n")
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
-	msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
+	
+	// Include X-Originating-IP only if explicitly enabled
+	if h.cfg.Mail.StripOriginatingIP {
+		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
+	}
+	
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
 	if cc != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", cc))

@@ -14,6 +14,7 @@ type Config struct {
 	DKIM     DKIMConfig     `json:"dkim"`
 	Store    StoreConfig    `json:"store"`
 	Web      WebConfig      `json:"web"`
+	Mail     MailConfig     `json:"mail"`
 	Delivery DeliveryConfig `json:"delivery"`
 	DNS      DNSConfig      `json:"dns"`
 	Security SecurityConfig `json:"security"`
@@ -81,6 +82,11 @@ func (w *WebConfig) IsTLSEnabled() bool {
 type BootstrapAdmin struct {
 	Email        string `json:"email"`
 	PasswordHash string `json:"password_hash"`
+}
+
+// MailConfig contains outbound mail settings.
+type MailConfig struct {
+	StripOriginatingIP bool `json:"strip_originating_ip"` // If true, don't include X-Originating-IP header
 }
 
 type DeliveryConfig struct {
