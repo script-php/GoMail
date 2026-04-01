@@ -38,6 +38,9 @@ type Session struct {
 	ehlo       string
 	mailFrom   string
 	rcptTo     []string
+	dsnNotify  map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
+	dsnRET     string // FULL or HDRS
+	dsnEnvID   string // Envelope ID
 	data       bytes.Buffer
 	tls        bool
 	tlsConfig  *tls.Config
@@ -67,6 +70,7 @@ func NewSession(conn net.Conn, hostname string, domains []string, accountExists 
 		maxRcpt:       maxRcpt,
 		readTimeout:   readTimeout,
 		writeTimeout:  writeTimeout,
+		dsnNotify:     make(map[string]string),
 	}
 }
 
@@ -141,6 +145,7 @@ func (s *Session) handleEHLO(arg string) {
 		"8BITMIME",
 		"ENHANCEDSTATUSCODES",
 		"PIPELINING",
+		"DSN",
 	}
 
 	if !s.tls && s.tlsConfig != nil {
@@ -204,6 +209,9 @@ func (s *Session) handleMAIL(arg string) {
 		return
 	}
 
+	// Parse DSN parameters (RET, ENVID)
+	s.parseDSNMailParams(arg)
+
 	s.mailFrom = from
 	s.state = StateMail
 	s.send(250, "OK")
@@ -252,6 +260,10 @@ func (s *Session) handleRCPT(arg string) {
 	}
 
 	s.rcptTo = append(s.rcptTo, to)
+	
+	// Parse DSN parameters (NOTIFY, ORCPT)
+	s.parseDSNRcptParams(to, arg)
+	
 	s.state = StateRcpt
 	s.send(250, "OK")
 }
@@ -310,6 +322,9 @@ func (s *Session) handleRSET() {
 func (s *Session) reset() {
 	s.mailFrom = ""
 	s.rcptTo = nil
+	s.dsnNotify = make(map[string]string)
+	s.dsnRET = ""
+	s.dsnEnvID = ""
 	s.data.Reset()
 }
 
@@ -366,3 +381,63 @@ func (s *Session) GetClientIP() string { return s.clientIP }
 
 // IsTLS returns whether the session is encrypted.
 func (s *Session) IsTLS() bool { return s.tls }
+
+// GetDSNNotify returns the DSN NOTIFY flags for a recipient (or empty string if none).
+func (s *Session) GetDSNNotify(recipient string) string {
+	return s.dsnNotify[recipient]
+}
+
+// parseDSNMailParams parses DSN parameters from MAIL FROM command.
+// Format: MAIL FROM:<addr> [RET=FULL|HDRS] [ENVID=id]
+func (s *Session) parseDSNMailParams(arg string) {
+	// Look for RET parameter
+	if strings.Contains(strings.ToUpper(arg), "RET=") {
+		idx := strings.Index(strings.ToUpper(arg), "RET=")
+		if idx != -1 {
+			rest := arg[idx+4:]
+			if idx2 := strings.IndexAny(rest, " \t"); idx2 != -1 {
+				s.dsnRET = rest[:idx2]
+			} else {
+				s.dsnRET = rest
+			}
+		}
+	}
+
+	// Look for ENVID parameter
+	if strings.Contains(strings.ToUpper(arg), "ENVID=") {
+		idx := strings.Index(strings.ToUpper(arg), "ENVID=")
+		if idx != -1 {
+			rest := arg[idx+6:]
+			if idx2 := strings.IndexAny(rest, " \t"); idx2 != -1 {
+				s.dsnEnvID = rest[:idx2]
+			} else {
+				s.dsnEnvID = rest
+			}
+		}
+	}
+}
+
+// parseDSNRcptParams parses DSN parameters from RCPT TO command.
+// Format: RCPT TO:<addr> [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;addr]
+func (s *Session) parseDSNRcptParams(recipient, arg string) {
+	var notify string
+	
+	// Look for NOTIFY parameter
+	upperArg := strings.ToUpper(arg)
+	if strings.Contains(upperArg, "NOTIFY=") {
+		idx := strings.Index(upperArg, "NOTIFY=")
+		if idx != -1 {
+			rest := arg[idx+7:]
+			if idx2 := strings.IndexAny(rest, " \t"); idx2 != -1 {
+				notify = rest[:idx2]
+			} else {
+				notify = rest
+			}
+		}
+	}
+	
+	// Store NOTIFY flags for this recipient
+	if notify != "" && notify != "NEVER" {
+		s.dsnNotify[recipient] = notify
+	}
+}

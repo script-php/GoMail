@@ -30,3 +30,10 @@ webhook api
 mobile app
 message context threading
 webmail interface
+DSN (Delivery Status Notifications) - No detailed bounce reports
+SMTPUTF8 - No Unicode email support (e.g., 用户@example.com)
+List-Unsubscribe headers - No automatic unsubscribe links
+ IPv6 - Only IPv4 connections (1-line fix: change "tcp4" to "tcp")
+VERP - Per-recipient bounce tracking
+ARF - Abuse report processing
+DANE, BIMI, Greylisting, Tarpitting, enhanced status codes

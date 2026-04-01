@@ -98,8 +98,8 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		}
 	}
 
-	// MAIL FROM
-	if err := sendCmd(conn, fmt.Sprintf("MAIL FROM:<%s>", from)); err != nil {
+	// MAIL FROM (with DSN parameters)
+	if err := sendCmd(conn, fmt.Sprintf("MAIL FROM:<%s> RET=FULL NOTIFY=FAILURE", from)); err != nil {
 		return err
 	}
 	mailReply, err := readReply(conn)

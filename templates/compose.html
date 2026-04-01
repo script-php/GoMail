@@ -4,6 +4,11 @@
         <div class="compose-header">
             <h2>New Message</h2>
         </div>
+        {{if .Error}}
+        <div class="error-notification">
+            <strong>Error:</strong> {{.Error}}
+        </div>
+        {{end}}
         <form method="POST" action="/send">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <div class="compose-body">
@@ -19,7 +24,8 @@
                 </div>
                 <div class="compose-field">
                     <label for="cc">Cc</label>
-                    <input type="text" id="cc" name="cc" placeholder="Cc (optional)">
+                    <input type="text" id="cc" name="cc" placeholder="Cc (optional)"
+                           value="{{if .Prefill}}{{index .Prefill "cc"}}{{end}}">
                 </div>
                 <div class="compose-field">
                     <label for="subject">Subject</label>
@@ -31,11 +37,11 @@
                     <label>
                         Priority:
                         <select id="priority" name="priority">
-                            <option value="1">Highest</option>
-                            <option value="2">High</option>
-                            <option value="3" selected>Normal</option>
-                            <option value="4">Low</option>
-                            <option value="5">Lowest</option>
+                            <option value="1" {{if and .Prefill (eq (index .Prefill "priority") "1")}}selected{{end}}>Highest</option>
+                            <option value="2" {{if and .Prefill (eq (index .Prefill "priority") "2")}}selected{{end}}>High</option>
+                            <option value="3" {{if or (not .Prefill) (eq (index .Prefill "priority") "3")}}selected{{end}}>Normal</option>
+                            <option value="4" {{if and .Prefill (eq (index .Prefill "priority") "4")}}selected{{end}}>Low</option>
+                            <option value="5" {{if and .Prefill (eq (index .Prefill "priority") "5")}}selected{{end}}>Lowest</option>
                         </select>
                     </label>
                     <label>
@@ -44,7 +50,7 @@
                     </label>
                 </div>
                 <textarea id="body" name="body" class="compose-textarea" required
-                          placeholder="Write your message..."></textarea>
+                          placeholder="Write your message...">{{if .Prefill}}{{index .Prefill "body"}}{{end}}</textarea>
             </div>
             <div class="compose-actions">
                 <button type="submit" class="btn btn-primary">Send</button>

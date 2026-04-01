@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     next_retry    DATETIME NOT NULL DEFAULT (datetime('now')),
     last_error    TEXT    NOT NULL DEFAULT '',
     status        TEXT    NOT NULL DEFAULT 'pending', -- pending, sending, sent, failed
+    dsn_notify    TEXT    NOT NULL DEFAULT '',        -- DSN NOTIFY flags (SUCCESS,FAILURE,DELAY)
+    dsn_ret       TEXT    NOT NULL DEFAULT 'FULL',    -- FULL or HDRS
+    dsn_envid     TEXT    NOT NULL DEFAULT '',        -- Envelope ID for DSN reports
+    dsn_sent      INTEGER NOT NULL DEFAULT 0,         -- Whether DSN was sent (boolean)
     created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
     updated_at    DATETIME NOT NULL DEFAULT (datetime('now'))
 );

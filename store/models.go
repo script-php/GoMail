@@ -86,6 +86,10 @@ type QueueEntry struct {
 	NextRetry   time.Time `json:"next_retry"`
 	LastError   string    `json:"last_error"`
 	Status      string    `json:"status"`
+	DSNNotify   string    `json:"dsn_notify"`    // DSN NOTIFY flags
+	DSNRet      string    `json:"dsn_ret"`      // FULL or HDRS
+	DSNEnvID    string    `json:"dsn_envid"`    // Envelope ID
+	DSNSent     bool      `json:"dsn_sent"`     // Whether DSN was sent
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

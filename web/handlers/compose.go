@@ -121,6 +121,8 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// Validate local recipients exist before enqueuing
 	localDomains, _ := h.db.ListAllDomainNames()
+	var validationErrors []string
+	
 	for _, rcpt := range recipients {
 		parts := strings.SplitN(rcpt, "@", 2)
 		if len(parts) != 2 {
@@ -137,10 +139,39 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		if isLocal {
 			acct, err := h.db.GetAccountByEmail(rcpt)
 			if err != nil || acct == nil || !acct.IsActive {
-				http.Error(w, fmt.Sprintf("Recipient not found: %s", rcpt), http.StatusBadRequest)
-				return
+				validationErrors = append(validationErrors, fmt.Sprintf("Recipient not found: %s", rcpt))
 			}
 		}
+	}
+
+	// If there are validation errors, re-render compose form with errors
+	if len(validationErrors) > 0 {
+		folders, _ := h.db.ListFolders(account.ID)
+		unread, _ := h.db.CountUnread(account.ID)
+		
+		data := map[string]interface{}{
+			"Title":     "Compose",
+			"From":      account.Email,
+			"Unread":    unread,
+			"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+			"Section":   "compose",
+			"Account":   account,
+			"Folders":   folders,
+			"Error":     strings.Join(validationErrors, "; "),
+			"Prefill": map[string]string{
+				"to":       to,
+				"cc":       cc,
+				"subject":  subject,
+				"body":     body,
+				"priority": priority,
+			},
+		}
+		
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+			log.Printf("[web] template error: %v", err)
+		}
+		return
 	}
 
 	// Build the RFC 5322 message

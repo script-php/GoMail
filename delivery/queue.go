@@ -132,6 +132,9 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 			RawMessage:  signedMessage,
 			MaxAttempts: q.cfg.Delivery.MaxRetries,
 			NextRetry:   time.Now().UTC(),
+			DSNNotify:   "FAILURE",  // Request failure notifications from remote server
+			DSNRet:      "FULL",     // Request full message in failure report
+			DSNEnvID:    fmt.Sprintf("%d@%s", msgID, q.cfg.Server.Hostname),
 		}
 
 		if _, err := q.db.EnqueueMessage(entry); err != nil {

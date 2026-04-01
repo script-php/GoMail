@@ -475,9 +475,9 @@ func sqliteTime(t time.Time) string {
 // EnqueueMessage adds a message to the outbound delivery queue.
 func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) {
 	result, err := db.Exec(`
-		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry),
+		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("enqueueing message: %w", err)
@@ -489,7 +489,7 @@ func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) {
 func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 	rows, err := db.Query(`
 		SELECT id, message_id, mail_from, rcpt_to, raw_message, attempts, max_attempts,
-			next_retry, last_error, status, created_at, updated_at
+			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, created_at, updated_at
 		FROM outbound_queue
 		WHERE status = 'pending' AND next_retry <= datetime('now')
 		ORDER BY next_retry ASC
@@ -502,11 +502,13 @@ func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 	var entries []*QueueEntry
 	for rows.Next() {
 		q := &QueueEntry{}
+		var dsnSent int
 		if err := rows.Scan(&q.ID, &q.MessageID, &q.MailFrom, &q.RcptTo,
 			&q.RawMessage, &q.Attempts, &q.MaxAttempts, &q.NextRetry,
-			&q.LastError, &q.Status, &q.CreatedAt, &q.UpdatedAt); err != nil {
+			&q.LastError, &q.Status, &q.DSNNotify, &q.DSNRet, &q.DSNEnvID, &dsnSent, &q.CreatedAt, &q.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scanning queue row: %w", err)
 		}
+		q.DSNSent = dsnSent != 0
 		entries = append(entries, q)
 	}
 	return entries, rows.Err()
@@ -526,6 +528,17 @@ func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry 
 // DeleteQueueEntry removes a completed/failed entry from the queue.
 func (db *DB) DeleteQueueEntry(id int64) error {
 	_, err := db.Exec(`DELETE FROM outbound_queue WHERE id = ?`, id)
+	return err
+}
+
+// MarkDSNSent marks a queue entry's DSN as sent.
+func (db *DB) MarkDSNSent(id int64) error {
+	_, err := db.Exec(`
+		UPDATE outbound_queue
+		SET dsn_sent = 1, updated_at = datetime('now')
+		WHERE id = ?`,
+		id,
+	)
 	return err
 }
 
