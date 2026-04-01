@@ -14,7 +14,8 @@ import (
 
 // SendMail delivers a message to a remote SMTP server via MX lookup.
 // This is used by the delivery worker for outbound messages.
-func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config) error {
+// DSN parameters (dsnNotify, dsnRet, dsnEnvID) are optional and can be empty.
+func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID string) error {
 	// Extract recipient domain
 	parts := strings.SplitN(to, "@", 2)
 	if len(parts) != 2 {
@@ -31,7 +32,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config) 
 	// Try each MX in preference order
 	var lastErr error
 	for _, mx := range mxRecords {
-		err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg)
+		err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, dsnNotify, dsnRet, dsnEnvID)
 		if err == nil {
 			return nil // Success
 		}
@@ -43,7 +44,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config) 
 }
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
-func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config) error {
+func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID string) error {
 	// Connect to port 25 (IPv4 only)
 	addr := host + ":25"
 	conn, err := net.DialTimeout("tcp4", addr, 30*time.Second)
@@ -75,6 +76,9 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("EHLO rejected by %s: %s", host, ehloReply)
 	}
 
+	// Check if server supports DSN (Delivery Status Notifications)
+	supportsDSN := strings.Contains(ehloReply, "DSN")
+
 	// Try STARTTLS if supported
 	if strings.Contains(ehloReply, "STARTTLS") && tlsCfg != nil {
 		if err := sendCmd(conn, "STARTTLS"); err == nil {
@@ -89,17 +93,29 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					log.Printf("[smtp] STARTTLS handshake with %s failed: %v (continuing without TLS)", host, err)
 				} else {
 					conn = clientTLS
-					// Re-EHLO after STARTTLS
+					// Re-EHLO after STARTTLS and update DSN support flag
 					if err := sendCmd(conn, fmt.Sprintf("EHLO %s", myHostname)); err == nil {
-						readReply(conn) // Consume EHLO reply
+						postTLSEhlo, _ := readReply(conn)
+						supportsDSN = strings.Contains(postTLSEhlo, "DSN")
 					}
 				}
 			}
 		}
 	}
 
-	// MAIL FROM (with DSN parameters)
-	if err := sendCmd(conn, fmt.Sprintf("MAIL FROM:<%s> RET=FULL NOTIFY=FAILURE", from)); err != nil {
+	// MAIL FROM with DSN parameters (RFC 3461) - only if server supports DSN
+	// Format: MAIL FROM:<addr> [RET=FULL|HDRS] [ENVID=<id>]
+	mailFromCmd := fmt.Sprintf("MAIL FROM:<%s>", from)
+	if supportsDSN {
+		if dsnRet != "" {
+			mailFromCmd += fmt.Sprintf(" RET=%s", dsnRet)
+		}
+		if dsnEnvID != "" {
+			mailFromCmd += fmt.Sprintf(" ENVID=%s", dsnEnvID)
+		}
+	}
+
+	if err := sendCmd(conn, mailFromCmd); err != nil {
 		return err
 	}
 	mailReply, err := readReply(conn)
@@ -110,8 +126,14 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("MAIL FROM rejected by %s: %s", host, mailReply)
 	}
 
-	// RCPT TO
-	if err := sendCmd(conn, fmt.Sprintf("RCPT TO:<%s>", to)); err != nil {
+	// RCPT TO with DSN parameters (RFC 3461) - only if server supports DSN
+	// Format: RCPT TO:<addr> [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;<addr>]
+	rcptToCmd := fmt.Sprintf("RCPT TO:<%s>", to)
+	if supportsDSN && dsnNotify != "" {
+		rcptToCmd += fmt.Sprintf(" NOTIFY=%s", dsnNotify)
+	}
+
+	if err := sendCmd(conn, rcptToCmd); err != nil {
 		return err
 	}
 	rcptReply, err := readReply(conn)

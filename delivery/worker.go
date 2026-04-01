@@ -126,6 +126,9 @@ func (w *Worker) processQueue() {
 			messageWithARC,
 			w.cfg.Server.Hostname,
 			w.tlsCfg,
+			entry.DSNNotify,
+			entry.DSNRet,
+			entry.DSNEnvID,
 		)
 	}
 
