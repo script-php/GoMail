@@ -700,8 +700,16 @@ func parseDKIMTags(s string) map[string]string {
 
 		key := strings.TrimSpace(part[:idx])
 		value := strings.TrimSpace(part[idx+1:])
-		// Remove internal whitespace from value
-		value = strings.Join(strings.Fields(value), "")
+		// For the h= tag (header list), clean up spaces around colons
+		// For other values, remove internal whitespace completely
+		if strings.ToLower(key) == "h" {
+			// Remove ALL spaces from h= value, then let Split handle it
+			// This handles cases like "from: to: subject:" correctly
+			value = strings.ReplaceAll(value, " ", "")
+		} else {
+			// Remove internal whitespace from other values
+			value = strings.Join(strings.Fields(value), "")
+		}
 		tags[key] = value
 	}
 
