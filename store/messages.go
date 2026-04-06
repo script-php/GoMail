@@ -43,11 +43,11 @@ func (db *DB) GetDomain(id int64) (*Domain, error) {
 // GetDomainByName returns a domain by its domain name.
 func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 	d := &Domain{}
-	var isActive int
+	var isActive, requireTLS int
 	err := db.QueryRow(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, created_at
 		FROM domains WHERE domain = ?`, domain).Scan(
-		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &d.CreatedAt,
+		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -56,13 +56,14 @@ func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 		return nil, fmt.Errorf("getting domain %s: %w", domain, err)
 	}
 	d.IsActive = isActive == 1
+	d.RequireTLS = requireTLS == 1
 	return d, nil
 }
 
 // ListDomains returns all domains.
 func (db *DB) ListDomains() ([]*Domain, error) {
 	rows, err := db.Query(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, created_at
 		FROM domains ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("listing domains: %w", err)
@@ -72,11 +73,12 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 	var domains []*Domain
 	for rows.Next() {
 		d := &Domain{}
-		var isActive int
-		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &d.CreatedAt); err != nil {
+		var isActive, requireTLS int
+		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &requireTLS, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scanning domain row: %w", err)
 		}
 		d.IsActive = isActive == 1
+		d.RequireTLS = requireTLS == 1
 		domains = append(domains, d)
 
 	}
@@ -87,9 +89,9 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 func (db *DB) UpdateDomain(d *Domain) error {
 	_, err := db.Exec(`
 		UPDATE domains SET domain = ?, is_active = ?, dkim_selector = ?, dkim_algorithm = ?,
-		dkim_private_key = ?, dkim_public_key = ? WHERE id = ?`,
+		dkim_private_key = ?, dkim_public_key = ?, require_tls = ? WHERE id = ?`,
 		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm,
-		d.DKIMPrivateKey, d.DKIMPublicKey, d.ID,
+		d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.ID,
 	)
 	return err
 }

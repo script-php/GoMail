@@ -44,6 +44,13 @@
             </label>
         </div>
 
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="require_tls" value="1" {{if .Domain.RequireTLS}}checked{{end}}>
+                Require TLS for outbound mail (enforce STARTTLS with remote servers)
+            </label>
+        </div>
+
         <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Domain{{else}}Save Changes{{end}}</button>
     </form>
 

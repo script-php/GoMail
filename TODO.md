@@ -11,6 +11,7 @@ list-id list-help list-unsubscribe list-subscribe list-post list-owner list-arch
 thread-index thread-topic
 arc-seal arc-message-signature arc-authentication-results (DONE - Full ARC with RSA+Ed25519) {cm:2026-03-27}
 ARC cryptographic verification (DONE - Full DKIM-style signature verification with RSA+Ed25519) {cm:2026-04-06}
+configurable strict-TLS mode (DONE - per-domain require_tls flag with RFC 8689 semantics) {cm:2026-04-06}
 smtp authentication (plain, login, cram-md5)
 bounce handling ndr detection
 spam filtering

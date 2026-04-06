@@ -15,7 +15,8 @@ import (
 // SendMail delivers a message to a remote SMTP server via MX lookup.
 // This is used by the delivery worker for outbound messages.
 // DSN parameters (dsnNotify, dsnRet, dsnEnvID) are optional and can be empty.
-func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID string) error {
+// requireTLS: if true, fails delivery if TLS cannot be established; if false, uses opportunistic TLS
+func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID string) error {
 	// Extract recipient domain
 	parts := strings.SplitN(to, "@", 2)
 	if len(parts) != 2 {
@@ -32,7 +33,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 	// Try each MX in preference order
 	var lastErr error
 	for _, mx := range mxRecords {
-		err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, dsnNotify, dsnRet, dsnEnvID)
+		err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID)
 		if err == nil {
 			return nil // Success
 		}
@@ -44,7 +45,8 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 }
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
-func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID string) error {
+// requireTLS: if true, fails delivery if TLS cannot be established; if false, uses opportunistic TLS
+func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID string) error {
 	// Connect to port 25 (IPv4 only)
 	addr := host + ":25"
 	conn, err := net.DialTimeout("tcp4", addr, 30*time.Second)
@@ -90,7 +92,10 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					MinVersion:         tls.VersionTLS12,
 				})
 				if err := clientTLS.Handshake(); err != nil {
-					log.Printf("[smtp] STARTTLS handshake with %s failed: %v (continuing without TLS)", host, err)
+					if requireTLS {
+						return fmt.Errorf("TLS required but STARTTLS handshake with %s failed: %w", host, err)
+					}
+					log.Printf("[smtp] STARTTLS handshake with %s failed: %v (continuing with opportunistic TLS disabled)", host, err)
 				} else {
 					conn = clientTLS
 					// Re-EHLO after STARTTLS and update DSN support flag
@@ -101,6 +106,9 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 				}
 			}
 		}
+	} else if requireTLS && !strings.Contains(ehloReply, "STARTTLS") {
+		// TLS required but server doesn't support STARTTLS
+		return fmt.Errorf("TLS required but %s does not support STARTTLS", host)
 	}
 
 	// MAIL FROM with DSN parameters (RFC 3461) - only if server supports DSN

@@ -11,6 +11,7 @@ type Domain struct {
 	DKIMAlgorithm  string    `json:"dkim_algorithm"`
 	DKIMPrivateKey string    `json:"-"`
 	DKIMPublicKey  string    `json:"dkim_public_key"`
+	RequireTLS     bool      `json:"require_tls"`     // Fail delivery if TLS unavailable (RFC 8689)
 	CreatedAt      time.Time `json:"created_at"`
 }
 

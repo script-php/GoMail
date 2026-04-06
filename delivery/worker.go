@@ -120,12 +120,20 @@ func (w *Worker) processQueue() {
 	if w.isLocalRecipient(entry.RcptTo) {
 		deliveryErr = w.deliverLocal(entry, messageWithARC)
 	} else {
+		// Get domain's requireTLS setting for outbound delivery
+		domain := parseRecipientDomain(entry.RcptTo)
+		requireTLS := false
+		if domainRecord, err := w.db.GetDomainByName(domain); err == nil && domainRecord != nil {
+			requireTLS = domainRecord.RequireTLS
+		}
+
 		deliveryErr = smtp.SendMail(
 			entry.MailFrom,
 			entry.RcptTo,
 			messageWithARC,
 			w.cfg.Server.Hostname,
 			w.tlsCfg,
+			requireTLS,
 			entry.DSNNotify,
 			entry.DSNRet,
 			entry.DSNEnvID,

@@ -163,6 +163,7 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 
 		domain.Domain = strings.ToLower(strings.TrimSpace(r.FormValue("domain")))
 		domain.IsActive = r.FormValue("is_active") == "1"
+		domain.RequireTLS = r.FormValue("require_tls") == "1"
 		domain.DKIMSelector = r.FormValue("dkim_selector")
 		domain.DKIMAlgorithm = r.FormValue("dkim_algorithm")
 

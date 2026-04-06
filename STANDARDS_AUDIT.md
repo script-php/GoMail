@@ -117,9 +117,13 @@
   - Impact: Violates strict DMARC intent; wastes storage on rejected mail
   - **Fix:** Return 550 during SMTP transaction for `p=reject`
 
-- ⚠️ **TLS on outbound** - STARTTLS attempted, but if handshake **fails, delivery continues unencrypted** with only a log warning (smtp/outbound.go)
-  - Impact: Mail can be sent in plaintext if MitM strips STARTTLS
-  - **Fix:** Add configurable strict-TLS mode per domain
+- ⚠️ **TLS on outbound** (FIXED April 6, 2026) - Configurable strict-TLS mode per domain
+  - **Implementation:** Added `require_tls` field to domains table; delivery fails if TLS unavailable when enabled
+  - **Behavior (opportunistic TLS default):**
+    - If `require_tls = false`: STARTTLS attempted; failure logs warning, delivery continues unencrypted
+    - If `require_tls = true`: STARTTLS required; failure aborts delivery with error
+  - **RFC compliance:** Supports RFC 8689 REQUIRETLS semantics
+  - **Admin control:** Set `require_tls=1` in domains table per domain
 
 - ⚠️ **Authentication-Results header** - Generated and stored in DB `auth_results` field, but **not prepended to the raw message** headers that the user sees
   - Impact: Email clients can't see auth results in message source
