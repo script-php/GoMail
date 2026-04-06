@@ -103,19 +103,11 @@
 - ✅ **DMARC report parsing** - Incoming XML aggregate reports (reporting/dmarc.go)
 - ✅ **TLS-RPT report parsing** - Incoming JSON reports (reporting/tlsrpt.go)
 
----
-
-## ⚠️ PARTIALLY IMPLEMENTED (Code exists but incomplete or not wired)
-
 ### Wired But Incomplete
 - ✅ **ARC cryptographic verification** (FIXED April 6, 2026) - Full DKIM-style signature verification for both ARC-Message-Signature and ARC-Seal
   - Impact: ARC chains now verified cryptographically; forged chains rejected
   - **Implementation:** `verifyARCMessageSignature()` and `verifyARCSeal()` with RSA and Ed25519 support
   - **Verified:** Working in production (Gmail ARC chains pass verification)
-
-- ⚠️ **DMARC policy enforcement** - Checks run, but `p=reject` messages are **accepted and quarantined** instead of rejected at SMTP level with 5xx
-  - Impact: Violates strict DMARC intent; wastes storage on rejected mail
-  - **Fix:** Return 550 during SMTP transaction for `p=reject`
 
 - ✅ **TLS on outbound** (FIXED April 6, 2026) - Configurable strict-TLS mode per domain
   - **Implementation:** Added `require_tls` field to domains table; delivery fails if TLS unavailable when enabled
@@ -124,6 +116,15 @@
     - If `require_tls = true`: STARTTLS required; failure aborts delivery with error
   - **RFC compliance:** Supports RFC 8689 REQUIRETLS semantics
   - **Admin control:** Set `require_tls=1` in domains table per domain
+
+
+---
+
+## ⚠️ PARTIALLY IMPLEMENTED (Code exists but incomplete or not wired)
+
+- ⚠️ **DMARC policy enforcement** - Checks run, but `p=reject` messages are **accepted and quarantined** instead of rejected at SMTP level with 5xx
+  - Impact: Violates strict DMARC intent; wastes storage on rejected mail
+  - **Fix:** Return 550 during SMTP transaction for `p=reject`
 
 - ⚠️ **Authentication-Results header** - Generated and stored in DB `auth_results` field, but **not prepended to the raw message** headers that the user sees
   - Impact: Email clients can't see auth results in message source
