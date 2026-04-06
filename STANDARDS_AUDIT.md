@@ -1,63 +1,156 @@
 # GoMail Standards Compliance Audit
 
-**Date:** March 31, 2026  
+**Date:** April 5, 2026  
 **Status:** Production-ready for basic delivery, missing advanced features  
+**Method:** Source code verified (not just config/docs)
 
 ---
 
-## ✅ IMPLEMENTED STANDARDS
+## ✅ FULLY IMPLEMENTED
 
 ### Core RFC 5321 SMTP Compliance
-- ✅ **EHLO/HELO** - Both supported, EHLO preferred (session.go:177)
-- ✅ **Line endings** - Handles CRLF, LF properly (session.go uses bufio.Reader)
-- ✅ **8BITMIME** - Advertised in EHLO (session.go:124)
-- ✅ **ENHANCEDSTATUSCODES** - Advertised (session.go:125)  
-- ✅ **PIPELINING** - Advertised (session.go:126)
-- ✅ **SIZE limit** - Advertised and enforced (session.go:123, 241-244)
-- ✅ **STARTTLS** - Full support with TLS upgrade (session.go:159-186)
+- ✅ **EHLO/HELO** - Both supported, EHLO preferred (smtp/session.go)
+- ✅ **Line endings** - Handles CRLF, LF properly (bufio.Reader)
+- ✅ **8BITMIME** - Advertised in EHLO
+- ✅ **ENHANCEDSTATUSCODES** - Advertised in EHLO
+- ✅ **PIPELINING** - Advertised in EHLO
+- ✅ **SIZE limit** - Advertised and enforced (default 25MB)
+- ✅ **STARTTLS** - Full support with TLS upgrade
+- ✅ **DSN extension** - Advertised in EHLO; `RET=`/`ENVID=` on MAIL FROM, `NOTIFY=` on RCPT TO parsed and forwarded to remote servers if supported (smtp/session.go, smtp/outbound.go)
 
 ### Security & Authentication
-- ✅ **DKIM Signing** - Per-domain DKIM signing on outbound (delivery/queue.go:44-68)
-- ✅ **DKIM Verification** - Inbound messages verified (smtp/inbound.go:auth checks)
-- ✅ **SPF Verification** - Checked on inbound (auth/spf.go)
-- ✅ **DMARC Verification** - Checked on inbound (auth/dmarc.go)
-- ✅ **ARC Chain** - Full implementation with signing (delivery/worker.go:283-351)
-- ✅ **Authentication-Results Headers** - Added to inbound (smtp/inbound.go)
-- ✅ **Reverse DNS (PTR)** - Verified (dns/ptr.go with forward-confirmed lookup)
+- ✅ **DKIM Signing** - Per-domain DKIM signing on outbound, RSA-SHA256 + Ed25519-SHA256 (delivery/queue.go, auth/dkim.go)
+- ✅ **DKIM Verification** - Inbound messages verified with DNS key lookup (auth/dkim.go, auth/dkim_lookup.go)
+- ✅ **SPF Verification** - Full mechanism parsing: `all`, `a`, `mx`, `ip4`, `ip6`, `include`, `redirect` with qualifiers and CIDR (auth/spf.go)
+- ✅ **DMARC Verification** - Record lookup, org domain fallback, relaxed/strict alignment, policy enforcement (auth/dmarc.go)
+- ✅ **ARC Chain Signing** - ARC-Authentication-Results, ARC-Message-Signature, ARC-Seal generation (auth/arc.go, delivery/worker.go)
+- ✅ **ARC Structural Validation** - Chain completeness, cv= values, sequential instance checks (auth/arc.go)
+- ✅ **Authentication-Results Headers** - RFC 8601 format with SPF, DKIM, DMARC results (auth/results.go)
 
-### Connection Management  
-- ✅ **Max connections** - Limited to config.SMTP.MaxConnections (default 100)
+### Delivery & Bounce Handling
+- ✅ **DSN generation** - RFC 3464 multipart DSN on permanent failure, delivered to sender mailbox (delivery/worker.go)
+- ✅ **DSN status codes** - RFC 3463 mapping via reporting/dsn.go
+- ✅ **DSN dedup** - `dsn_sent` flag prevents duplicate bounce messages
+- ✅ **Retry with backoff** - Configurable intervals + exponential backoff, capped at 48 hours (delivery/retry.go)
+- ✅ **Local delivery shortcut** - Skips SMTP for local recipients (delivery/worker.go)
+- ✅ **Worker pool** - Configurable worker count, DB-backed queue polling (delivery/worker.go)
+
+### Connection Management
 - ✅ **Max recipients** - Limited to config.SMTP.MaxRecipients (default 100)
-- ✅ **Message size limit** - Enforced (config default 25MB, ~26MB)
-- ✅ **Read/Write timeouts** - Both configurable (config default 60s each)
-- ✅ **Connection rate limiting** - Per IP (smtp/ratelimit.go)
-- ✅ **Message rate limiting** - Per IP (smtp/ratelimit.go, messages_per_minute)
+- ✅ **Message size limit** - Enforced (config default 25MB)
+- ✅ **Read/Write timeouts** - Both configurable (default 60s each)
+- ✅ **Connection rate limiting** - Per-IP connections/minute sliding window (smtp/ratelimit.go)
+- ✅ **Message rate limiting** - Per-IP messages/minute sliding window (smtp/ratelimit.go)
 
 ### Deliverability
-- ✅ **Proper SMTP banner** - Includes hostname, no version disclosure (session.go:81)
-- ✅ **MAIL FROM validation** - Checked syntax and format
-- ✅ **RCPT TO validation** - Checks domain and account existence
-- ✅ **Received header** - Added to all inbound messages
+- ✅ **Proper SMTP banner** - Includes hostname, no version disclosure
+- ✅ **MAIL FROM validation** - Syntax and format checked
+- ✅ **RCPT TO validation** - Domain and account existence checks
+- ✅ **Received header** - Prepended to all inbound messages
 - ✅ **Message-ID** - Generated per message
+- ✅ **DMARC policy enforcement** - `p=reject`/`p=quarantine` → spam folder; `p=none` → inbox
 
-### MTA-STS & Security Policies
-- ✅ **MTA-STS Policy** - Endpoint at `/.well-known/mta-sts.txt` (web/handlers/mta_sts.go)
-- ✅ **MTA-STS structure** - RFC 8461 compliant policy (mta_sts/policy.go)
-- ✅ **TLS enforcement** - Enforced via STARTTLS (smtp/outbound.go:94-110)
+### MTA-STS (Serving)
+- ✅ **MTA-STS Policy endpoint** - `/.well-known/mta-sts.txt` (web/handlers/mta_sts.go)
+- ✅ **MTA-STS structure** - RFC 8461 compliant enforce-mode policy (mta_sts/policy.go)
+- ✅ **MTA-STS DNS record helper** - Generation utility included
+
+### MDN (Read Receipts)
+- ✅ **MDN generation** - Simple text + RFC 3798 multipart format (mdn/mdn.go)
+- ✅ **MDN auto/manual modes** - Configurable send-on-read or user-triggered
+- ✅ **MDN dedup** - `mdn_sent` flag prevents duplicates
+- ✅ **MDN web API** - `/api/send-mdn/{id}` endpoint for manual sending
+
+### TLS
+- ✅ **Three TLS modes** - `autocert` (Let's Encrypt), `manual` (cert files), `none`
+- ✅ **Strong defaults** - X25519+P256 curves, AEAD-only ciphers, TLS 1.2+ minimum (tls/config.go)
+- ✅ **ACME integration** - ACME challenge handling, shared cert for HTTPS + SMTP
+- ✅ **TLSA record generation** - `3 1 1` format from server cert (tls/dane.go)
+
+### DNS
+- ✅ **MX lookup** - Preference-sorted with A/AAAA fallback per RFC 5321 §5 (dns/mx.go)
+- ✅ **PTR lookup** - Forward-confirmed reverse DNS (FCrDNS) verification (dns/ptr.go)
+- ✅ **DNS caching** - TTL-based in-memory cache with background cleanup (dns/cache.go)
+
+### Web/UI
+- ✅ **Session-based auth** - DB-backed sessions, HttpOnly+Secure+SameSite cookies (security/session.go)
+- ✅ **CSRF protection** - HMAC-SHA256 of session token
+- ✅ **Security headers** - HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy (security/headers.go)
+- ✅ **Compose** - Plain text with To, Cc, Subject, Body; priority headers; read receipt option
+- ✅ **Reply & Forward** - With ARC signing on forwarded messages
+- ✅ **Folder system** - Inbox, Sent, Spam, Drafts, Trash with unread/total counts (store/folders.go)
+- ✅ **Admin panel** - Domain and account management
+- ✅ **Attachment download** - Served from message view
+
+### MIME & Parsing
+- ✅ **RFC 5322 parsing** - Via Go's `net/mail` (parser/message.go)
+- ✅ **Recursive multipart walking** - Handles nested `multipart/*` (parser/mime.go)
+- ✅ **Attachment extraction** - Content-Disposition detection, SHA256-based storage (parser/attachments.go)
+- ✅ **Base64 decoding** - Handled in MIME parser
 
 ### Error Handling
 - ✅ **Reply codes** - Proper SMTP codes (220, 250, 354, 452, 500, 503, etc.)
-- ✅ **Multiline responses** - Supported (session.go:345-349)
-- ✅ **RSET support** - Connection reset (session.go:338-342)
-- ✅ **QUIT support** - Graceful closure (session.go:104-106)
-- ✅ **VRFY command** - Accepted (session.go:108)
-- ✅ **NOOP command** - Accepted (session.go:101)
+- ✅ **Multiline responses** - Supported
+- ✅ **RSET/QUIT/VRFY/NOOP** - All implemented
 
 ### Configuration
-- ✅ **Configurable parameters** - Per docs/config.md
-- ✅ **Rate limiting config** - connections_per_minute, messages_per_minute
-- ✅ **TLS mode selection** - autocert, manual, none
-- ✅ **DKIM algorithm choice** - ed25519, rsa
+- ✅ **Comprehensive config** - Server, SMTP, TLS, DKIM, Store, Web, Mail, Delivery, DNS, Security, MDN, Logging sections
+- ✅ **Validation** - Clear error messages on invalid config
+- ✅ **Bootstrap admin** - First-run setup
+- ✅ **Graceful shutdown** - SIGINT/SIGTERM stops SMTP, workers, web in order (main.go)
+
+### Reporting (Parse Only)
+- ✅ **DMARC report parsing** - Incoming XML aggregate reports (reporting/dmarc.go)
+- ✅ **TLS-RPT report parsing** - Incoming JSON reports (reporting/tlsrpt.go)
+
+---
+
+## ⚠️ PARTIALLY IMPLEMENTED (Code exists but incomplete or not wired)
+
+### Wired But Incomplete
+- ✅ **ARC cryptographic verification** (FIXED April 6, 2026) - Full DKIM-style signature verification for both ARC-Message-Signature and ARC-Seal
+  - Impact: ARC chains now verified cryptographically; forged chains rejected
+  - **Implementation:** `verifyARCMessageSignature()` and `verifyARCSeal()` with RSA and Ed25519 support
+  - **Verified:** Working in production (Gmail ARC chains pass verification)
+
+- ⚠️ **DMARC policy enforcement** - Checks run, but `p=reject` messages are **accepted and quarantined** instead of rejected at SMTP level with 5xx
+  - Impact: Violates strict DMARC intent; wastes storage on rejected mail
+  - **Fix:** Return 550 during SMTP transaction for `p=reject`
+
+- ⚠️ **TLS on outbound** - STARTTLS attempted, but if handshake **fails, delivery continues unencrypted** with only a log warning (smtp/outbound.go)
+  - Impact: Mail can be sent in plaintext if MitM strips STARTTLS
+  - **Fix:** Add configurable strict-TLS mode per domain
+
+- ⚠️ **Authentication-Results header** - Generated and stored in DB `auth_results` field, but **not prepended to the raw message** headers that the user sees
+  - Impact: Email clients can't see auth results in message source
+  - **Fix:** Prepend header to raw message before storage
+
+- ⚠️ **MDN multipart format** - Proper RFC 3798 multipart MDN exists (`GenerateMDNMultipart`) but the **simple text version** is used in practice
+  - Impact: Some mail clients may not process simple-format MDNs correctly
+  - **Fix:** Switch handler to use `GenerateMDNMultipart`
+
+- ⚠️ **SPF spec compliance** - Core mechanisms work, but missing: `exists` mechanism, `exp=` modifier, macro expansion, DNS lookup counting (RFC 7208 §4.6.4 limits to 10)
+  - Impact: Could infinite-loop on adversarial SPF records; rare edge cases may fail
+
+- ⚠️ **DMARC spec compliance** - `sp=` (subdomain policy) parsed but never applied; `pct=` (percentage) parsed but ignored; `rua`/`ruf` parsed but no reports generated; org-domain uses naive "last two labels" instead of Public Suffix List
+  - Impact: Subdomains with different policies treated same as parent; percentage sampling not honored
+
+### Code Exists But Not Wired
+- ⚠️ **Reverse DNS (PTR) on inbound** - `dns.VerifyPTR` is fully implemented but **never called** from the SMTP inbound accept path
+  - Impact: No rDNS verification on connecting IPs despite having the code
+  - **Fix:** Call `dns.VerifyPTR(remoteIP)` in inbound.go before processing; add result to auth checks
+
+- ⚠️ **Max connections enforcement** - `config.SMTP.MaxConnections` is defined (default 100) but **never enforced** in the accept loop (smtp/inbound.go has no connection counter)
+  - Impact: No upper bound on simultaneous SMTP connections under load
+  - **Fix:** Add semaphore/counter in accept loop
+
+- ⚠️ **Web rate limiter** - Rate limiting middleware written in web/middleware.go but **never registered** in web/server.go
+  - Impact: Web UI has no rate limiting; login brute-force possible
+  - **Fix:** Wire middleware into server setup
+
+- ⚠️ **Logging config** - `level` and `format` fields defined in config struct but **never used**; all logging is `log.Printf`
+  - Impact: Can't control log verbosity or output format
+  - **Fix:** Initialize a structured logger from config values at startup
 
 ---
 
@@ -66,144 +159,195 @@
 ### SMTP Extensions
 - ❌ **SMTPUTF8** (RFC 6531) - Not advertised in EHLO; Unicode email addresses not supported
   - Impact: Cannot send/receive emails with non-ASCII addresses (e.g., 用户@example.com)
-  - **Priority:** Medium (increasingly important for international email)
+  - **Priority:** Medium
 
-- ❌ **DSN** (RFC 3464) - Delivery Status Notifications not implemented
-  - Impact: Cannot provide detailed bounce reports (e.g., "user unknown", "mailbox full")
-  - **Priority:** High (essential for real-world deployments)
+- ❌ **SMTP AUTH** (RFC 4954) - No LOGIN/PLAIN authentication for external clients
+  - Impact: Only webmail users can send; no IMAP/external client relay
+  - **Priority:** High (blocks external mail client integration)
 
-- ❌ **CHUNKING** (RFC 3030) - Not supported for large messages
-  - Impact: No alternative delivery mechanism for large files
-  - **Priority:** Low (SIZE limit works adequately)
+- ❌ **CHUNKING/BDAT** (RFC 3030) - Not supported
+  - Impact: No alternative delivery for large messages
+  - **Priority:** Low
+
+### Outbound Security
+- ❌ **MTA-STS enforcement (outbound)** - Policy is served but **never checked** when sending to remote domains
+  - Impact: GoMail ignores remote domains' MTA-STS policies
+  - **Priority:** Medium
+
+- ❌ **DANE verification** (RFC 7672) - Can generate TLSA records but **cannot verify** remote servers' TLSA records
+  - Impact: No DNSSEC-based certificate validation on outbound
+  - **Priority:** Low
+
+- ❌ **REQUIRETLS** (RFC 8689) - Not supported
+  - **Priority:** Low
 
 ### Bounce & Feedback Handling
 - ❌ **VERP** (Variable Envelope Return Path) - Not implemented
   - Impact: Cannot track per-recipient bounces automatically
-  - **Priority:** Medium (useful for bulk email analytics)
+  - **Priority:** Medium
 
-- ❌ **ARF** (Abuse Reporting Format) - Structure exists but not receiving/processing
+- ❌ **Inbound bounce parsing** - No special handling of null-sender `<>` DSN messages received from remote servers
+  - Impact: Bounce reports land in inbox like regular mail
+  - **Priority:** Medium
+
+- ❌ **ARF** (Abuse Reporting Format, RFC 5965) - Not receiving or processing abuse reports
   - Impact: Cannot process complaint reports from ISPs
-  - **Priority:** Medium (important for abuse management)
+  - **Priority:** Medium
 
-- ❌ **Enhanced Status Codes** - Generic codes used; no RFC 3463 specifics
-  - Example: `550 User not found` instead of `5.1.1 User not found`
-  - **Priority:** Low (basic codes work for compatibility)
+### Reporting (Outbound)
+- ❌ **DMARC report generation** - Can parse incoming reports but **never generates or sends** aggregate reports
+  - Impact: Remote domains don't receive your DMARC telemetry
+  - **Priority:** Low
 
-### TLS & Security
-- ❌ **DANE** (RFC 7672) - DNSSEC-based certificate validation not implemented
-  - Impact: No cryptographic verification of mail server certificates via DNS
-  - **Priority:** Low (STARTTLS + CA verification is adequate for now)
+- ❌ **TLS-RPT report sending** (RFC 8460) - Can parse incoming reports but **never generates or sends** them
+  - Impact: Remote domains don't receive your TLS failure telemetry
+  - **Priority:** Low
 
-- ❌ **TLS-RPT Sending** - Structure exists but doesn't send reports
-  - Impact: Cannot report TLS failures to remote domains for analysis
-  - **Priority:** Low (internal reporting only)
+### IPv6
+- ❌ **IPv6 outbound** - Hardcoded `"tcp4"` in smtp/outbound.go
+  - Impact: Cannot reach IPv6-only mail servers
+  - **Priority:** Medium
 
+### Web/Compose
+- ❌ **Attachment upload in compose** - Only plain text sending; no file upload
+  - Impact: Users can't attach files from webmail
+  - **Priority:** High (basic webmail feature)
+
+- ❌ **HTML compose** - Only `text/plain; charset=UTF-8`
+  - Impact: No rich text email composition
+  - **Priority:** Medium
+
+- ❌ **List-Unsubscribe headers** (RFC 8058) - Not generated on outbound or extracted on inbound
+  - Impact: Bulk emails won't show unsubscribe in Gmail/Yahoo
+  - **Priority:** Medium
+
+### Queue Reliability
+- ❌ **Stale queue recovery** - If process crashes mid-delivery, entries stuck in `"sending"` status forever
+  - Impact: Messages can be permanently lost on crash
+  - **Priority:** High (data loss risk)
+
+- ❌ **Session rotation** - No token rotation after login
+  - Impact: Session token reuse risk if leaked
+  - **Priority:** Medium
+
+### Anti-Spam
+- ❌ **Greylisting** - No temporary rejection of unknown senders
+  - **Priority:** Low
+- ❌ **Tarpitting** - No delays on failed commands
+  - **Priority:** Low
+- ❌ **HELO validation** - HELO argument stored but never validated (no FQDN check, no rDNS check)
+  - **Priority:** Low
 - ❌ **Greeting delay** - 220 banner sent immediately
-  - Impact: Cannot slow down lightweight spam bots
-  - **Priority:** Low (rate limiting already in place)
+  - **Priority:** Low
 
 ### Modern Features
-- ❌ **IPv6 Support** - Only IPv4 connections (outbound: "tcp4", inbound works but no AAAA)
-  - Impact: Cannot connect to IPv6-only mail servers
-  - **Priority:** Medium (future-proofing, not critical today)
-
-- ❌ **BIMI** (Brand Indicators for Message Identification)
-  - Impact: No brand logo display in Gmail/Yahoo inboxes
-  - **Priority:** Low (visual enhancement only)
-
-- ❌ **List-Unsubscribe Headers** - Not automatically added
-  - Impact: Bulk emails won't show unsubscribe options
-  - **Priority:** Medium (important for compliance)
-
-- ❌ **SMTP-specific domain policies** - MTA-STS is generic for all domains
-  - Impact: All domains use same MTA-STS policy (works but not flexible)
-  - **Priority:** Low (current implementation adequate)
-
-### Anti-Spam Mechanisms
-- ❌ **Greylisting** - Not implemented
-  - Impact: No temporary rejection of unknown senders
-  - **Priority:** Low (you're already selective with RCPT TO checks)
-
-- ❌ **Tarpitting** - No delays on failed commands
-  - Impact: Cannot slow down brute-force attempts
-  - **Priority:** Low (rate limiting covers most cases)
-
-- ❌ **HELO validation** - No strict checks on client HELO/EHLO
-  - Missing: `reject_non_fqdn_helo_hostname`, `reject_unknown_sender_domain`, etc.
-  - **Priority:** Low (trust-based model is simpler for now)
-
-### Logging & Observability
-- ❌ **Complete transaction logging** - Basic logs exist but not comprehensive
-  - Missing: Full TLS cipher info, command-by-command logging, structured logs
-  - **Priority:** Low (current logging adequate for debugging)
-
+- ❌ **BIMI** (Brand Indicators for Message Identification) - No brand logo support
+  - **Priority:** Low
+- ❌ **Per-domain MTA-STS** - All domains share one generic policy
+  - **Priority:** Low
+- ❌ **Structured logging** - Config fields exist but logging uses only `log.Printf`
+  - **Priority:** Low
 - ❌ **SMTP audit trail** - Commands not logged in order
-  - **Priority:** Low (optional for compliance)
+  - **Priority:** Low
 
 ---
 
 ## PRIORITY RECOMMENDATIONS
 
-### **HIGH Priority** (Should implement)
-1. **DSN (Delivery Status Notifications)** - RFC 3464
-   - Enables bounce handling, delivery reports
-   - File: New module `smtp/dsn.go` or extension to `delivery/`
-   - Effort: Medium (1-2 days)
+### **CRITICAL** (Fix immediately)
+1. **Wire up MaxConnections enforcement** - Add semaphore in SMTP accept loop
+   - File: `smtp/inbound.go`
+   - Effort: 30 minutes
 
-2. **SMTPUTF8** - RFC 6531
-   - Support Unicode in email addresses
-   - Files: `smtp/session.go` (advertise), `smtp/inbound.go` (handle), database schema update
-   - Effort: Low (0.5-1 day)
+2. **Wire up web rate limiter** - Middleware exists, just needs registration
+   - File: `web/server.go`
+   - Effort: 15 minutes
 
-3. **List-Unsubscribe Headers** - RFC 8367
-   - Add to compose handler for bulk emails
-   - Files: `web/handlers/compose.go`
-   - Effort: Low (2-3 hours)
+3. **Stale queue recovery** - Timeout entries stuck in `"sending"` for >15 minutes
+   - File: `delivery/worker.go`
+   - Effort: 1 hour
+
+### **HIGH Priority** (Should implement soon)
+1. **SMTP AUTH** (RFC 4954) - Enable external client relay
+   - Files: `smtp/session.go` (advertise + handle), `config/config.go`
+   - Effort: 1-2 days
+
+2. **Wire up PTR check on inbound** - Code exists, needs one function call
+   - File: `smtp/inbound.go`
+   - Effort: 15 minutes
+
+3. **Attachment upload in compose** - File upload + multipart message building
+   - Files: `web/handlers/compose.go`, templates
+   - Effort: 1-2 days
+
+
+5. **SMTPUTF8** (RFC 6531) - Advertise + handle Unicode addresses
+   - Files: `smtp/session.go`, `smtp/inbound.go`
+   - Effort: 0.5-1 day
 
 ### **MEDIUM Priority** (Nice to have)
-1. **IPv6 Support** - RFC 5321
-   - Enable connection to IPv6-only servers
-   - Files: `smtp/outbound.go` (change "tcp4" to "tcp"), DNS MX lookup
-   - Effort: Low (1-2 hours)
+1. **IPv6 outbound** - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
+   - Effort: 30 minutes
 
-2. **VERP** - Variable Envelope Return Path
-   - Per-recipient bounce tracking
-   - Files: `smtp/session.go`, `delivery/`
-   - Effort: Medium (1-2 days)
+2. **MTA-STS enforcement on outbound** - Fetch/cache remote policies before delivery
+   - Files: `smtp/outbound.go`, `mta_sts/policy.go`
+   - Effort: 1-2 days
 
-3. **ARF Processing** - RFC 5965
-   - Handle abuse reports from ISPs
-   - Files: New module `reporting/arf.go`
-   - Effort: Medium (1-2 days)
+3. **List-Unsubscribe headers** (RFC 8058)
+   - File: `web/handlers/compose.go`
+   - Effort: 2-3 hours
 
-4. **TLS-RPT Sending** - RFC 8460 
-   - Report TLS failures to remote domains
-   - Files: Extend `reporting/tlsrpt.go`, add sending logic
-   - Effort: Medium (1-2 days)
+4. **DMARC reject at SMTP level** - Return 550 instead of accepting to spam
+   - File: `smtp/inbound.go`
+   - Effort: 1 hour
+
+5. **Switch to multipart MDN format** - Use existing `GenerateMDNMultipart`
+   - File: handler calling `GenerateMDN`
+   - Effort: 30 minutes
+
+6. **VERP** - Variable Envelope Return Path
+   - Effort: 1-2 days
+
+7. **TLS-RPT report sending** (RFC 8460)
+   - Effort: 1-2 days
 
 ### **LOW Priority** (Enhancement)
-1. **DANE** - RFC 7672 (complex DNSSEC)
+1. **DANE verification** - RFC 7672 (complex DNSSEC)
 2. **BIMI** - Brand logos (visual only)
 3. **Greylisting** - Additional spam filtering
 4. **Tarpitting** - Spam bot slowdown
-5. **Enhanced Status Codes** - RFC 3463 (cosmetic)
-6. **Per-domain MTA-STS** - Generic policy adequate
-7. **SMTP command logging** - Current logs sufficient
+5. **Per-domain MTA-STS** - Generic policy adequate
+6. **Structured logging** - Replace `log.Printf`
+7. **HTML compose** - Rich text editor
+8. **ARF processing** - Abuse report handling
 
 ---
 
-## QUICK WINS (Low effort, good impact)
+## QUICK WINS (Code already exists, just needs wiring)
 
-1. **Add SMTPUTF8 support** ✏️ 1 hour
-   - Add to EHLO response: `"SMTPUTF8"`
-   - File: `smtp/session.go` line 124
+1. **Wire PTR check** ✏️ 15 minutes
+   - Call `dns.VerifyPTR(remoteIP)` in `smtp/inbound.go`
+   - Already fully implemented in `dns/ptr.go`
 
-2. **Add IPv6** ✏️ 30 minutes
-   - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go` line 45
-   - Verify DNS AAAA records work
+2. **Wire web rate limiter** ✏️ 15 minutes
+   - Register middleware from `web/middleware.go` in `web/server.go`
+   - Already fully implemented
 
-3. **Fix DNS check script** ✏️ 10 minutes
-   - Already checks SMTPUTF8 but it's not advertised yet
+3. **Enforce MaxConnections** ✏️ 30 minutes
+   - Add connection counter/semaphore in `smtp/inbound.go` accept loop
+   - Config value already exists
+
+4. **Add IPv6** ✏️ 30 minutes
+   - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
+
+5. **Use multipart MDN** ✏️ 30 minutes
+   - Switch from `GenerateMDN` to `GenerateMDNMultipart` in handler
+
+6. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
+   - Add `"SMTPUTF8"` to EHLO extensions in `smtp/session.go`
+
+7. **Stale queue recovery** ✏️ 1 hour
+   - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
 
 ---
 
@@ -231,16 +375,26 @@ openssl s_client -connect yourdomain.com:25 -starttls smtp
 
 ## SUMMARY
 
-**Overall Status:** ✅ **Production-ready for basic SMTP**
+**Overall Status:** ✅ **Production-ready for basic SMTP** with ⚠️ several items needing wiring
 
 GoMail implements the **essential SMTP standards** needed for reliable email delivery:
-- ✅ RFC 5321 (EHLO, message delivery)
+- ✅ RFC 5321 (SMTP, EHLO, message delivery)
+- ✅ RFC 3464 (DSN — generation on permanent failure + SMTP extension)
 - ✅ RFC 6376 (DKIM signing/verification)
-- ✅ RFC 7208 (SPF verification)  
+- ✅ RFC 7208 (SPF verification)
 - ✅ RFC 7489 (DMARC verification)
-- ✅ RFC 8617 (ARC chain)
-- ✅ RFC 8461 (MTA-STS policy)
+- ✅ RFC 8617 (ARC chain signing + structural validation)
+- ✅ RFC 8461 (MTA-STS policy serving)
+- ✅ RFC 3798 (MDN read receipts)
 
-**What's missing** are primarily **optional modern features** (DSN, SMTPUTF8, IPv6, etc.) that improve deliverability and robustness but aren't strictly necessary for basic operation.
+**What needs immediate attention:**
+- ⚠️ MaxConnections not enforced (config exists, accept loop doesn't check)
+- ⚠️ Web rate limiter not wired (middleware exists, not registered)
+- ⚠️ PTR/rDNS check not wired (function exists, never called)
+- ⚠️ Stale queue entries never recovered after crash
 
-Since mail is already being delivered successfully to Gmail, Outlook, Yahoo, and Yandex, you have a **solid foundation**. The recommended next steps are the quick wins above (SMTPUTF8, IPv6, DSN).
+✅ **ARC cryptographic verification now working** (fixed April 6, 2026) - all signatures properly validated
+
+**What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, **SMTPUTF8**, and various optional modern features.
+
+Mail is delivered successfully to Gmail, Outlook, Yahoo, and Yandex. The foundation is solid — the biggest risks are the unwired code (PTR, MaxConnections, web rate limiter) and the stale queue recovery gap.

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -355,6 +356,247 @@ type ARCValidationResult struct {
 	Details      string // Human-readable details
 }
 
+// verifyARCMessageSignature verifies the ARC-Message-Signature header signature
+// Similar to DKIM verification but specific to ARC-Message-Signature tags
+// Returns: (isValid, errorDetail)
+func verifyARCMessageSignature(rawMessage []byte, arcMsgSig string, pubKeyRecord *DKIMRecord) (bool, string) {
+	if arcMsgSig == "" {
+		return false, "empty message-signature"
+	}
+
+	// Parse ARC-Message-Signature tags
+	tags := parseDKIMTags(arcMsgSig)
+	
+	algo := tags["a"]
+	headersToVerify := tags["h"]
+	bodyHashB64 := tags["bh"]
+	sigB64 := tags["b"]
+	canonMethod := tags["c"]
+
+	if sigB64 == "" {
+		return false, "missing b= in ARC-Message-Signature"
+	}
+
+	// Parse canonicalization (default: relaxed/relaxed for ARC)
+	headerSimple := false
+	bodySimple := false
+	if canonMethod != "" {
+		parts := strings.Split(canonMethod, "/")
+		if len(parts) >= 1 {
+			headerSimple = strings.EqualFold(strings.TrimSpace(parts[0]), "simple")
+		}
+		if len(parts) >= 2 {
+			bodySimple = strings.EqualFold(strings.TrimSpace(parts[1]), "simple")
+		}
+	}
+
+	// Extract body and verify body hash
+	hdrs, bodyOffset, err := parseMessageHeaders(rawMessage)
+	if err != nil {
+		return false, fmt.Sprintf("failed to parse message: %v", err)
+	}
+	
+	body := rawMessage[bodyOffset:]
+	bodyHash := bodyHashFunc(bodySimple, body)
+	expectedBH := base64.StdEncoding.EncodeToString(bodyHash)
+	if bodyHashB64 != expectedBH {
+		return false, fmt.Sprintf("body hash mismatch: expected %s, got %s", bodyHashB64, expectedBH)
+	}
+
+	// Build data to sign (similar to DKIM)
+	revHdrs := make(map[string][]*headerRaw)
+	for _, h := range hdrs {
+		lkey := strings.ToLower(h.key)
+		revHdrs[lkey] = append([]*headerRaw{h}, revHdrs[lkey]...)
+	}
+
+	var dataToSign bytes.Buffer
+	headersToSign := strings.Split(headersToVerify, ":")
+
+	for _, headerName := range headersToSign {
+		headerName = strings.TrimSpace(headerName)
+		lkey := strings.ToLower(headerName)
+
+		hdrsForKey := revHdrs[lkey]
+		if len(hdrsForKey) == 0 {
+			continue
+		}
+
+		h := hdrsForKey[0]
+		revHdrs[lkey] = hdrsForKey[1:]
+
+		hval := string(h.raw)
+		if !headerSimple {
+			hval, _ = relaxedCanonicalHeader(hval)
+		}
+
+		dataToSign.WriteString(hval)
+		dataToSign.WriteString("\r\n")
+	}
+
+	// Strip b= value from ARC-Message-Signature before signing
+	arcMsgSigStripped := stripDKIMBValue(arcMsgSig)
+	sigVal := "ARC-Message-Signature: " + arcMsgSigStripped
+	if !headerSimple {
+		sigVal, _ = relaxedCanonicalHeader(sigVal)
+	}
+	dataToSign.WriteString(sigVal)
+
+	// Verify signature
+	hash := sha256.Sum256(dataToSign.Bytes())
+	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false, fmt.Sprintf("invalid signature encoding: %v", err)
+	}
+
+	// Extract public key from RawKey field
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyRecord.RawKey)
+	if err != nil {
+		return false, fmt.Sprintf("invalid public key encoding: %v", err)
+	}
+
+	// Verify based on algorithm
+	switch {
+	case strings.Contains(algo, "ed25519"):
+		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+		if err == nil {
+			if edPub, ok := key.(ed25519.PublicKey); ok {
+				if ed25519.Verify(edPub, hash[:], sigBytes) {
+					return true, ""
+				}
+			}
+		} else if len(pubKeyBytes) == ed25519.PublicKeySize {
+			if ed25519.Verify(ed25519.PublicKey(pubKeyBytes), hash[:], sigBytes) {
+				return true, ""
+			}
+		}
+		return false, "ed25519 signature verification failed"
+
+	case strings.Contains(algo, "rsa"):
+		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+		if err != nil {
+			return false, fmt.Sprintf("cannot parse RSA public key: %v", err)
+		}
+		rsaPub, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return false, "key is not RSA"
+		}
+		if err := rsa.VerifyPKCS1v15(rsaPub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			return false, fmt.Sprintf("RSA signature verification failed: %v", err)
+		}
+		return true, ""
+	}
+
+	return false, fmt.Sprintf("unsupported algorithm: %s", algo)
+}
+
+// verifyARCSeal verifies the ARC-Seal header signature
+// ARC-Seal signs all three ARC headers (Authentication-Results, Message-Signature, Seal itself)
+// Returns: (isValid, errorDetail)
+func verifyARCSeal(arcAuthResults, arcMsgSig, arcSeal string, pubKeyRecord *DKIMRecord) (bool, string) {
+	if arcSeal == "" {
+		return false, "empty seal"
+	}
+
+	// Parse ARC-Seal tags
+	tags := parseDKIMTags(arcSeal)
+	
+	algo := tags["a"]
+	sigB64 := tags["b"]
+	canonMethod := tags["c"]
+
+	if sigB64 == "" {
+		return false, "missing b= in ARC-Seal"
+	}
+
+	// Parse canonicalization (ARC-Seal typically uses relaxed/relaxed)
+	headerSimple := false
+	if canonMethod != "" {
+		parts := strings.Split(canonMethod, "/")
+		if len(parts) >= 1 {
+			headerSimple = strings.EqualFold(strings.TrimSpace(parts[0]), "simple")
+		}
+	}
+
+	// Build data to sign: ARC-Authentication-Results, ARC-Message-Signature, ARC-Seal (with b= empty)
+	var dataToSign bytes.Buffer
+
+	// Add ARC-Authentication-Results (without "ARC-Authentication-Results: " prefix if it has it)
+	authLine := arcAuthResults
+	if strings.HasPrefix(strings.ToUpper(authLine), "ARC-AUTHENTICATION-RESULTS:") {
+		authLine = authLine[len("ARC-Authentication-Results:"):]
+		authLine = "ARC-Authentication-Results:" + authLine
+	}
+	if !headerSimple {
+		authLine, _ = relaxedCanonicalHeader(authLine)
+	}
+	dataToSign.WriteString(authLine)
+	dataToSign.WriteString("\r\n")
+
+	// Add ARC-Message-Signature
+	msgSigLine := arcMsgSig
+	if !headerSimple {
+		msgSigLine, _ = relaxedCanonicalHeader(msgSigLine)
+	}
+	dataToSign.WriteString(msgSigLine)
+	dataToSign.WriteString("\r\n")
+
+	// Add ARC-Seal with b= stripped
+	sealLine := stripDKIMBValue(arcSeal)
+	sealLine = "ARC-Seal: " + sealLine
+	if !headerSimple {
+		sealLine, _ = relaxedCanonicalHeader(sealLine)
+	}
+	dataToSign.WriteString(sealLine)
+
+	// Verify signature
+	hash := sha256.Sum256(dataToSign.Bytes())
+	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false, fmt.Sprintf("invalid signature encoding: %v", err)
+	}
+
+	// Extract public key from RawKey field
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyRecord.RawKey)
+	if err != nil {
+		return false, fmt.Sprintf("invalid public key encoding: %v", err)
+	}
+
+	// Verify based on algorithm
+	switch {
+	case strings.Contains(algo, "ed25519"):
+		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+		if err == nil {
+			if edPub, ok := key.(ed25519.PublicKey); ok {
+				if ed25519.Verify(edPub, hash[:], sigBytes) {
+					return true, ""
+				}
+			}
+		} else if len(pubKeyBytes) == ed25519.PublicKeySize {
+			if ed25519.Verify(ed25519.PublicKey(pubKeyBytes), hash[:], sigBytes) {
+				return true, ""
+			}
+		}
+		return false, "ed25519 signature verification failed"
+
+	case strings.Contains(algo, "rsa"):
+		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+		if err != nil {
+			return false, fmt.Sprintf("cannot parse RSA public key: %v", err)
+		}
+		rsaPub, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return false, "key is not RSA"
+		}
+		if err := rsa.VerifyPKCS1v15(rsaPub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			return false, fmt.Sprintf("RSA signature verification failed: %v", err)
+		}
+		return true, ""
+	}
+
+	return false, fmt.Sprintf("unsupported algorithm: %s", algo)
+}
+
 // ValidateArcChainAtInstance validates the ARC chain up to a specific instance
 // Performs full cryptographic validation of signatures and chain integrity
 // Returns: (isValid, status, error)
@@ -385,16 +627,31 @@ func ValidateArcChainAtInstance(rawMessage []byte, instance int) (bool, string, 
 		return false, "temperror", fmt.Errorf("DKIM lookup failed for %s at instance %d: %w", domain, instance, err)
 	}
 
-	// TODO: Extract canonicalized body and headers for verification
-	// For now, we'll return that validation is deferred
-	// Full implementation would:
-	// 1. Relay the actual canonicalized versions from verification code
-	// 2. Call VerifyARCChainSignature here
-	// 3. Check previous instance had cv=pass (if instance > 1)
+	// Verify ARC-Message-Signature cryptographically
+	msgSigValid, msgSigErr := verifyARCMessageSignature(rawMessage, iheader["message-signature"], dkimRec)
+	if !msgSigValid {
+		return false, "fail", fmt.Errorf("ARC-Message-Signature verification failed at instance %d: %s", instance, msgSigErr)
+	}
 
-	_ = dkimRec // Use dkimRec in actual verification
+	// Verify ARC-Seal cryptographically
+	sealValid, sealErr := verifyARCSeal(iheader["auth-results"], iheader["message-signature"], iheader["seal"], dkimRec)
+	if !sealValid {
+		return false, "fail", fmt.Errorf("ARC-Seal verification failed at instance %d: %s", instance, sealErr)
+	}
 
-	// For now, if headers exist and are complete, consider it valid (stub)
+	// If this is not the first instance, check that previous instance had cv=pass
+	if instance > 1 {
+		prevHeaders := arcHeaders[instance-1]
+		if prevHeaders == nil {
+			return false, "fail", fmt.Errorf("missing previous ARC instance %d", instance-1)
+		}
+		prevSealCV := extractTagValue(prevHeaders["seal"], "cv=")
+		if prevSealCV != "pass" {
+			return false, "fail", fmt.Errorf("previous ARC instance %d has cv=%s, expected cv=pass", instance-1, prevSealCV)
+		}
+	}
+
+	// All checks passed
 	return true, "pass", nil
 }
 
