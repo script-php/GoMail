@@ -117,7 +117,7 @@
   - Impact: Violates strict DMARC intent; wastes storage on rejected mail
   - **Fix:** Return 550 during SMTP transaction for `p=reject`
 
-- ⚠️ **TLS on outbound** (FIXED April 6, 2026) - Configurable strict-TLS mode per domain
+- ✅ **TLS on outbound** (FIXED April 6, 2026) - Configurable strict-TLS mode per domain
   - **Implementation:** Added `require_tls` field to domains table; delivery fails if TLS unavailable when enabled
   - **Behavior (opportunistic TLS default):**
     - If `require_tls = false`: STARTTLS attempted; failure logs warning, delivery continues unencrypted
