@@ -117,6 +117,24 @@
   - **RFC compliance:** Supports RFC 8689 REQUIRETLS semantics
   - **Admin control:** Set `require_tls=1` in domains table per domain
 
+- ✅ **SPF spec compliance** (FIXED April 7, 2026) - Full RFC 7208 implementation
+  - **Mechanisms:** `all`, `a`, `mx`, `ip4`, `ip6`, `include`, `ptr`, `exists` + `redirect=` modifier
+  - **Qualifiers:** `+` (pass), `-` (fail), `~` (softfail), `?` (neutral)
+  - **CIDR support:** `a/24`, `a:domain/24//48`, `mx/24`, `mx:domain/24//48`  
+  - **Modifiers:** `redirect=`, `exp=` (explanation on SPF fail)
+  - **Macro expansion (RFC 7208 §7):**
+    - Macros: `%{s}`, `%{l}`, `%{o}`, `%{d}`, `%{i}`, `%{p}`, `%{v}`, `%{h}`, `%{c}`, `%{r}`, `%{t}`
+    - Transformers: `%{ir}` (reverse), `%{d2}` (rightmost N labels)
+    - Custom delimiters: `%{l-}` splits by `-`, supports `. - + , / _ =`
+    - Uppercase = URL-encode per RFC 7208 §7.3
+  - **DNS limits (RFC 7208 §4.6.4):**
+    - 10-lookup maximum across all mechanisms
+    - 2 void lookup limit (NXDOMAIN/empty responses)
+    - 10 MX record limit per query
+    - 10 PTR record limit per query
+  - **Error semantics:** RFC 7208 §5.2 include/redirect error propagation
+  - **RFC compliance:** Full RFC 7208 including all SHOULD requirements
+
 
 ---
 
@@ -133,9 +151,6 @@
 - ⚠️ **MDN multipart format** - Proper RFC 3798 multipart MDN exists (`GenerateMDNMultipart`) but the **simple text version** is used in practice
   - Impact: Some mail clients may not process simple-format MDNs correctly
   - **Fix:** Switch handler to use `GenerateMDNMultipart`
-
-- ⚠️ **SPF spec compliance** - Core mechanisms work, but missing: `exists` mechanism, `exp=` modifier, macro expansion, DNS lookup counting (RFC 7208 §4.6.4 limits to 10)
-  - Impact: Could infinite-loop on adversarial SPF records; rare edge cases may fail
 
 - ⚠️ **DMARC spec compliance** - `sp=` (subdomain policy) parsed but never applied; `pct=` (percentage) parsed but ignored; `rua`/`ruf` parsed but no reports generated; org-domain uses naive "last two labels" instead of Public Suffix List
   - Impact: Subdomains with different policies treated same as parent; percentage sampling not honored
@@ -386,19 +401,22 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 5321 (SMTP, EHLO, message delivery)
 - ✅ RFC 3464 (DSN — generation on permanent failure + SMTP extension)
 - ✅ RFC 6376 (DKIM signing/verification)
-- ✅ RFC 7208 (SPF verification)
+- ✅ RFC 7208 (SPF verification — **full compliance with all mechanisms, modifiers, macro expansion, and DNS counting**)
 - ✅ RFC 7489 (DMARC verification)
-- ✅ RFC 8617 (ARC chain signing + structural validation)
+- ✅ RFC 8617 (ARC chain signing + cryptographic verification)
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
+
+**Recently Fixed (April 6-7, 2026):**
+- ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
+- ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
+- ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
 
 **What needs immediate attention:**
 - ⚠️ MaxConnections not enforced (config exists, accept loop doesn't check)
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
 - ⚠️ PTR/rDNS check not wired (function exists, never called)
 - ⚠️ Stale queue entries never recovered after crash
-
-✅ **ARC cryptographic verification now working** (fixed April 6, 2026) - all signatures properly validated
 
 **What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, **SMTPUTF8**, and various optional modern features.
 
