@@ -230,6 +230,10 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	authResults := authBuilder.Build()
 
+	// Prepend Authentication-Results header to raw message so clients can see it
+	authResultsHeader := authResults + "\r\n"
+	rawMessage = append([]byte(authResultsHeader), rawMessage...)
+
 	// --- Validate ARC Chain (if present) ---
 	arcValidation := auth.ValidateARCChain(rawMessage)
 	switch arcValidation.Status {

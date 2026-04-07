@@ -25,7 +25,7 @@
 - ✅ **DMARC Verification** - Record lookup, org domain fallback, relaxed/strict alignment, policy enforcement (auth/dmarc.go)
 - ✅ **ARC Chain Signing** - ARC-Authentication-Results, ARC-Message-Signature, ARC-Seal generation (auth/arc.go, delivery/worker.go)
 - ✅ **ARC Structural Validation** - Chain completeness, cv= values, sequential instance checks (auth/arc.go)
-- ✅ **Authentication-Results Headers** - RFC 8601 format with SPF, DKIM, DMARC results (auth/results.go)
+- ✅ **Authentication-Results Headers** - RFC 8601 format with SPF, DKIM, DMARC results, prepended to raw messages (FIXED April 8, 2026) (auth/results.go)
 
 ### Delivery & Bounce Handling
 - ✅ **DSN generation** - RFC 3464 multipart DSN on permanent failure, delivered to sender mailbox (delivery/worker.go)
@@ -143,10 +143,6 @@
 - ⚠️ **DMARC policy enforcement** - Checks run, but `p=reject` messages are **accepted and quarantined** instead of rejected at SMTP level with 5xx
   - Impact: Violates strict DMARC intent; wastes storage on rejected mail
   - **Fix:** Return 550 during SMTP transaction for `p=reject`
-
-- ⚠️ **Authentication-Results header** - Generated and stored in DB `auth_results` field, but **not prepended to the raw message** headers that the user sees
-  - Impact: Email clients can't see auth results in message source
-  - **Fix:** Prepend header to raw message before storage
 
 - ⚠️ **MDN multipart format** - Proper RFC 3798 multipart MDN exists (`GenerateMDNMultipart`) but the **simple text version** is used in practice
   - Impact: Some mail clients may not process simple-format MDNs correctly
