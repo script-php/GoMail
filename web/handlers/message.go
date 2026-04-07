@@ -105,7 +105,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 	if !msg.IsRead {
 		h.db.MarkRead(id)
 		msg.IsRead = true
-		
+
 		// Update folder counts since message is now read
 		if msg.FolderID != nil {
 			h.db.UpdateFolderCounts(*msg.FolderID)
