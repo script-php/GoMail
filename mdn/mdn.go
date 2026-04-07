@@ -94,7 +94,7 @@ func GenerateMDNMultipart(originalMessageID, originalSubject, recipientEmail, se
 	msg.WriteString(fmt.Sprintf("Final-Recipient: rfc822; %s\r\n", recipientEmail))
 	msg.WriteString(fmt.Sprintf("Original-Message-ID: %s\r\n", originalMessageID))
 	msg.WriteString(fmt.Sprintf("Disposition: automatic-action/MDN-sent-automatically; displayed\r\n"))
-	msg.WriteString("\r\n")
+	msg.WriteString("\r\n") // Blank line after fields (required by RFC 3798)
 
 	// End boundary
 	msg.WriteString(fmt.Sprintf("--%s--\r\n", boundary))

@@ -237,8 +237,8 @@ func (h *MessageHandler) handleMDN(msg *store.Message, account *store.Account) {
 // sendMDN generates and sends an MDN response
 func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) {
 	log.Printf("[web] sendMDN: starting for msg=%d, recipient=%s", msg.ID, msg.MDNAddress)
-	// Generate MDN message
-	mdnBody := mdn.GenerateMDN(
+	// Generate MDN message using multipart/report format per RFC 3798
+	mdnBody := mdn.GenerateMDNMultipart(
 		msg.MessageID,
 		msg.Subject,
 		account.Email,

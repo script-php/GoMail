@@ -145,9 +145,9 @@
   - **Current approach:** Accept and quarantine - protects users while avoiding false rejections
   - **Note:** This matches what many large email providers do in practice
 
-- ⚠️ **MDN multipart format** - Proper RFC 3798 multipart MDN exists (`GenerateMDNMultipart`) but the **simple text version** is used in practice
-  - Impact: Some mail clients may not process simple-format MDNs correctly
-  - **Fix:** Switch handler to use `GenerateMDNMultipart`
+- ✅ **MDN multipart format** (FIXED April 8, 2026) - Uses proper RFC 3798 multipart/report format
+  - Implementation: `GenerateMDNMultipart()` generates both human-readable text part and machine-readable disposition-notification part
+  - Benefit: Mail clients now properly process MDN with structured disposition information
 
 - ⚠️ **DMARC spec compliance** - `sp=` (subdomain policy) parsed but never applied; `pct=` (percentage) parsed but ignored; `rua`/`ruf` parsed but no reports generated; org-domain uses naive "last two labels" instead of Public Suffix List
   - Impact: Subdomains with different policies treated same as parent; percentage sampling not honored
@@ -314,14 +314,10 @@
    - File: `web/handlers/compose.go`
    - Effort: 2-3 hours
 
-4. **Switch to multipart MDN format** - Use existing `GenerateMDNMultipart`
-   - File: handler calling `GenerateMDN`
-   - Effort: 30 minutes
-
-5. **VERP** - Variable Envelope Return Path
+4. **VERP** - Variable Envelope Return Path
    - Effort: 1-2 days
 
-6. **TLS-RPT report sending** (RFC 8460)
+5. **TLS-RPT report sending** (RFC 8460)
    - Effort: 1-2 days
 
 ### **LOW Priority** (Enhancement)
@@ -353,13 +349,10 @@
 4. **Add IPv6** ✏️ 30 minutes
    - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
 
-5. **Use multipart MDN** ✏️ 30 minutes
-   - Switch from `GenerateMDN` to `GenerateMDNMultipart` in handler
-
-6. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
+5. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
    - Add `"SMTPUTF8"` to EHLO extensions in `smtp/session.go`
 
-7. **Stale queue recovery** ✏️ 1 hour
+6. **Stale queue recovery** ✏️ 1 hour
    - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
 
 ---
