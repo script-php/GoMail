@@ -140,9 +140,10 @@
 
 ## ⚠️ PARTIALLY IMPLEMENTED (Code exists but incomplete or not wired)
 
-- ⚠️ **DMARC policy enforcement** - Checks run, but `p=reject` messages are **accepted and quarantined** instead of rejected at SMTP level with 5xx
-  - Impact: Violates strict DMARC intent; wastes storage on rejected mail
-  - **Fix:** Return 550 during SMTP transaction for `p=reject`
+- ✅ **DMARC policy enforcement** - Checks run; `p=reject` and `p=quarantine` messages are accepted but routed to spam folder
+  - **Intentional behavior:** Strict 550 rejection would block legitimate mail from providers like Yahoo that often fail DMARC due to forwarding/mailing lists
+  - **Current approach:** Accept and quarantine - protects users while avoiding false rejections
+  - **Note:** This matches what many large email providers do in practice
 
 - ⚠️ **MDN multipart format** - Proper RFC 3798 multipart MDN exists (`GenerateMDNMultipart`) but the **simple text version** is used in practice
   - Impact: Some mail clients may not process simple-format MDNs correctly
@@ -313,18 +314,14 @@
    - File: `web/handlers/compose.go`
    - Effort: 2-3 hours
 
-4. **DMARC reject at SMTP level** - Return 550 instead of accepting to spam
-   - File: `smtp/inbound.go`
-   - Effort: 1 hour
-
-5. **Switch to multipart MDN format** - Use existing `GenerateMDNMultipart`
+4. **Switch to multipart MDN format** - Use existing `GenerateMDNMultipart`
    - File: handler calling `GenerateMDN`
    - Effort: 30 minutes
 
-6. **VERP** - Variable Envelope Return Path
+5. **VERP** - Variable Envelope Return Path
    - Effort: 1-2 days
 
-7. **TLS-RPT report sending** (RFC 8460)
+6. **TLS-RPT report sending** (RFC 8460)
    - Effort: 1-2 days
 
 ### **LOW Priority** (Enhancement)
