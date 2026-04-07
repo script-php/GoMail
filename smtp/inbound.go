@@ -234,7 +234,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	arcValidation := auth.ValidateARCChain(rawMessage)
 	switch arcValidation.Status {
 	case "pass":
-		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d", 
+		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d",
 			arcValidation.HighestValid)
 	case "fail":
 		log.Printf("[smtp] ARC ✗ FAIL: %s", arcValidation.Details)
@@ -278,7 +278,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// Note: DMARC enforcement is now done per-recipient via folder assignment below
 		// p=reject and p=quarantine both result in messages going to spam folder
 		// p=none messages go to inbox normally
-		
+
 		// Check if DMARC failed for this domain
 		if dmarcResult.Result == "fail" {
 			switch dmarcResult.Policy {
@@ -304,40 +304,39 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 		accountID := account.ID
 
-		// Determine folder based on auth failure and direction
+		// Determine folder based on auth results
 		var folderID *int64
-		
-		if arcFailed {
-			// ARC validation failed - quarantine to spam
-			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
-			if err != nil {
-				log.Printf("[smtp] error getting spam folder: %v", err)
-			} else if spamFolder != nil {
-				folderID = &spamFolder.ID
-				log.Printf("[smtp] ARC failed: quarantining to spam folder=%d (reason: %s)", 
-					spamFolder.ID, arcValidation.Details)
+
+		// Route to inbox ONLY if all three authentications pass
+		allAuthPass := spfResult == "pass" && dkimResult == "pass" && dmarcResult.Result == "pass"
+		authFailed := arcFailed || !allAuthPass
+
+		if authFailed {
+			// Any auth failure → spam folder
+			if arcFailed {
+				log.Printf("[smtp] ARC failed: quarantining to spam (reason: %s)", arcValidation.Details)
 			} else {
-				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
+				log.Printf("[smtp] auth check failed - SPF: %s, DKIM: %s, DMARC: %s - quarantining to spam",
+					spfResult, dkimResult, dmarcResult.Result)
 			}
-		} else if dmarcResult.Result == "fail" && (dmarcResult.Policy == "quarantine" || dmarcResult.Policy == "reject") {
-			// DMARC quarantine/reject - move to spam
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
 				log.Printf("[smtp] error getting spam folder: %v", err)
 			} else if spamFolder != nil {
 				folderID = &spamFolder.ID
-				log.Printf("[smtp] quarantining mail from %s to spam folder=%d (DMARC %s)", fromDomain, spamFolder.ID, dmarcResult.Policy)
+				log.Printf("[smtp] message routed to spam folder=%d", spamFolder.ID)
 			} else {
 				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
 			}
 		} else {
-			// Normal inbound messages go to Inbox folder
+			// All auth passed - route to inbox
 			inboxFolder, err := s.db.GetFolderByType(accountID, "inbox")
 			if err != nil {
 				log.Printf("[smtp] error getting inbox folder for account %d: %v", accountID, err)
 			} else if inboxFolder != nil {
 				folderID = &inboxFolder.ID
-				log.Printf("[smtp] assigning inbound mail to inbox folder=%d for account %d", inboxFolder.ID, accountID)
+				log.Printf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
+					spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID)
 			} else {
 				log.Printf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID)
 			}
