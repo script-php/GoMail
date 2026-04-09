@@ -45,6 +45,12 @@ func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueF
 	// Wrap with security headers (HSTS only when TLS is enabled)
 	handler := security.SecureHeaders(mux, tlsEnabled)
 
+	// Wrap with rate limiter (configurable, applies only to non-static requests)
+	rateLimitPerMin := cfg.Web.GetRateLimitPerMin()
+	log.Printf("[web] rate limiter: %d requests/minute per IP (static assets exempt)", rateLimitPerMin)
+	rateLimiter := NewWebRateLimiter(rateLimitPerMin)
+	handler = rateLimiter.Middleware(handler)
+
 	// When TLS is enabled, listen on HTTPS port; otherwise HTTP port
 	addr := cfg.Web.ListenAddr
 	if !tlsEnabled {

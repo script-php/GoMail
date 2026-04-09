@@ -43,6 +43,7 @@
     "enable_tls": true,
     "session_secret": "change-me-to-a-random-64-char-string",
     "session_max_age": 86400,
+    "rate_limit_per_minute": 5,
     "bootstrap_admin": {
       "email": "admin@example.com",
       "password_hash": ""

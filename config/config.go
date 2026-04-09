@@ -63,12 +63,13 @@ type StoreConfig struct {
 }
 
 type WebConfig struct {
-	ListenAddr     string         `json:"listen_addr"`
-	HTTPAddr       string         `json:"http_addr"`
-	EnableTLS      *bool          `json:"enable_tls"`
-	SessionSecret  string         `json:"session_secret"`
-	SessionMaxAge  int            `json:"session_max_age"`
-	BootstrapAdmin BootstrapAdmin `json:"bootstrap_admin"`
+	ListenAddr      string         `json:"listen_addr"`
+	HTTPAddr        string         `json:"http_addr"`
+	EnableTLS       *bool          `json:"enable_tls"`
+	SessionSecret   string         `json:"session_secret"`
+	SessionMaxAge   int            `json:"session_max_age"`
+	BootstrapAdmin  BootstrapAdmin `json:"bootstrap_admin"`
+	RateLimitPerMin int            `json:"rate_limit_per_minute"`
 }
 
 // IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).
@@ -77,6 +78,16 @@ func (w *WebConfig) IsTLSEnabled() bool {
 		return true
 	}
 	return *w.EnableTLS
+}
+
+// GetRateLimitPerMin returns the web rate limit per minute (default 300).
+// This only applies to non-static requests (CSS/JS are exempt).
+func (w *WebConfig) GetRateLimitPerMin() int {
+	// Debug: log what value was loaded from config
+	if w.RateLimitPerMin <= 0 {
+		return 300 // Default: 300 req/min per IP (5 req/sec), static assets exempt
+	}
+	return w.RateLimitPerMin
 }
 
 // BootstrapAdmin is the initial admin created on first run (before any accounts exist).

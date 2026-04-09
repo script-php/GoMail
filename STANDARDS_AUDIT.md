@@ -174,9 +174,12 @@
   - **Config:** Respects `config.SMTP.MaxConnections` (defaults to 100)
   - **Impact:** Limits simultaneous SMTP connections; prevents resource exhaustion under load
 
-- ⚠️ **Web rate limiter** - Rate limiting middleware written in web/middleware.go but **never registered** in web/server.go
-  - Impact: Web UI has no rate limiting; login brute-force possible
-  - **Fix:** Wire middleware into server setup
+- ✅ **Web rate limiter** (FIXED April 9, 2026) - Rate limiting middleware now wired into server setup
+  - **Implementation:** WebRateLimiter wraps handler chain in NewServer(); configurable via `web.rate_limit_per_minute` (default 100)
+  - **Behavior:** Per-IP sliding window rate limiter returns HTTP 429 when threshold exceeded
+  - **Features:** Handles X-Forwarded-For header for proxy scenarios; background cleanup of stale entries
+  - **Config:** Set `rate_limit_per_minute` in web config section (e.g., 100, 500, 1000 for different security postures)
+  - **Impact:** Web UI now rate-limited; login brute-force protection active with tunable limits
 
 - ⚠️ **Logging config** - `level` and `format` fields defined in config struct but **never used**; all logging is `log.Printf`
   - Impact: Can't control log verbosity or output format

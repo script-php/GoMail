@@ -34,8 +34,8 @@ type WebRateLimiter struct {
 }
 
 type webRateEntry struct {
-	count    int
-	resetAt  time.Time
+	count   int
+	resetAt time.Time
 }
 
 // NewWebRateLimiter creates a rate limiter for HTTP requests.
@@ -49,9 +49,15 @@ func NewWebRateLimiter(requestsPerMinute int) *WebRateLimiter {
 	return rl
 }
 
-// Middleware wraps a handler with rate limiting.
+// Middleware wraps a handler with rate limiting (excludes static files).
 func (rl *WebRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip rate limiting for static assets (CSS, JS, images, fonts)
+		if strings.HasPrefix(r.URL.Path, "/static/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		ip := extractIP(r)
 
 		rl.mu.Lock()
