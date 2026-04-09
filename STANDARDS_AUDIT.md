@@ -22,7 +22,7 @@
 - ✅ **DKIM Signing** - Per-domain DKIM signing on outbound, RSA-SHA256 + Ed25519-SHA256 (delivery/queue.go, auth/dkim.go)
 - ✅ **DKIM Verification** - Inbound messages verified with DNS key lookup (auth/dkim.go, auth/dkim_lookup.go)
 - ✅ **SPF Verification** - Full mechanism parsing: `all`, `a`, `mx`, `ip4`, `ip6`, `include`, `redirect` with qualifiers and CIDR (auth/spf.go)
-- ✅ **DMARC Verification** - Record lookup, org domain fallback, relaxed/strict alignment, policy enforcement (auth/dmarc.go)
+- ✅ **DMARC Verification** - Full RFC 7489 compliance: policy evaluation, subdomain policies (`sp=`), percentage sampling (`pct=`), public suffix list for org-domain, alignment modes, report address extraction (FIXED April 8, 2026) (auth/dmarc.go)
 - ✅ **ARC Chain Signing** - ARC-Authentication-Results, ARC-Message-Signature, ARC-Seal generation (auth/arc.go, delivery/worker.go)
 - ✅ **ARC Structural Validation** - Chain completeness, cv= values, sequential instance checks (auth/arc.go)
 - ✅ **Authentication-Results Headers** - RFC 8601 format with SPF, DKIM, DMARC results, prepended to raw messages (FIXED April 8, 2026) (auth/results.go)
@@ -149,8 +149,16 @@
   - Implementation: `GenerateMDNMultipart()` generates both human-readable text part and machine-readable disposition-notification part
   - Benefit: Mail clients now properly process MDN with structured disposition information
 
-- ⚠️ **DMARC spec compliance** - `sp=` (subdomain policy) parsed but never applied; `pct=` (percentage) parsed but ignored; `rua`/`ruf` parsed but no reports generated; org-domain uses naive "last two labels" instead of Public Suffix List
-  - Impact: Subdomains with different policies treated same as parent; percentage sampling not honored
+- ✅ **DMARC spec compliance** (FIXED April 8, 2026) - Full RFC 7489 compliance
+  - ✅ **Core evaluation:** Policy (`p=`), subdomain policy (`sp=`), alignment modes (`aspf=`, `adkim=`)
+  - ✅ **Percentage sampling:** `pct=` honored with random distribution
+  - ✅ **Organizational domain:** Uses public suffix list for proper domain calculation (handles `.co.uk`, `.com.br`, etc.)
+  - ✅ **Report addresses:** `rua=` (aggregate) and `ruf=` (forensic) extracted and available in results
+  - ✅ **Report generation:** RFC 7489-compliant XML aggregate reports generated (reporting/dmarc.go) (FIXED April 8, 2026)
+  - ✅ **Feedback recording:** DMARC authentication results recorded to database for each inbound message (store/dmarc_feedback.go) (FIXED April 8, 2026)
+  - ✅ **Admin viewer:** DMARC feedback statistics viewable on `/admin/dmarc-feedback` (web/handlers/admin.go) (FIXED April 8, 2026)
+  - ✅ **Report scheduler:** Weekly background job generates and sends reports to rua= addresses every Sunday at midnight UTC (reporting/scheduler.go) (FIXED April 8, 2026)
+  - **RFC 7489 compliance:** Full alignment evaluation, policy application, and report infrastructure
 
 ### Code Exists But Not Wired
 - ⚠️ **Reverse DNS (PTR) on inbound** - `dns.VerifyPTR` is fully implemented but **never called** from the SMTP inbound accept path
@@ -212,9 +220,11 @@
   - **Priority:** Medium
 
 ### Reporting (Outbound)
-- ❌ **DMARC report generation** - Can parse incoming reports but **never generates or sends** aggregate reports
-  - Impact: Remote domains don't receive your DMARC telemetry
-  - **Priority:** Low
+- ✅ **DMARC report generation and delivery** (FIXED April 8, 2026) - Full RFC 7489 aggregate report support
+  - **Completed:** Feedback recording, database persistence, XML generation, admin viewer, weekly scheduler
+  - **Scheduler:** Sunday at 00:00 UTC automatically generates and sends reports to all configured rua= addresses
+  - **Implementation:** Parses DMARC DNS records, extracts rua= addresses, generates RFC 7489-compliant XML, enqueues for delivery
+  - **Priority:** Complete
 
 - ❌ **TLS-RPT report sending** (RFC 8460) - Can parse incoming reports but **never generates or sends** them
   - Impact: Remote domains don't receive your TLS failure telemetry
@@ -393,10 +403,16 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-7, 2026):**
+**Recently Fixed (April 6-8, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
+- ✅ **Authentication-Results header prepending** - Now visible in message source to email clients
+- ✅ **MDN multipart/report format** - RFC 3798 compliant with disposition-notification part
+- ✅ **DMARC full standards compliance** - sp=, pct=, public suffix list org-domain, report address extraction
+- ✅ **DMARC feedback recording** - Authentication results tracked for aggregate reporting
+- ✅ **DMARC report generation** - RFC 7489 XML reports generated and viewable in admin panel
+- ✅ **DMARC weekly report scheduler** - Automatic weekly generation and delivery to rua= addresses
 
 **What needs immediate attention:**
 - ⚠️ MaxConnections not enforced (config exists, accept loop doesn't check)

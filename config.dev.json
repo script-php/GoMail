@@ -71,6 +71,10 @@
   "logging": {
     "level": "info",
     "format": "text"
+  },
+
+  "dmarc": {
+    "send_reports": false
   }
 
 }

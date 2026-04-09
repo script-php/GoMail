@@ -127,6 +127,33 @@ func (db *DB) CountDomainAccounts(domainID int64) (int, error) {
 	return count, err
 }
 
+// GetDomainsWithFeedback returns all domains that have DMARC feedback records.
+func (db *DB) GetDomainsWithFeedback() ([]*Domain, error) {
+	// Get all unique domains from DMARC feedback (these are sender domains with DMARC records)
+	rows, err := db.Query(`
+		SELECT DISTINCT domain
+		FROM dmarc_feedback
+		ORDER BY domain`)
+	if err != nil {
+		return nil, fmt.Errorf("listing domains with feedback: %w", err)
+	}
+	defer rows.Close()
+
+	var domains []*Domain
+	for rows.Next() {
+		var domainName string
+		if err := rows.Scan(&domainName); err != nil {
+			return nil, fmt.Errorf("scanning domain row: %w", err)
+		}
+		// Create a minimal Domain struct with just the domain name
+		// (we don't need DKIM keys for report generation, just the domain)
+		domains = append(domains, &Domain{
+			Domain: domainName,
+		})
+	}
+	return domains, rows.Err()
+}
+
 // --- Account CRUD ---
 
 // CreateAccount adds a new user account.
@@ -140,18 +167,18 @@ func (db *DB) CreateAccount(a *Account) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("creating account: %w", err)
 	}
-	
+
 	accountID, err := result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
-	
+
 	// Create default folders for the account
 	if err := db.DefaultFolders(accountID); err != nil {
 		// Log error but don't fail account creation
 		fmt.Printf("[warn] failed to create default folders for account %d: %v\n", accountID, err)
 	}
-	
+
 	return accountID, nil
 }
 

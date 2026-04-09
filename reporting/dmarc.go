@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"time"
 )
 
 // DMARCReport represents a DMARC aggregate report (RFC 7489).
@@ -15,10 +16,10 @@ type DMARCReport struct {
 }
 
 type ReportMetadata struct {
-	OrgName   string     `xml:"org_name"`
-	Email     string     `xml:"email"`
-	ReportID  string     `xml:"report_id"`
-	DateRange DateRange  `xml:"date_range"`
+	OrgName   string    `xml:"org_name"`
+	Email     string    `xml:"email"`
+	ReportID  string    `xml:"report_id"`
+	DateRange DateRange `xml:"date_range"`
 }
 
 type DateRange struct {
@@ -42,9 +43,9 @@ type ReportRecord struct {
 }
 
 type Row struct {
-	SourceIP    string         `xml:"source_ip"`
-	Count       int            `xml:"count"`
-	PolicyEval  PolicyEvaluated `xml:"policy_evaluated"`
+	SourceIP   string          `xml:"source_ip"`
+	Count      int             `xml:"count"`
+	PolicyEval PolicyEvaluated `xml:"policy_evaluated"`
 }
 
 type PolicyEvaluated struct {
@@ -81,4 +82,45 @@ func ParseDMARCReport(r io.Reader) (*DMARCReport, error) {
 		return nil, fmt.Errorf("parsing DMARC report: %w", err)
 	}
 	return &report, nil
+}
+
+// GenerateDMARCAggregateReport generates an RFC 7489-compliant DMARC aggregate report.
+func GenerateDMARCAggregateReport(
+	domain string,
+	reporterEmail string,
+	reporterOrg string,
+	policy PolicyPublished,
+	records []ReportRecord,
+	startTime, endTime time.Time,
+) (string, error) {
+	reportID := fmt.Sprintf("%d.%d.%s@%s",
+		startTime.Unix(),
+		endTime.Unix(),
+		domain,
+		reporterOrg,
+	)
+
+	report := DMARCReport{
+		XMLName: xml.Name{Local: "feedback"},
+		Metadata: ReportMetadata{
+			OrgName:  reporterOrg,
+			Email:    reporterEmail,
+			ReportID: reportID,
+			DateRange: DateRange{
+				Begin: startTime.Unix(),
+				End:   endTime.Unix(),
+			},
+		},
+		Policy:  policy,
+		Records: records,
+	}
+
+	// Marshal to XML with proper declaration
+	output, err := xml.MarshalIndent(&report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling DMARC report: %w", err)
+	}
+
+	// Add XML declaration
+	return fmt.Sprintf("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n%s\n", string(output)), nil
 }

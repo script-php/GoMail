@@ -228,6 +228,22 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	authBuilder.AddDMARC(dmarcResult.Result, dmarcResult.Details, fromDomain)
 	log.Printf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details)
 
+	// Record DMARC feedback for aggregate reporting (RFC 7489)
+	// Determine disposition based on policy and auth results
+	disposition := "none"
+	dkimPass := dkimResult == "pass"
+	spfPass := spfResult == "pass"
+	if !dkimPass && !spfPass {
+		if dmarcResult.Policy == "reject" {
+			disposition = "reject"
+		} else if dmarcResult.Policy == "quarantine" {
+			disposition = "quarantine"
+		}
+	}
+	if err := s.db.SaveDMARCFeedback(fromDomain, clientIP, spfDomain, dkimResult, string(spfResult), disposition); err != nil {
+		log.Printf("[smtp] warning: failed to save DMARC feedback: %v", err)
+	}
+
 	authResults := authBuilder.Build()
 
 	// Prepend Authentication-Results header to raw message so clients can see it

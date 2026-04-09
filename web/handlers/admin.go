@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"gomail/auth"
 	"gomail/config"
+	"gomail/reporting"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
@@ -19,17 +21,19 @@ import (
 
 // AdminHandler handles the admin panel for domains and accounts.
 type AdminHandler struct {
-	cfg        *config.Config
-	db         *store.DB
-	sessionMgr *security.SessionManager
-	tmplDomains     *template.Template
-	tmplDomainEdit  *template.Template
-	tmplAccounts    *template.Template
-	tmplAccountEdit *template.Template
+	cfg               *config.Config
+	db                *store.DB
+	sessionMgr        *security.SessionManager
+	tmplDomains       *template.Template
+	tmplDomainEdit    *template.Template
+	tmplAccounts      *template.Template
+	tmplAccountEdit   *template.Template
+	tmplDMARCFeedback *template.Template
+	enqueueFunc       reporting.EnqueueFunc
 }
 
 // NewAdminHandler creates an admin handler.
-func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager) *AdminHandler {
+func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager, enqueueFunc reporting.EnqueueFunc) *AdminHandler {
 	funcMap := template.FuncMap{
 		"formatSize": func(size int64) string {
 			switch {
@@ -55,15 +59,18 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplDomainEdit := templates.LoadTemplate(funcMap, "base", "admin_domain_edit")
 	tmplAccounts := templates.LoadTemplate(funcMap, "base", "admin_accounts")
 	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit")
+	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback")
 
 	return &AdminHandler{
-		cfg:             cfg,
-		db:              db,
-		sessionMgr:      sm,
-		tmplDomains:     tmplDomains,
-		tmplDomainEdit:  tmplDomainEdit,
-		tmplAccounts:    tmplAccounts,
-		tmplAccountEdit: tmplAccountEdit,
+		cfg:               cfg,
+		db:                db,
+		sessionMgr:        sm,
+		tmplDomains:       tmplDomains,
+		tmplDomainEdit:    tmplDomainEdit,
+		tmplAccounts:      tmplAccounts,
+		tmplAccountEdit:   tmplAccountEdit,
+		tmplDMARCFeedback: tmplDMARCFeedback,
+		enqueueFunc:       enqueueFunc,
 	}
 }
 
@@ -598,6 +605,115 @@ func (h *AdminHandler) buildDNSRecords(domain *store.Domain) []dnsRecord {
 	})
 
 	return records
+}
+
+// --- DMARC Feedback Handler ---
+
+// DMARCFeedback displays DMARC authentication feedback statistics.
+func (h *AdminHandler) DMARCFeedback(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get time range query parameters (default to last 7 days)
+	now := time.Now()
+	defaultStart := now.AddDate(0, 0, -7)
+	startStr := r.URL.Query().Get("start")
+	if startStr == "" {
+		startStr = defaultStart.Format("2006-01-02")
+	}
+	startTime, _ := time.Parse("2006-01-02", startStr)
+
+	// Get all DMARC feedback for the time period
+	rows, err := h.db.Query(`
+		SELECT domain, source_ip, COUNT(*) as count,
+		       SUM(CASE WHEN spf_result = 'pass' THEN 1 ELSE 0 END) as spf_pass,
+		       SUM(CASE WHEN dkim_result = 'pass' THEN 1 ELSE 0 END) as dkim_pass,
+		       disposition
+		FROM dmarc_feedback
+		WHERE received_at >= datetime(?)
+		GROUP BY domain, source_ip, disposition
+		ORDER BY domain ASC, count DESC
+	`, startTime.Format(time.RFC3339))
+	if err != nil {
+		log.Printf("[admin] error querying DMARC feedback: %v", err)
+		http.Error(w, "Error querying feedback", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type FeedbackRow struct {
+		Domain      string
+		SourceIP    string
+		Count       int
+		SPFPass     int
+		DKIMPass    int
+		Disposition string
+	}
+
+	var feedback []FeedbackRow
+	for rows.Next() {
+		var row FeedbackRow
+		if err := rows.Scan(&row.Domain, &row.SourceIP, &row.Count, &row.SPFPass, &row.DKIMPass, &row.Disposition); err != nil {
+			log.Printf("[admin] error scanning feedback row: %v", err)
+			continue
+		}
+		feedback = append(feedback, row)
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":     "DMARC Feedback",
+		"Feedback":  feedback,
+		"StartStr":  startStr,
+		"EndStr":    now.Format("2006-01-02"),
+		"Unread":    unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+		"Section":   "admin",
+		"Account":   account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplDMARCFeedback.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// SendDMARCReportsNow generates and sends DMARC reports immediately (for testing).
+func (h *AdminHandler) SendDMARCReportsNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+
+	// Trigger report sending
+	total, sent, err := reporting.SendReportsNow(h.cfg, h.db, h.enqueueFunc)
+	if err != nil {
+		log.Printf("[admin] error sending reports now: %v", err)
+		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Log the action
+	log.Printf("[admin] user %s triggered manual DMARC reports (total: %d, sent: %d)", account.Email, total, sent)
+
+	// Redirect back to DMARC feedback page with success message
+	w.Header().Set("X-Report-Status", fmt.Sprintf("Reports sent: %d/%d domains", sent, total))
+	http.Redirect(w, r, "/admin/dmarc-feedback?sent=1", http.StatusSeeOther)
 }
 
 // extractPubKeyBase64 extracts the base64 public key from PEM format.

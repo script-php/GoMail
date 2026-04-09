@@ -1,0 +1,133 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>DMARC Feedback</h2>
+        <p class="subtitle">Email authentication statistics from the last 7 days</p>
+        <div class="admin-actions">
+            <form method="POST" action="/admin/dmarc-reports-manual" style="display: inline;">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="btn btn-success" title="Generate and send DMARC reports immediately for testing">
+                    📧 Send Reports Now
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <div class="filter-section">
+        <form method="GET" class="filter-form">
+            <label>Start Date:</label>
+            <input type="date" name="start" value="{{.StartStr}}">
+            <button type="submit" class="btn btn-primary">Filter</button>
+        </form>
+    </div>
+
+    {{if not .Feedback}}
+    <div class="empty-state">
+        <p>No DMARC feedback recorded yet. Send and receive emails to populate this report.</p>
+    </div>
+    {{else}}
+    <div class="feedback-stats">
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Source IP</th>
+                    <th>Messages</th>
+                    <th>SPF Pass</th>
+                    <th>DKIM Pass</th>
+                    <th>Disposition</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{$prevDomain := ""}}
+                {{range .Feedback}}
+                <tr>
+                    {{if ne .Domain $prevDomain}}
+                    <td><strong>{{.Domain}}</strong></td>
+                    {{else}}
+                    <td></td>
+                    {{end}}
+                    <td><code>{{.SourceIP}}</code></td>
+                    <td class="text-center">{{.Count}}</td>
+                    <td class="text-center">
+                        {{if gt .SPFPass 0}}
+                        <span class="badge badge-success">{{.SPFPass}}</span>
+                        {{else}}
+                        <span class="badge badge-danger">0</span>
+                        {{end}}
+                    </td>
+                    <td class="text-center">
+                        {{if gt .DKIMPass 0}}
+                        <span class="badge badge-success">{{.DKIMPass}}</span>
+                        {{else}}
+                        <span class="badge badge-danger">0</span>
+                        {{end}}
+                    </td>
+                    <td>
+                        {{if eq .Disposition "reject"}}
+                        <span class="badge badge-danger">Reject</span>
+                        {{else if eq .Disposition "quarantine"}}
+                        <span class="badge badge-warning">Quarantine</span>
+                        {{else}}
+                        <span class="badge badge-info">None</span>
+                        {{end}}
+                    </td>
+                </tr>
+                {{$prevDomain = .Domain}}
+                {{end}}
+            </tbody>
+        </table>
+    </div>
+    {{end}}
+
+    <style>
+    .filter-section {
+        margin: 20px 0;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 4px;
+    }
+
+    .filter-form {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+    }
+
+    .filter-form label {
+        font-weight: bold;
+    }
+
+    .filter-form input[type="date"] {
+        padding: 8px 12px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+    }
+
+    .text-center {
+        text-align: center;
+    }
+
+    .admin-actions {
+        margin-top: 15px;
+        padding-top: 15px;
+        border-top: 1px solid #ddd;
+    }
+
+    .btn-success {
+        background-color: #28a745;
+        color: white;
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+    }
+
+    .btn-success:hover {
+        background-color: #218838;
+    }
+    </style>
+</div>
+{{end}}

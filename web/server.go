@@ -7,32 +7,36 @@ import (
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/mta_sts"
+	"gomail/reporting"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
 	"gomail/web/handlers"
+
 	"golang.org/x/crypto/acme/autocert"
 )
 
 // Server is the HTTP/HTTPS web server for the mail interface.
 type Server struct {
-	cfg            *config.Config
-	db             *store.DB
-	queue          *delivery.Queue
-	sessionMgr     *security.SessionManager
-	httpServer     *http.Server
+	cfg         *config.Config
+	db          *store.DB
+	queue       *delivery.Queue
+	sessionMgr  *security.SessionManager
+	httpServer  *http.Server
+	enqueueFunc reporting.EnqueueFunc
 }
 
 // NewServer creates the web server with all routes.
-func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue) *Server {
+func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueFunc reporting.EnqueueFunc) *Server {
 	tlsEnabled := cfg.Web.IsTLSEnabled()
 	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey, tlsEnabled)
 
 	s := &Server{
-		cfg:        cfg,
-		db:         db,
-		queue:      queue,
-		sessionMgr: sessionMgr,
+		cfg:         cfg,
+		db:          db,
+		queue:       queue,
+		sessionMgr:  sessionMgr,
+		enqueueFunc: enqueueFunc,
 	}
 
 	mux := http.NewServeMux()
@@ -108,7 +112,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/unread-count", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.UnreadCount)))
 
 	// Admin panel (requires admin role)
-	adminHandler := handlers.NewAdminHandler(s.cfg, s.db, s.sessionMgr)
+	adminHandler := handlers.NewAdminHandler(s.cfg, s.db, s.sessionMgr, s.enqueueFunc)
 	mux.Handle("/admin/domains", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Domains)))
 	mux.Handle("/admin/domain/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainEdit)))
 	mux.Handle("/admin/domain/dkim/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainGenerateDKIM)))
@@ -116,6 +120,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/admin/accounts", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Accounts)))
 	mux.Handle("/admin/account/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.AccountEdit)))
 	mux.Handle("/admin/account/delete/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.AccountDelete)))
+	mux.Handle("/admin/dmarc-feedback", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DMARCFeedback)))
+	mux.Handle("/admin/dmarc-reports-manual", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.SendDMARCReportsNow)))
 }
 
 // GetHTTPServer returns the underlying http.Server for TLS configuration.
