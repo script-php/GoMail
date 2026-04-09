@@ -1,0 +1,35 @@
+{{define "welcome-content"}}
+<div class="welcome-container">
+    <div class="welcome-content">
+        <div class="welcome-header">
+            <div class="welcome-logo">G</div>
+            <h1>Welcome to GoMail</h1>
+            <p class="welcome-subtitle">Your email, your way</p>
+        </div>
+
+        <div class="welcome-body">
+            <div class="welcome-card">
+                <div class="card-icon">📧</div>
+                <h3>Get Started</h3>
+                <p>Click on a folder in the sidebar to view your emails, or start composing a new message.</p>
+            </div>
+
+            <div class="welcome-card">
+                <div class="card-icon">📁</div>
+                <h3>Your Folders</h3>
+                <p>You have {{.Unread}} unread messages across {{len .Folders}} folders. Browse them from the left sidebar.</p>
+            </div>
+
+            <div class="welcome-card">
+                <div class="card-icon">✏️</div>
+                <h3>Compose</h3>
+                <p>Use the Compose button to send a new email. You can add attachments and format your message.</p>
+            </div>
+        </div>
+
+        <div class="welcome-footer">
+            <p>Ready? Start by selecting a folder from the sidebar or composing a new email.</p>
+        </div>
+    </div>
+</div>
+{{end}}

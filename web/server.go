@@ -93,7 +93,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	composeHandler := handlers.NewComposeHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 	forwardHandler := handlers.NewForwardHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 
-	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
+	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Welcome)))
 	mux.Handle("/inbox", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
 	mux.Handle("/sent", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Sent)))
 	mux.Handle("/folder/{folderID}", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.FolderView)))
@@ -113,6 +113,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Admin panel (requires admin role)
 	adminHandler := handlers.NewAdminHandler(s.cfg, s.db, s.sessionMgr, s.enqueueFunc)
+	mux.Handle("/admin", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Dashboard)))
 	mux.Handle("/admin/domains", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Domains)))
 	mux.Handle("/admin/domain/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainEdit)))
 	mux.Handle("/admin/domain/dkim/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainGenerateDKIM)))

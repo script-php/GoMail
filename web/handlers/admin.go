@@ -24,6 +24,7 @@ type AdminHandler struct {
 	cfg               *config.Config
 	db                *store.DB
 	sessionMgr        *security.SessionManager
+	tmplDashboard     *template.Template
 	tmplDomains       *template.Template
 	tmplDomainEdit    *template.Template
 	tmplAccounts      *template.Template
@@ -55,16 +56,18 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		},
 	}
 
-	tmplDomains := templates.LoadTemplate(funcMap, "base", "admin_domains")
-	tmplDomainEdit := templates.LoadTemplate(funcMap, "base", "admin_domain_edit")
-	tmplAccounts := templates.LoadTemplate(funcMap, "base", "admin_accounts")
-	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit")
-	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback")
+	tmplDashboard := templates.LoadTemplate(funcMap, "base", "admin_dashboard", "welcome")
+	tmplDomains := templates.LoadTemplate(funcMap, "base", "admin_domains", "welcome")
+	tmplDomainEdit := templates.LoadTemplate(funcMap, "base", "admin_domain_edit", "welcome")
+	tmplAccounts := templates.LoadTemplate(funcMap, "base", "admin_accounts", "welcome")
+	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit", "welcome")
+	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
 		db:                db,
 		sessionMgr:        sm,
+		tmplDashboard:     tmplDashboard,
 		tmplDomains:       tmplDomains,
 		tmplDomainEdit:    tmplDomainEdit,
 		tmplAccounts:      tmplAccounts,
@@ -81,6 +84,43 @@ func (h *AdminHandler) getAdmin(r *http.Request) *store.Account {
 		return nil
 	}
 	return account
+}
+
+// --- Dashboard ---
+
+// Dashboard displays the admin dashboard with overview stats.
+func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	domains, _ := h.db.ListDomains()
+	accounts, _ := h.db.ListAccounts(0)
+
+	domainCount := len(domains)
+	accountCount := len(accounts)
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":        "Admin Dashboard",
+		"DomainCount":  domainCount,
+		"AccountCount": accountCount,
+		"Domains":      domains,
+		"Accounts":     accounts,
+		"Unread":       unread,
+		"CSRFToken":    h.sessionMgr.GenerateCSRFToken(r),
+		"Section":      "admin",
+		"AdminPanel":   "dashboard",
+		"Account":      account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplDashboard.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
 }
 
 // --- Domain Handlers ---
@@ -114,12 +154,13 @@ func (h *AdminHandler) Domains(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
-		"Title":     "Manage Domains",
-		"Domains":   domainInfos,
-		"Unread":    unread,
-		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-		"Section":   "admin",
-		"Account":   account,
+		"Title":      "Manage Domains",
+		"Domains":    domainInfos,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "domains",
+		"Account":    account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -341,6 +382,7 @@ func (h *AdminHandler) Accounts(w http.ResponseWriter, r *http.Request) {
 		"Unread":         unread,
 		"CSRFToken":      h.sessionMgr.GenerateCSRFToken(r),
 		"Section":        "admin",
+		"AdminPanel":     "accounts",
 		"Account":        account,
 	}
 
@@ -666,14 +708,15 @@ func (h *AdminHandler) DMARCFeedback(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
-		"Title":     "DMARC Feedback",
-		"Feedback":  feedback,
-		"StartStr":  startStr,
-		"EndStr":    now.Format("2006-01-02"),
-		"Unread":    unread,
-		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-		"Section":   "admin",
-		"Account":   account,
+		"Title":      "DMARC Feedback",
+		"Feedback":   feedback,
+		"StartStr":   startStr,
+		"EndStr":     now.Format("2006-01-02"),
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "dmarc",
+		"Account":    account,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

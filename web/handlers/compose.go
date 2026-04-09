@@ -26,7 +26,8 @@ type ComposeHandler struct {
 
 // NewComposeHandler creates a compose handler.
 func NewComposeHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *ComposeHandler {
-	tmpl := templates.LoadSimpleTemplate("base", "compose")
+	funcMap := template.FuncMap{}
+	tmpl := templates.LoadTemplate(funcMap, "base", "compose", "welcome")
 
 	return &ComposeHandler{
 		cfg:        cfg,
@@ -122,7 +123,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	// Validate local recipients exist before enqueuing
 	localDomains, _ := h.db.ListAllDomainNames()
 	var validationErrors []string
-	
+
 	for _, rcpt := range recipients {
 		parts := strings.SplitN(rcpt, "@", 2)
 		if len(parts) != 2 {
@@ -148,7 +149,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if len(validationErrors) > 0 {
 		folders, _ := h.db.ListFolders(account.ID)
 		unread, _ := h.db.CountUnread(account.ID)
-		
+
 		data := map[string]interface{}{
 			"Title":     "Compose",
 			"From":      account.Email,
@@ -166,7 +167,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 				"priority": priority,
 			},
 		}
-		
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
 			log.Printf("[web] template error: %v", err)
@@ -182,7 +183,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	clientIP := getRealClientIP(r)
 
 	var msg strings.Builder
-	
+
 	// Build Received header - show IP only if explicitly enabled
 	var receivedLine string
 	if h.cfg.Mail.StripOriginatingIP {
@@ -204,12 +205,12 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(receivedLine + "\r\n")
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
-	
+
 	// Include X-Originating-IP only if explicitly enabled
 	if h.cfg.Mail.StripOriginatingIP {
 		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
 	}
-	
+
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
 	if cc != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", cc))
@@ -224,7 +225,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if readReceipt {
 		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
 	}
-	
+
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")

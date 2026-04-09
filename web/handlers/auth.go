@@ -22,7 +22,8 @@ type AuthHandler struct {
 // NewAuthHandler creates an auth handler.
 func NewAuthHandler(db *store.DB, sm *security.SessionManager) *AuthHandler {
 	// Use embedded templates
-	tmpl := templates.LoadSimpleTemplate("base", "login")
+	funcMap := template.FuncMap{}
+	tmpl := templates.LoadTemplate(funcMap, "base", "login", "welcome")
 	return &AuthHandler{
 		db:         db,
 		sessionMgr: sm,
@@ -32,9 +33,9 @@ func NewAuthHandler(db *store.DB, sm *security.SessionManager) *AuthHandler {
 
 // LoginPage shows the login form or processes a login attempt.
 func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
-	// If already logged in, redirect to inbox
+	// If already logged in, redirect to home
 	if h.sessionMgr.GetSession(r) != "" {
-		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
@@ -51,7 +52,7 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[web] session creation error: %v", err)
 				data["Error"] = "Internal error, please try again"
 			} else {
-				http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+				http.Redirect(w, r, "/", http.StatusSeeOther)
 				return
 			}
 		} else {

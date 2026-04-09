@@ -27,7 +27,8 @@ type ForwardHandler struct {
 
 // NewForwardHandler creates a forward handler.
 func NewForwardHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *ForwardHandler {
-	tmpl := templates.LoadSimpleTemplate("base", "forward")
+	funcMap := template.FuncMap{}
+	tmpl := templates.LoadTemplate(funcMap, "base", "forward", "welcome")
 
 	return &ForwardHandler{
 		cfg:        cfg,
@@ -79,15 +80,15 @@ func (h *ForwardHandler) ForwardPage(w http.ResponseWriter, r *http.Request) {
 
 	// Prepare forward form with original message details
 	data := map[string]interface{}{
-		"Section":        "forward",
-		"OriginalMsg":    originalMsg,
-		"OriginalFrom":   originalMsg.FromAddr,
-		"OriginalTo":     originalMsg.ToAddr,
-		"OriginalCC":     originalMsg.CcAddr,
+		"Section":         "forward",
+		"OriginalMsg":     originalMsg,
+		"OriginalFrom":    originalMsg.FromAddr,
+		"OriginalTo":      originalMsg.ToAddr,
+		"OriginalCC":      originalMsg.CcAddr,
 		"OriginalSubject": "Fwd: " + originalMsg.Subject,
-		"OriginalText":   originalMsg.TextBody,
-		"Account":        account,
-		"CSRFToken":      h.sessionMgr.GenerateCSRFToken(r),
+		"OriginalText":    originalMsg.TextBody,
+		"Account":         account,
+		"CSRFToken":       h.sessionMgr.GenerateCSRFToken(r),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -144,7 +145,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[forward.Send] retrieved original message: id=%d, direction=%s, rawmsg_size=%d", 
+	log.Printf("[forward.Send] retrieved original message: id=%d, direction=%s, rawmsg_size=%d",
 		originalMsg.ID, originalMsg.Direction, len(originalMsg.RawMessage))
 
 	// Parse recipients
@@ -188,7 +189,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// Build forwarded message
 	var msg strings.Builder
-	
+
 	// Build Received header - show IP only if explicitly enabled
 	var receivedLine string
 	if h.cfg.Mail.StripOriginatingIP {
@@ -230,7 +231,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// User agent
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
-	
+
 	// Include X-Originating-IP unless disabled in config
 	if !h.cfg.Mail.StripOriginatingIP {
 		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
@@ -241,7 +242,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	// We need to include original ARC headers so delivery worker detects this as a forward (i=2+)
 	var arcHeadersFromOriginal []string
 	var messageToEnqueue []byte
-	
+
 	// For inbound messages, RawMessage might be empty, so try RawHeaders first
 	var messageForExtraction []byte
 	if len(originalMsg.RawMessage) > 0 {
@@ -252,30 +253,30 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		messageForExtraction = append([]byte(originalMsg.RawHeaders+"\r\n\r\n"), []byte(originalMsg.TextBody)...)
 		log.Printf("[forward.Send] reconstructed message from RawHeaders for ARC extraction (headers_size=%d)", len(originalMsg.RawHeaders))
 	}
-	
-	log.Printf("[forward.Send] ARC extraction START: has_message=%v, msg_len=%d", 
+
+	log.Printf("[forward.Send] ARC extraction START: has_message=%v, msg_len=%d",
 		len(messageForExtraction) > 0, len(messageForExtraction))
-	
+
 	if len(messageForExtraction) > 0 {
 		existingInstance := auth.GetHighestArcInstance(messageForExtraction)
-		log.Printf("[forward.Send] checking original message for ARC chain: instance=%d, msg_size=%d", 
+		log.Printf("[forward.Send] checking original message for ARC chain: instance=%d, msg_size=%d",
 			existingInstance, len(messageForExtraction))
-		
+
 		if existingInstance > 0 {
 			log.Printf("[forward.Send] preserving existing ARC chain at instance=%d", existingInstance)
 			existingARC := auth.ExtractArcHeaders(messageForExtraction)
 			log.Printf("[forward.Send] extracted ARC headers: %d instances found", len(existingARC))
-			
+
 			// Extract all ARC headers from the original message
 			// These will be prepended to the new forward message
 			for i := 1; i <= existingInstance; i++ {
 				if headerMap, ok := existingARC[i]; ok {
 					log.Printf("[forward.Send] instance %d: auth-results=%v, msg-sig=%v, seal=%v",
-						i, 
+						i,
 						len(headerMap["auth-results"]) > 0,
 						len(headerMap["message-signature"]) > 0,
 						len(headerMap["seal"]) > 0)
-					
+
 					// Add in correct order: auth-results, message-signature, seal
 					if authResult := headerMap["auth-results"]; authResult != "" {
 						arcHeadersFromOriginal = append(arcHeadersFromOriginal, authResult)
@@ -322,7 +323,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		// This allows NextArcInstance() to detect the chain
 		arcHeaderStr := strings.Join(arcHeadersFromOriginal, "\r\n") + "\r\n"
 		messageToEnqueue = append([]byte(arcHeaderStr), []byte(msg.String())...)
-		log.Printf("[forward.Send] prepended %d ARC headers, final message size=%d", 
+		log.Printf("[forward.Send] prepended %d ARC headers, final message size=%d",
 			len(arcHeadersFromOriginal), len(messageToEnqueue))
 	} else {
 		messageToEnqueue = []byte(msg.String())

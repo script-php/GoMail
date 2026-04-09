@@ -66,7 +66,7 @@ func NewMessageHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, 
 		},
 	}
 
-	tmpl := templates.LoadTemplate(funcMap, "base", "message")
+	tmpl := templates.LoadTemplate(funcMap, "base", "message", "welcome")
 
 	return &MessageHandler{
 		db:         db,
