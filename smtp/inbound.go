@@ -18,13 +18,14 @@ import (
 
 // InboundServer listens for incoming SMTP connections.
 type InboundServer struct {
-	cfg         *config.Config
-	db          *store.DB
-	tlsConfig   *tls.Config
-	rateLimiter *RateLimiter
-	listener    net.Listener
-	wg          sync.WaitGroup
-	quit        chan struct{}
+	cfg           *config.Config
+	db            *store.DB
+	tlsConfig     *tls.Config
+	rateLimiter   *RateLimiter
+	listener      net.Listener
+	wg            sync.WaitGroup
+	quit          chan struct{}
+	connSemaphore chan struct{} // Limits concurrent connections
 }
 
 // NewInboundServer creates a new inbound SMTP server.
@@ -37,7 +38,8 @@ func NewInboundServer(cfg *config.Config, db *store.DB, tlsCfg *tls.Config) *Inb
 			cfg.SMTP.RateLimit.ConnectionsPerMinute,
 			cfg.SMTP.RateLimit.MessagesPerMinute,
 		),
-		quit: make(chan struct{}),
+		quit:          make(chan struct{}),
+		connSemaphore: make(chan struct{}, cfg.SMTP.MaxConnections),
 	}
 }
 
@@ -89,11 +91,21 @@ func (s *InboundServer) acceptLoop() {
 			continue
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.handleConnection(conn)
-		}()
+		// Try to acquire connection slot
+		select {
+		case s.connSemaphore <- struct{}{}:
+			// Slot acquired, handle the connection
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer func() { <-s.connSemaphore }() // Release slot when done
+				s.handleConnection(conn)
+			}()
+		default:
+			// No slots available, reject connection
+			log.Printf("[smtp] max connections reached: rejecting connection from %s", ip)
+			conn.Close()
+		}
 	}
 }
 

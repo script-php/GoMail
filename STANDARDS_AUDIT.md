@@ -165,9 +165,12 @@
   - Impact: No rDNS verification on connecting IPs despite having the code
   - **Fix:** Call `dns.VerifyPTR(remoteIP)` in inbound.go before processing; add result to auth checks
 
-- ⚠️ **Max connections enforcement** - `config.SMTP.MaxConnections` is defined (default 100) but **never enforced** in the accept loop (smtp/inbound.go has no connection counter)
-  - Impact: No upper bound on simultaneous SMTP connections under load
-  - **Fix:** Add semaphore/counter in accept loop
+- ✅ **Max connections enforcement** (FIXED April 9, 2026) - Semaphore-based connection limiter now active
+  - **Implementation:** Added `connSemaphore` channel (buffered to `MaxConnections`) in InboundServer
+  - **Behavior:** Accept loop now checks if slot available; rejects connection if at limit with log message
+  - **On disconnect:** Slot automatically released via defer so next client can connect
+  - **Config:** Respects `config.SMTP.MaxConnections` (defaults to 100)
+  - **Impact:** Limits simultaneous SMTP connections; prevents resource exhaustion under load
 
 - ⚠️ **Web rate limiter** - Rate limiting middleware written in web/middleware.go but **never registered** in web/server.go
   - Impact: Web UI has no rate limiting; login brute-force possible
@@ -282,15 +285,11 @@
 ## PRIORITY RECOMMENDATIONS
 
 ### **CRITICAL** (Fix immediately)
-1. **Wire up MaxConnections enforcement** - Add semaphore in SMTP accept loop
-   - File: `smtp/inbound.go`
-   - Effort: 30 minutes
-
-2. **Wire up web rate limiter** - Middleware exists, just needs registration
+1. **Wire up web rate limiter** - Middleware exists, just needs registration
    - File: `web/server.go`
    - Effort: 15 minutes
 
-3. **Stale queue recovery** - Timeout entries stuck in `"sending"` for >15 minutes
+2. **Stale queue recovery** - Timeout entries stuck in `"sending"` for >15 minutes
    - File: `delivery/worker.go`
    - Effort: 1 hour
 
@@ -352,17 +351,13 @@
    - Register middleware from `web/middleware.go` in `web/server.go`
    - Already fully implemented
 
-3. **Enforce MaxConnections** ✏️ 30 minutes
-   - Add connection counter/semaphore in `smtp/inbound.go` accept loop
-   - Config value already exists
-
-4. **Add IPv6** ✏️ 30 minutes
+3. **Add IPv6** ✏️ 30 minutes
    - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
 
-5. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
+4. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
    - Add `"SMTPUTF8"` to EHLO extensions in `smtp/session.go`
 
-6. **Stale queue recovery** ✏️ 1 hour
+5. **Stale queue recovery** ✏️ 1 hour
    - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
 
 ---
@@ -403,7 +398,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-8, 2026):**
+**Recently Fixed (April 6-9, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -413,9 +408,9 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **DMARC feedback recording** - Authentication results tracked for aggregate reporting
 - ✅ **DMARC report generation** - RFC 7489 XML reports generated and viewable in admin panel
 - ✅ **DMARC weekly report scheduler** - Automatic weekly generation and delivery to rua= addresses
+- ✅ **Max connections enforcement** - Semaphore-based limiter in SMTP accept loop prevents resource exhaustion
 
 **What needs immediate attention:**
-- ⚠️ MaxConnections not enforced (config exists, accept loop doesn't check)
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
 - ⚠️ PTR/rDNS check not wired (function exists, never called)
 - ⚠️ Stale queue entries never recovered after crash
