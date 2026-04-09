@@ -12,6 +12,7 @@ import (
 
 	"gomail/auth"
 	"gomail/config"
+	"gomail/dns"
 	"gomail/parser"
 	"gomail/store"
 )
@@ -118,6 +119,19 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Verify reverse DNS (PTR) for the connecting IP
+	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	ptrHostname, ptrValid, err := dns.VerifyPTR(ip)
+	if err != nil {
+		log.Printf("[smtp] PTR lookup failed for %s: %v", ip, err)
+	} else {
+		if ptrValid {
+			log.Printf("[smtp] PTR verified for %s: %s", ip, ptrHostname)
+		} else {
+			log.Printf("[smtp] PTR hostname %s does not resolve back to %s (forward confirmation failed)", ptrHostname, ip)
+		}
+	}
+
 	accountExists := func(email string) bool {
 		acct, err := s.db.GetAccountByEmail(email)
 		return err == nil && acct != nil && acct.IsActive
@@ -133,6 +147,8 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		s.cfg.SMTP.MaxRecipients,
 		time.Duration(s.cfg.SMTP.ReadTimeout)*time.Second,
 		time.Duration(s.cfg.SMTP.WriteTimeout)*time.Second,
+		ptrHostname,
+		ptrValid,
 	)
 
 	// Override the DATA handler to intercept the message
@@ -197,6 +213,15 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	log.Printf("[smtp] processing message from=%s to=%v ip=%s size=%d",
 		mailFrom, rcptTo, clientIP, len(rawMessage))
+
+	// Log PTR verification result
+	if sess.ptrValid {
+		log.Printf("[smtp] PTR verified: %s", sess.ptrHostname)
+	} else if sess.ptrHostname != "" {
+		log.Printf("[smtp] PTR unverified: %s (no forward confirmation)", sess.ptrHostname)
+	} else {
+		log.Printf("[smtp] PTR: no reverse DNS records found")
+	}
 
 	// --- Add Received header ---
 	receivedHeader := fmt.Sprintf("Received: from %s\r\n\tby %s\r\n\twith SMTP%s\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",

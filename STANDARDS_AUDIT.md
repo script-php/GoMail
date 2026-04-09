@@ -161,9 +161,11 @@
   - **RFC 7489 compliance:** Full alignment evaluation, policy application, and report infrastructure
 
 ### Code Exists But Not Wired
-- ⚠️ **Reverse DNS (PTR) on inbound** - `dns.VerifyPTR` is fully implemented but **never called** from the SMTP inbound accept path
-  - Impact: No rDNS verification on connecting IPs despite having the code
-  - **Fix:** Call `dns.VerifyPTR(remoteIP)` in inbound.go before processing; add result to auth checks
+- ✅ **Reverse DNS (PTR) on inbound** (FIXED April 9, 2026) - FCrDNS verification now wired into accept path
+  - **Implementation:** Call `dns.VerifyPTR(ip)` in handleConnection; stores hostname and validity in Session struct
+  - **Behavior:** Performs forward-confirmed reverse DNS lookup (reverse IP → hostname, then forward hostname → IP)
+  - **Logging:** Logs PTR result for each connection: "PTR verified: ...", "PTR unverified: ... (no forward confirmation)", or "PTR: no reverse DNS"
+  - **Impact:** Now verifies connecting IP has valid reverse DNS; useful for spam scoring and forensics
 
 - ✅ **Max connections enforcement** (FIXED April 9, 2026) - Semaphore-based connection limiter now active
   - **Implementation:** Added `connSemaphore` channel (buffered to `MaxConnections`) in InboundServer
@@ -298,16 +300,11 @@
    - Files: `smtp/session.go` (advertise + handle), `config/config.go`
    - Effort: 1-2 days
 
-2. **Wire up PTR check on inbound** - Code exists, needs one function call
-   - File: `smtp/inbound.go`
-   - Effort: 15 minutes
-
-3. **Attachment upload in compose** - File upload + multipart message building
+2. **Attachment upload in compose** - File upload + multipart message building
    - Files: `web/handlers/compose.go`, templates
    - Effort: 1-2 days
 
-
-5. **SMTPUTF8** (RFC 6531) - Advertise + handle Unicode addresses
+3. **SMTPUTF8** (RFC 6531) - Advertise + handle Unicode addresses
    - Files: `smtp/session.go`, `smtp/inbound.go`
    - Effort: 0.5-1 day
 
@@ -343,21 +340,17 @@
 
 ## QUICK WINS (Code already exists, just needs wiring)
 
-1. **Wire PTR check** ✏️ 15 minutes
-   - Call `dns.VerifyPTR(remoteIP)` in `smtp/inbound.go`
-   - Already fully implemented in `dns/ptr.go`
-
-2. **Wire web rate limiter** ✏️ 15 minutes
+1. **Wire web rate limiter** ✏️ 15 minutes
    - Register middleware from `web/middleware.go` in `web/server.go`
    - Already fully implemented
 
-3. **Add IPv6** ✏️ 30 minutes
+2. **Add IPv6** ✏️ 30 minutes
    - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
 
-4. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
+3. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
    - Add `"SMTPUTF8"` to EHLO extensions in `smtp/session.go`
 
-5. **Stale queue recovery** ✏️ 1 hour
+4. **Stale queue recovery** ✏️ 1 hour
    - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
 
 ---
@@ -409,10 +402,10 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **DMARC report generation** - RFC 7489 XML reports generated and viewable in admin panel
 - ✅ **DMARC weekly report scheduler** - Automatic weekly generation and delivery to rua= addresses
 - ✅ **Max connections enforcement** - Semaphore-based limiter in SMTP accept loop prevents resource exhaustion
+- ✅ **Reverse DNS (PTR) verification** - FCrDNS lookup on inbound connections with logging
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
-- ⚠️ PTR/rDNS check not wired (function exists, never called)
 - ⚠️ Stale queue entries never recovered after crash
 
 **What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, **SMTPUTF8**, and various optional modern features.

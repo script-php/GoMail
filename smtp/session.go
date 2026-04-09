@@ -26,32 +26,34 @@ const (
 
 // Session represents a single SMTP session with a connected client.
 type Session struct {
-	conn       net.Conn
-	reader     *bufio.Reader
-	writer     *bufio.Writer
-	state      SessionState
-	hostname   string
-	domains       []string // all accepted domains
+	conn          net.Conn
+	reader        *bufio.Reader
+	writer        *bufio.Writer
+	state         SessionState
+	hostname      string
+	domains       []string                // all accepted domains
 	accountExists func(email string) bool // checks if a local account exists
 	clientAddr    string
 	clientIP      string
-	ehlo       string
-	mailFrom   string
-	rcptTo     []string
-	dsnNotify  map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
-	dsnRET     string // FULL or HDRS
-	dsnEnvID   string // Envelope ID
-	data       bytes.Buffer
-	tls        bool
-	tlsConfig  *tls.Config
-	maxSize    int64
-	maxRcpt    int
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	ptrHostname   string // reverse DNS hostname (if verified)
+	ptrValid      bool   // true if forward-confirmed reverse DNS
+	ehlo          string
+	mailFrom      string
+	rcptTo        []string
+	dsnNotify     map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
+	dsnRET        string            // FULL or HDRS
+	dsnEnvID      string            // Envelope ID
+	data          bytes.Buffer
+	tls           bool
+	tlsConfig     *tls.Config
+	maxSize       int64
+	maxRcpt       int
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
 }
 
 // NewSession creates a new SMTP session for the given connection.
-func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration) *Session {
+func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool) *Session {
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
@@ -65,6 +67,8 @@ func NewSession(conn net.Conn, hostname string, domains []string, accountExists 
 		accountExists: accountExists,
 		clientAddr:    remoteAddr,
 		clientIP:      ip,
+		ptrHostname:   ptrHostname,
+		ptrValid:      ptrValid,
 		tlsConfig:     tlsCfg,
 		maxSize:       maxSize,
 		maxRcpt:       maxRcpt,
@@ -260,10 +264,10 @@ func (s *Session) handleRCPT(arg string) {
 	}
 
 	s.rcptTo = append(s.rcptTo, to)
-	
+
 	// Parse DSN parameters (NOTIFY, ORCPT)
 	s.parseDSNRcptParams(to, arg)
-	
+
 	s.state = StateRcpt
 	s.send(250, "OK")
 }
@@ -421,7 +425,7 @@ func (s *Session) parseDSNMailParams(arg string) {
 // Format: RCPT TO:<addr> [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;addr]
 func (s *Session) parseDSNRcptParams(recipient, arg string) {
 	var notify string
-	
+
 	// Look for NOTIFY parameter
 	upperArg := strings.ToUpper(arg)
 	if strings.Contains(upperArg, "NOTIFY=") {
@@ -435,7 +439,7 @@ func (s *Session) parseDSNRcptParams(recipient, arg string) {
 			}
 		}
 	}
-	
+
 	// Store NOTIFY flags for this recipient
 	if notify != "" && notify != "NEVER" {
 		s.dsnNotify[recipient] = notify
