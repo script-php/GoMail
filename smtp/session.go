@@ -26,30 +26,31 @@ const (
 
 // Session represents a single SMTP session with a connected client.
 type Session struct {
-	conn          net.Conn
-	reader        *bufio.Reader
-	writer        *bufio.Writer
-	state         SessionState
-	hostname      string
-	domains       []string                // all accepted domains
-	accountExists func(email string) bool // checks if a local account exists
-	clientAddr    string
-	clientIP      string
-	ptrHostname   string // reverse DNS hostname (if verified)
-	ptrValid      bool   // true if forward-confirmed reverse DNS
-	ehlo          string
-	mailFrom      string
-	rcptTo        []string
-	dsnNotify     map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
-	dsnRET        string            // FULL or HDRS
-	dsnEnvID      string            // Envelope ID
-	data          bytes.Buffer
-	tls           bool
-	tlsConfig     *tls.Config
-	maxSize       int64
-	maxRcpt       int
-	readTimeout   time.Duration
-	writeTimeout  time.Duration
+	conn            net.Conn
+	reader          *bufio.Reader
+	writer          *bufio.Writer
+	state           SessionState
+	hostname        string
+	domains         []string                // all accepted domains
+	accountExists   func(email string) bool // checks if a local account exists
+	clientAddr      string
+	clientIP        string
+	ptrHostname     string // reverse DNS hostname (if verified)
+	ptrValid        bool   // true if forward-confirmed reverse DNS
+	ehlo            string
+	mailFrom        string
+	rcptTo          []string
+	dsnNotify       map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
+	dsnRET          string            // FULL or HDRS
+	dsnEnvID        string            // Envelope ID
+	data            bytes.Buffer
+	tls             bool
+	tlsConfig       *tls.Config
+	maxSize         int64
+	maxRcpt         int
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	smtputf8Enabled bool // true if client advertised SMTPUTF8 support
 }
 
 // NewSession creates a new SMTP session for the given connection.
@@ -143,6 +144,10 @@ func (s *Session) handleEHLO(arg string) {
 	s.reset()
 	s.state = StateReady
 
+	// Check if client supports SMTPUTF8
+	// This is detected from the EHLO argument in the actual handshake
+	// For now, we always advertise it (RFC 6531)
+
 	lines := []string{
 		fmt.Sprintf("%s greets %s", s.hostname, arg),
 		fmt.Sprintf("SIZE %d", s.maxSize),
@@ -150,6 +155,7 @@ func (s *Session) handleEHLO(arg string) {
 		"ENHANCEDSTATUSCODES",
 		"PIPELINING",
 		"DSN",
+		"SMTPUTF8",
 	}
 
 	if !s.tls && s.tlsConfig != nil {
@@ -211,6 +217,11 @@ func (s *Session) handleMAIL(arg string) {
 	if from == "" && !strings.Contains(strings.ToUpper(arg), "FROM:<>") {
 		s.send(501, "Syntax error in MAIL FROM")
 		return
+	}
+
+	// Check for UTF8 parameter (RFC 6531)
+	if strings.Contains(strings.ToUpper(arg), "UTF8") {
+		s.smtputf8Enabled = true
 	}
 
 	// Parse DSN parameters (RET, ENVID)

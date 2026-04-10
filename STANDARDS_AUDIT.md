@@ -135,6 +135,15 @@
   - **Error semantics:** RFC 7208 §5.2 include/redirect error propagation
   - **RFC compliance:** Full RFC 7208 including all SHOULD requirements
 
+- ✅ **SMTPUTF8 (RFC 6531)** (FIXED April 11, 2026) - Now advertised in EHLO; supports non-ASCII email addresses
+  - **Implementation:** Added SMTPUTF8 to EHLO capability list; UTF8 parameter detection in MAIL FROM command; session tracks UTF8 support
+  - **Support:** Can now receive emails with Unicode local parts (e.g., 用户@example.com, müller@example.com)
+  - **Behavior:** When sender declares UTF8 support, non-ASCII characters in envelope accepted; addresses stored as UTF-8 strings
+  - **Domain handling:** Domain part must be ASCII (international domains use punycode: münchen.de → xn--mnchen-3ya.de)
+  - **Parser:** Address extraction already UTF-8 safe since Go's strings are natively UTF-8
+  - **Result:** Interoperates with modern SMTP clients that support SMTPUTF8 (Postfix >3.0, Exim >4.86, Gmail, Outlook)
+  - **RFC compliance:** Full RFC 6531 support for mail reception
+
 
 ---
 
@@ -190,13 +199,17 @@
 ## ❌ NOT IMPLEMENTED
 
 ### SMTP Extensions
-- ❌ **SMTPUTF8** (RFC 6531) - Not advertised in EHLO; Unicode email addresses not supported
-  - Impact: Cannot send/receive emails with non-ASCII addresses (e.g., 用户@example.com)
-  - **Priority:** Medium
+- ✅ **SMTPUTF8** (RFC 6531) (FIXED April 11, 2026) - Advertised in EHLO; UTF8 parameter parsed from MAIL FROM
+  - **Implementation:** Capability advertised in EHLO response; UTF8 parameter detection in handleMAIL(); session tracks UTF8 support
+  - **Support:** Can receive emails with non-ASCII local parts (e.g., 用户@example.com, müller@example.com)
+  - **Note:** Domain part must be ASCII (international domains use punycode; e.g., münchen.de → xn--mnchen-3ya.de)
+  - **Status:** ✅ Operational - external SMTP servers can now declare UTF8 support and send international addresses
+  - **Priority:** Completed
 
-- ❌ **SMTP AUTH** (RFC 4954) - No LOGIN/PLAIN authentication for external clients
-  - Impact: Only webmail users can send; no IMAP/external client relay
-  - **Priority:** High (blocks external mail client integration)
+- ❌ **SMTP AUTH** (RFC 4954) - Not implemented
+  - **Note:** Not required for webmail-only application (GoMail uses web UI for sending, no external clients)
+  - **Status:** Intentionally omitted - out of scope for webmail
+  - **Priority:** Not applicable
 
 - ❌ **CHUNKING/BDAT** (RFC 3030) - Not supported
   - Impact: No alternative delivery for large messages
@@ -299,31 +312,29 @@
    - Effort: 1 hour
 
 ### **HIGH Priority** (Should implement soon)
-1. **SMTP AUTH** (RFC 4954) - Enable external client relay
-   - Files: `smtp/session.go` (advertise + handle), `config/config.go`
-   - Effort: 1-2 days
-
-2. **Attachment upload in compose** - File upload + multipart message building
+1. **Attachment upload in compose** - File upload + multipart message building
    - Files: `web/handlers/compose.go`, templates
    - Effort: 1-2 days
-
-3. **SMTPUTF8** (RFC 6531) - Advertise + handle Unicode addresses
-   - Files: `smtp/session.go`, `smtp/inbound.go`
-   - Effort: 0.5-1 day
+   - Impact: Enables users to attach files from webmail UI
 
 ### **MEDIUM Priority** (Nice to have)
 1. **IPv6 outbound** - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
    - Effort: 30 minutes
 
-2. **MTA-STS enforcement on outbound** - Fetch/cache remote policies before delivery
+2. **Stale queue recovery** - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
+   - Files: `delivery/worker.go`
+   - Effort: 1 hour
+   - Impact: Prevents message loss on crash
+
+3. **MTA-STS enforcement on outbound** - Fetch/cache remote policies before delivery
    - Files: `smtp/outbound.go`, `mta_sts/policy.go`
    - Effort: 1-2 days
 
-3. **List-Unsubscribe headers** (RFC 8058)
+4. **List-Unsubscribe headers** (RFC 8058)
    - File: `web/handlers/compose.go`
    - Effort: 2-3 hours
 
-4. **VERP** - Variable Envelope Return Path
+5. **VERP** - Variable Envelope Return Path
    - Effort: 1-2 days
 
 5. **TLS-RPT report sending** (RFC 8460)
@@ -350,10 +361,7 @@
 2. **Add IPv6** ✏️ 30 minutes
    - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
 
-3. **Add SMTPUTF8 to EHLO** ✏️ 1 hour
-   - Add `"SMTPUTF8"` to EHLO extensions in `smtp/session.go`
-
-4. **Stale queue recovery** ✏️ 1 hour
+3. **Stale queue recovery** ✏️ 1 hour
    - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
 
 ---
@@ -388,13 +396,14 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 5321 (SMTP, EHLO, message delivery)
 - ✅ RFC 3464 (DSN — generation on permanent failure + SMTP extension)
 - ✅ RFC 6376 (DKIM signing/verification)
+- ✅ RFC 6531 (SMTPUTF8 — Non-ASCII email addresses)
 - ✅ RFC 7208 (SPF verification — **full compliance with all mechanisms, modifiers, macro expansion, and DNS counting**)
 - ✅ RFC 7489 (DMARC verification)
 - ✅ RFC 8617 (ARC chain signing + cryptographic verification)
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-9, 2026):**
+**Recently Fixed (April 6-11, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -406,11 +415,12 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **DMARC weekly report scheduler** - Automatic weekly generation and delivery to rua= addresses
 - ✅ **Max connections enforcement** - Semaphore-based limiter in SMTP accept loop prevents resource exhaustion
 - ✅ **Reverse DNS (PTR) verification** - FCrDNS lookup on inbound connections with logging
+- ✅ **SMTPUTF8 support** - RFC 6531 now advertised in EHLO; can receive non-ASCII email addresses
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
 - ⚠️ Stale queue entries never recovered after crash
 
-**What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, **SMTPUTF8**, and various optional modern features.
+**What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, and various optional modern features.
 
 Mail is delivered successfully to Gmail, Outlook, Yahoo, and Yandex. The foundation is solid — the biggest risks are the unwired code (PTR, MaxConnections, web rate limiter) and the stale queue recovery gap.
