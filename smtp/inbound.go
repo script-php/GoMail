@@ -258,6 +258,9 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		return fmt.Errorf("parsing message: %w", err)
 	}
 
+	log.Printf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
+		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments))
+
 	fromDomain := extractDomain(parsed.From)
 	spfDomain := extractDomain(mailFrom)
 

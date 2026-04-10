@@ -36,7 +36,11 @@
                         <div><strong>Subject:</strong> {{.OriginalMsg.Subject}}</div>
                         <div><strong>Date:</strong> {{.OriginalMsg.ReceivedAt.Format "Jan 02, 2006 15:04 MST"}}</div>
                     </div>
+                    {{if .IsHTML}}
+                    <div class="original-message-body html-preview">{{safeHTML .OriginalHTML}}</div>
+                    {{else}}
                     <div class="original-message-body">{{.OriginalText}}</div>
+                    {{end}}
                 </div>
             </div>
             <div class="compose-actions">

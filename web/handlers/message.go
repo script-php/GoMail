@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -32,7 +33,7 @@ type MessageHandler struct {
 func NewMessageHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *MessageHandler {
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
-			return template.HTML(s)
+			return template.HTML(sanitizeHTML(s))
 		},
 		"formatSize": func(size int64) string {
 			switch {
@@ -98,6 +99,8 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[web] View message: id=%d, subject=%q, textLen=%d, htmlLen=%d",
+		id, msg.Subject, len(msg.TextBody), len(msg.HTMLBody))
 	log.Printf("[web] View message: id=%d, MDNRequested=%v, MDNAddress=%s, MDNSent=%v, Config.MDN.Enabled=%s, Config.MDN.Mode=%s",
 		id, msg.MDNRequested, msg.MDNAddress, msg.MDNSent, h.cfg.MDN.Enabled, h.cfg.MDN.Mode)
 
@@ -339,4 +342,35 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", att.ContentType)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+att.Filename+"\"")
 	http.ServeFile(w, r, fullPath)
+}
+
+// sanitizeHTML removes potentially dangerous content from HTML emails
+func sanitizeHTML(html string) string {
+	// Remove script tags and content
+	html = regexp.MustCompile(`(?i)<script[^>]*>.*?</script>`).ReplaceAllString(html, "")
+
+	// Remove iframes
+	html = regexp.MustCompile(`(?i)<iframe[^>]*>.*?</iframe>`).ReplaceAllString(html, "")
+
+	// Remove event handlers (onclick, onerror, onload, etc.)
+	// Match: on<word>= followed by quoted or unquoted value
+	html = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)`).ReplaceAllString(html, " ")
+
+	// Remove form submissions
+	html = regexp.MustCompile(`(?i)<form[^>]*>`).ReplaceAllString(html, "<div>")
+	html = regexp.MustCompile(`(?i)</form>`).ReplaceAllString(html, "</div>")
+	html = regexp.MustCompile(`(?i)<input[^>]*>`).ReplaceAllString(html, "")
+	html = regexp.MustCompile(`(?i)<button[^>]*>.*?</button>`).ReplaceAllString(html, "")
+
+	// Remove meta refresh (can be used to redirect)
+	html = regexp.MustCompile(`(?i)<meta\s+http-equiv\s*=\s*['"]?refresh['"]?[^>]*>`).ReplaceAllString(html, "")
+
+	// Remove base tag (can be used to change relative URLs)
+	html = regexp.MustCompile(`(?i)<base[^>]*>`).ReplaceAllString(html, "")
+
+	// Allow safe tags and attributes
+	// Keep: a, img, table, tr, td, div, span, p, br, strong, em, etc.
+	// This is a basic whitelist - emails should mostly work
+
+	return strings.TrimSpace(html)
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/textproto"
 	"strings"
 )
@@ -103,7 +104,10 @@ func readPartData(part *multipart.Part) ([]byte, error) {
 		}
 		return decoded[:n], nil
 	case "quoted-printable":
-		// Go's multipart reader already handles QP if Content-Transfer-Encoding is set
+		buf := new(bytes.Buffer)
+		if _, err := io.Copy(buf, quotedprintable.NewReader(bytes.NewReader(raw))); err == nil {
+			return buf.Bytes(), nil
+		}
 		return raw, nil
 	default:
 		return raw, nil
@@ -112,14 +116,11 @@ func readPartData(part *multipart.Part) ([]byte, error) {
 
 // isAttachment determines if a MIME part is an attachment.
 func isAttachment(disposition, mediaType string) bool {
+	// Only treat explicit attachments as downloadable
 	if strings.HasPrefix(strings.ToLower(disposition), "attachment") {
 		return true
 	}
-	// Inline images and other non-text types with filenames
-	if strings.HasPrefix(strings.ToLower(disposition), "inline") &&
-		!strings.HasPrefix(mediaType, "text/") {
-		return true
-	}
+	// Inline content (including inline images in multipart/related) are NOT attachments
 	return false
 }
 

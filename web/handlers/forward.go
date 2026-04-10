@@ -27,7 +27,11 @@ type ForwardHandler struct {
 
 // NewForwardHandler creates a forward handler.
 func NewForwardHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *ForwardHandler {
-	funcMap := template.FuncMap{}
+	funcMap := template.FuncMap{
+		"safeHTML": func(s string) template.HTML {
+			return template.HTML(sanitizeHTML(s))
+		},
+	}
 	tmpl := templates.LoadTemplate(funcMap, "base", "forward", "welcome")
 
 	return &ForwardHandler{
@@ -87,6 +91,8 @@ func (h *ForwardHandler) ForwardPage(w http.ResponseWriter, r *http.Request) {
 		"OriginalCC":      originalMsg.CcAddr,
 		"OriginalSubject": "Fwd: " + originalMsg.Subject,
 		"OriginalText":    originalMsg.TextBody,
+		"OriginalHTML":    originalMsg.HTMLBody,
+		"IsHTML":          originalMsg.HTMLBody != "",
 		"Account":         account,
 		"CSRFToken":       h.sessionMgr.GenerateCSRFToken(r),
 	}

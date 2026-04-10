@@ -350,6 +350,23 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
     font-size: 13px; line-height: 1.6; color: var(--text-secondary);
 }
 
+.original-message-body.html-preview {
+    white-space: normal; color: var(--text); font-size: 14px;
+}
+
+.original-message-body.html-preview table {
+    width: 100%; border-collapse: collapse; margin: 10px 0;
+}
+
+.original-message-body.html-preview td,
+.original-message-body.html-preview th {
+    padding: 8px; border: 1px solid var(--border);
+}
+
+.original-message-body.html-preview img {
+    max-width: 100%; height: auto; margin: 8px 0;
+}
+
 /* ===== BUTTONS ===== */
 .btn {
     display: inline-flex; align-items: center; justify-content: center;
