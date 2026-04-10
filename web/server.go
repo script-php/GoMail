@@ -18,25 +18,28 @@ import (
 
 // Server is the HTTP/HTTPS web server for the mail interface.
 type Server struct {
-	cfg         *config.Config
-	db          *store.DB
-	queue       *delivery.Queue
-	sessionMgr  *security.SessionManager
-	httpServer  *http.Server
-	enqueueFunc reporting.EnqueueFunc
+	cfg              *config.Config
+	db               *store.DB
+	queue            *delivery.Queue
+	sessionMgr       *security.SessionManager
+	loginRateLimiter *LoginRateLimiter
+	httpServer       *http.Server
+	enqueueFunc      reporting.EnqueueFunc
 }
 
 // NewServer creates the web server with all routes.
 func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueFunc reporting.EnqueueFunc) *Server {
 	tlsEnabled := cfg.Web.IsTLSEnabled()
 	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey, tlsEnabled)
+	loginRateLimiter := NewLoginRateLimiter()
 
 	s := &Server{
-		cfg:         cfg,
-		db:          db,
-		queue:       queue,
-		sessionMgr:  sessionMgr,
-		enqueueFunc: enqueueFunc,
+		cfg:              cfg,
+		db:               db,
+		queue:            queue,
+		sessionMgr:       sessionMgr,
+		loginRateLimiter: loginRateLimiter,
+		enqueueFunc:      enqueueFunc,
 	}
 
 	mux := http.NewServeMux()
@@ -90,6 +93,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Auth routes (no session required)
 	authHandler := handlers.NewAuthHandler(s.db, s.sessionMgr)
+	authHandler.SetLoginRateLimiter(s.loginRateLimiter)
 	mux.HandleFunc("/login", authHandler.LoginPage)
 	mux.HandleFunc("/logout", authHandler.Logout)
 
