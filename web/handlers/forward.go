@@ -225,9 +225,13 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 	msg.WriteString(fmt.Sprintf("Resent-Message-ID: %s\r\n", msgID2))
 
-	// Original headers (preserved from forwarded message)
-	// These are from external emails, might contain RFC 2047 encoded values already
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(originalMsg.FromAddr)))
+	// For forwarded messages, From: must be the forwarder for DMARC alignment with DKIM signature.
+	// Original sender goes in Reply-To for context. Resent- headers also identify the forwarder.
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
+	msg.WriteString(fmt.Sprintf("Reply-To: %s\r\n", encodeHeaderValue(originalMsg.FromAddr)))
+
+	// Preserve original message's addresses in message body context
+	// (not as email headers to avoid DMARC issues)
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(originalMsg.ToAddr)))
 	if originalMsg.CcAddr != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(originalMsg.CcAddr)))
