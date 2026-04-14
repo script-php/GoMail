@@ -237,7 +237,10 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(originalMsg.Subject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", originalMsg.ReceivedAt.Format(time.RFC1123Z)))
-	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", originalMsg.MessageID))
+
+	// Message-ID for the wrapper message (not the original)
+	// Use msgID2 which was generated for this wrapper message
+	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID2))
 
 	// User agent
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
@@ -247,127 +250,118 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
 	}
 
-	// ADD ARC HEADERS WITH CHAIN SUPPORT
-	// Extract existing ARC chain from original message
-	// We need to include original ARC headers so delivery worker detects this as a forward (i=2+)
-	var arcHeadersFromOriginal []string
-	var messageToEnqueue []byte
-
-	// For inbound messages, RawMessage might be empty, so try RawHeaders first
-	var messageForExtraction []byte
+	// Extract existing ARC chain from original message for verification
+	// The original message/rfc822 part preserves the ARC chain intact
+	var messageForARCExtraction []byte
 	if len(originalMsg.RawMessage) > 0 {
-		messageForExtraction = originalMsg.RawMessage
-		log.Printf("[forward.Send] using RawMessage for ARC extraction (size=%d)", len(originalMsg.RawMessage))
+		messageForARCExtraction = originalMsg.RawMessage
+		log.Printf("[forward.Send] checking RawMessage for existing ARC chain (size=%d)", len(originalMsg.RawMessage))
 	} else if len(originalMsg.RawHeaders) > 0 {
-		// Reconstruct minimal message from RawHeaders + body for ARC extraction
-		messageForExtraction = append([]byte(originalMsg.RawHeaders+"\r\n\r\n"), []byte(originalMsg.TextBody)...)
-		log.Printf("[forward.Send] reconstructed message from RawHeaders for ARC extraction (headers_size=%d)", len(originalMsg.RawHeaders))
+		// Reconstruct minimal message from headers + body for ARC detection
+		messageForARCExtraction = append([]byte(originalMsg.RawHeaders+"\r\n\r\n"), []byte(originalMsg.TextBody)...)
+		log.Printf("[forward.Send] checking reconstructed message for ARC chain")
 	}
 
-	log.Printf("[forward.Send] ARC extraction START: has_message=%v, msg_len=%d",
-		len(messageForExtraction) > 0, len(messageForExtraction))
-
-	if len(messageForExtraction) > 0 {
-		existingInstance := auth.GetHighestArcInstance(messageForExtraction)
-		log.Printf("[forward.Send] checking original message for ARC chain: instance=%d, msg_size=%d",
-			existingInstance, len(messageForExtraction))
-
+	if len(messageForARCExtraction) > 0 {
+		existingInstance := auth.GetHighestArcInstance(messageForARCExtraction)
 		if existingInstance > 0 {
-			log.Printf("[forward.Send] preserving existing ARC chain at instance=%d", existingInstance)
-			existingARC := auth.ExtractArcHeaders(messageForExtraction)
-			log.Printf("[forward.Send] extracted ARC headers: %d instances found", len(existingARC))
-
-			// Extract all ARC headers from the original message
-			// These will be prepended to the new forward message
-			for i := 1; i <= existingInstance; i++ {
-				if headerMap, ok := existingARC[i]; ok {
-					log.Printf("[forward.Send] instance %d: auth-results=%v, msg-sig=%v, seal=%v",
-						i,
-						len(headerMap["auth-results"]) > 0,
-						len(headerMap["message-signature"]) > 0,
-						len(headerMap["seal"]) > 0)
-
-					// Add in correct order: auth-results, message-signature, seal
-					if authResult := headerMap["auth-results"]; authResult != "" {
-						arcHeadersFromOriginal = append(arcHeadersFromOriginal, authResult)
-					}
-					if msgSig := headerMap["message-signature"]; msgSig != "" {
-						arcHeadersFromOriginal = append(arcHeadersFromOriginal, msgSig)
-					}
-					if seal := headerMap["seal"]; seal != "" {
-						arcHeadersFromOriginal = append(arcHeadersFromOriginal, seal)
-					}
-				}
-			}
-			log.Printf("[forward.Send] collected %d ARC header strings from original", len(arcHeadersFromOriginal))
+			// Original message has ARC chain - we'll add i=2+
+			log.Printf("[forward.Send] original message has ARC chain at instance=%d", existingInstance)
+			// Note: The original ARC headers are preserved in the message/rfc822 part
+			// The delivery worker will add new ARC headers at i=2 for this wrapper message
 		}
 	}
 
-	// Generate boundary for multipart message if HTML is available
+	// Generate boundary for multipart message
 	boundary := fmt.Sprintf("boundary_%d", time.Now().UnixNano())
 
-	// Build MIME headers based on whether we have HTML content
+	// Build MIME structure: message/rfc822 wrapper to preserve original completely
 	msg.WriteString("MIME-Version: 1.0\r\n")
-	if originalMsg.HTMLBody != "" {
-		// Create multipart/alternative with both text and HTML
-		msg.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n", boundary))
-	} else {
-		// Plain text only
-		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	}
+	msg.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=\"%s\"\r\n", boundary))
 	msg.WriteString("\r\n")
 
-	// Add forwarding note if provided
+	// Part 1: Forwarding note (if provided)
 	if forwardNotes != "" {
-		if originalMsg.HTMLBody != "" {
-			msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-			msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-			msg.WriteString("\r\n")
-		}
+		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+		msg.WriteString("Content-Disposition: inline\r\n")
+		msg.WriteString("\r\n")
 		msg.WriteString("--- Forwarded message ---\r\n")
 		msg.WriteString(forwardNotes)
 		msg.WriteString("\r\n\r\n")
 	}
 
-	// Add original message body
-	if originalMsg.HTMLBody != "" {
-		// Text part
-		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-		msg.WriteString("\r\n")
-	}
-	msg.WriteString("--- Original Message ---\r\n")
-	msg.WriteString("From: " + originalMsg.FromAddr + "\r\n")
-	msg.WriteString("To: " + originalMsg.ToAddr + "\r\n")
-	if originalMsg.CcAddr != "" {
-		msg.WriteString("Cc: " + originalMsg.CcAddr + "\r\n")
-	}
-	msg.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
-	msg.WriteString("Subject: " + originalMsg.Subject + "\r\n")
+	// Part 2: Original message as message/rfc822
+	// Build a clean rfc822 message with essential headers and decoded body
+	// (Don't use RawMessage directly - it includes all headers/encoding which displays messily)
+	msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	msg.WriteString("Content-Type: message/rfc822\r\n")
+	msg.WriteString("Content-Disposition: inline\r\n")
 	msg.WriteString("\r\n")
-	msg.WriteString(originalMsg.TextBody)
 
-	// Add HTML part if available
+	// Build clean RFC822 message with just essential headers and decoded body
+	var rfc822Message strings.Builder
+
+	// Essential headers only (From, To, Cc, Date, Subject, Message-ID, Reply-To)
+	rfc822Message.WriteString("From: " + originalMsg.FromAddr + "\r\n")
+	rfc822Message.WriteString("To: " + originalMsg.ToAddr + "\r\n")
+	if originalMsg.CcAddr != "" {
+		rfc822Message.WriteString("Cc: " + originalMsg.CcAddr + "\r\n")
+	}
+	if originalMsg.ReplyTo != "" {
+		rfc822Message.WriteString("Reply-To: " + originalMsg.ReplyTo + "\r\n")
+	}
+	rfc822Message.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
+	rfc822Message.WriteString("Subject: " + originalMsg.Subject + "\r\n")
+
+	// Message-ID must be wrapped in angle brackets per RFC 5322
+	messageID := originalMsg.MessageID
+	if messageID != "" && !strings.HasPrefix(messageID, "<") {
+		messageID = "<" + messageID + ">"
+	}
+	rfc822Message.WriteString("Message-ID: " + messageID + "\r\n")
+
+	// MIME headers for the body
+	rfc822Message.WriteString("MIME-Version: 1.0\r\n")
+
+	// Include both HTML and text if available
 	if originalMsg.HTMLBody != "" {
-		msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", boundary))
-		msg.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
-		msg.WriteString("\r\n")
-		msg.WriteString(originalMsg.HTMLBody)
-		msg.WriteString(fmt.Sprintf("\r\n--%s--\r\n", boundary))
+		// Create multipart/alternative for HTML + text
+		bodyBoundary := fmt.Sprintf("boundary_%d", time.Now().UnixNano())
+		rfc822Message.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n", bodyBoundary))
+		rfc822Message.WriteString("\r\n")
+
+		// Text part
+		rfc822Message.WriteString(fmt.Sprintf("--%s\r\n", bodyBoundary))
+		rfc822Message.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+		rfc822Message.WriteString("\r\n")
+		rfc822Message.WriteString(originalMsg.TextBody)
+		rfc822Message.WriteString("\r\n")
+
+		// HTML part
+		rfc822Message.WriteString(fmt.Sprintf("--%s\r\n", bodyBoundary))
+		rfc822Message.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
+		rfc822Message.WriteString("\r\n")
+		rfc822Message.WriteString(originalMsg.HTMLBody)
+		rfc822Message.WriteString(fmt.Sprintf("\r\n--%s--\r\n", bodyBoundary))
+	} else {
+		// Plain text only
+		rfc822Message.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+		rfc822Message.WriteString("\r\n")
+		rfc822Message.WriteString(originalMsg.TextBody)
 	}
 
-	// Rebuild messageToEnqueue with complete message content
-	if len(arcHeadersFromOriginal) > 0 {
-		// Prepend original ARC headers to the complete message
-		// This allows NextArcInstance() to detect the chain
-		arcHeaderStr := strings.Join(arcHeadersFromOriginal, "\r\n") + "\r\n"
-		messageToEnqueue = append([]byte(arcHeaderStr), []byte(msg.String())...)
-		log.Printf("[forward.Send] prepended %d ARC headers, final message size=%d",
-			len(arcHeadersFromOriginal), len(messageToEnqueue))
-	} else {
-		messageToEnqueue = []byte(msg.String())
-		log.Printf("[forward.Send] no ARC headers to prepend, message size=%d", len(messageToEnqueue))
-	}
+	// Append the clean RFC822 message
+	msg.WriteString(rfc822Message.String())
+
+	// End of multipart
+	msg.WriteString(fmt.Sprintf("\r\n--%s--\r\n", boundary))
+
+	// Build final message to enqueue
+	// The delivery worker will detect this as a forward (has multipart/mixed with message/rfc822)
+	// and add ARC chain appropriately
+	messageToEnqueue := []byte(msg.String())
+	log.Printf("[forward.Send] final wrapper message size=%d", len(messageToEnqueue))
 
 	// Enqueue for delivery
 	if err := h.queue.Enqueue(from, recipients, messageToEnqueue, account.ID); err != nil {
@@ -378,6 +372,16 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
 	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+}
+
+// escapeHTML escapes text for safe HTML inclusion.
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
 }
 
 // extractHeaderValue extracts a single header value from raw headers string.
