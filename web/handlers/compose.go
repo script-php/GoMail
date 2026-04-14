@@ -203,7 +203,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	msg.WriteString(receivedLine + "\r\n")
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
 	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
 
 	// Include X-Originating-IP only if explicitly enabled
@@ -211,11 +211,11 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
 	}
 
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
 	if cc != "" {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", cc))
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(cc)))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(subject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
@@ -223,7 +223,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
 	msg.WriteString(fmt.Sprintf("Importance: %s\r\n", priorityToImportance(priority)))
 	if readReceipt {
-		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
+		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", encodeHeaderValue(from)))
 	}
 
 	msg.WriteString("MIME-Version: 1.0\r\n")

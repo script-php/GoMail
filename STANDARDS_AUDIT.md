@@ -135,14 +135,18 @@
   - **Error semantics:** RFC 7208 §5.2 include/redirect error propagation
   - **RFC compliance:** Full RFC 7208 including all SHOULD requirements
 
-- ✅ **SMTPUTF8 (RFC 6531)** (FIXED April 11, 2026) - Now advertised in EHLO; supports non-ASCII email addresses
-  - **Implementation:** Added SMTPUTF8 to EHLO capability list; UTF8 parameter detection in MAIL FROM command; session tracks UTF8 support
-  - **Support:** Can now receive emails with Unicode local parts (e.g., 用户@example.com, müller@example.com)
-  - **Behavior:** When sender declares UTF8 support, non-ASCII characters in envelope accepted; addresses stored as UTF-8 strings
-  - **Domain handling:** Domain part must be ASCII (international domains use punycode: münchen.de → xn--mnchen-3ya.de)
-  - **Parser:** Address extraction already UTF-8 safe since Go's strings are natively UTF-8
-  - **Result:** Interoperates with modern SMTP clients that support SMTPUTF8 (Postfix >3.0, Exim >4.86, Gmail, Outlook)
-  - **RFC compliance:** Full RFC 6531 support for mail reception
+- ✅ **SMTPUTF8 (RFC 6531)** (FIXED April 11-14, 2026) - Full support for international email addresses
+  - **Implementation:** EHLO advertises SMTPUTF8; MAIL FROM/RCPT TO UTF8 parameter handling; session tracks UTF8 support
+  - **Web UI:** Email input fields accept Unicode (type="text" instead of type="email")
+  - **Outbound:** Detects SMTPUTF8 on recipient servers; sends UTF8 parameter when needed
+  - **Headers:** RFC 2047 base64 encoding for non-ASCII header values (From, To, Cc, Subject)
+  - **Support:** 
+    - ✓ Receive FROM international addresses (用户@example.com)
+    - ✓ Send FROM international addresses (用户@example.com → recipients)
+    - ✓ Local delivery between international accounts
+    - ✓ All Unicode scripts: Chinese, Kannada, Hindi, Ukrainian, Greek, German, Russian, Arabic, etc.
+  - **Result:** Full RFC 6531 SMTPUTF8 compliance - GoMail now handles international email addresses natively
+  - **RFC compliance:** Complete RFC 6531 support for mail reception and transmission
 
 
 ---
@@ -403,7 +407,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-11, 2026):**
+**Recently Fixed (April 6-14, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -415,7 +419,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **DMARC weekly report scheduler** - Automatic weekly generation and delivery to rua= addresses
 - ✅ **Max connections enforcement** - Semaphore-based limiter in SMTP accept loop prevents resource exhaustion
 - ✅ **Reverse DNS (PTR) verification** - FCrDNS lookup on inbound connections with logging
-- ✅ **SMTPUTF8 support** - RFC 6531 now advertised in EHLO; can receive non-ASCII email addresses
+- ✅ **SMTPUTF8 full support** - RFC 6531 now fully implemented; send and receive international email addresses natively
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)

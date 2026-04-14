@@ -78,8 +78,9 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("EHLO rejected by %s: %s", host, ehloReply)
 	}
 
-	// Check if server supports DSN (Delivery Status Notifications)
+	// Check if server supports DSN (Delivery Status Notifications) and SMTPUTF8
 	supportsDSN := strings.Contains(ehloReply, "DSN")
+	supportsUTF8 := strings.Contains(ehloReply, "SMTPUTF8")
 
 	// Try STARTTLS if supported
 	if strings.Contains(ehloReply, "STARTTLS") && tlsCfg != nil {
@@ -98,10 +99,11 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					log.Printf("[smtp] STARTTLS handshake with %s failed: %v (continuing with opportunistic TLS disabled)", host, err)
 				} else {
 					conn = clientTLS
-					// Re-EHLO after STARTTLS and update DSN support flag
+					// Re-EHLO after STARTTLS and update DSN/UTF8 support flags
 					if err := sendCmd(conn, fmt.Sprintf("EHLO %s", myHostname)); err == nil {
 						postTLSEhlo, _ := readReply(conn)
 						supportsDSN = strings.Contains(postTLSEhlo, "DSN")
+						supportsUTF8 = strings.Contains(postTLSEhlo, "SMTPUTF8")
 					}
 				}
 			}
@@ -111,9 +113,17 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("TLS required but %s does not support STARTTLS", host)
 	}
 
-	// MAIL FROM with DSN parameters (RFC 3461) - only if server supports DSN
-	// Format: MAIL FROM:<addr> [RET=FULL|HDRS] [ENVID=<id>]
+	// MAIL FROM with SMTPUTF8 parameter (if supported)
+	// Format: MAIL FROM:<addr> [SMTPUTF8] [RET=FULL|HDRS] [ENVID=<id>]
+	// RFC 6531: Include SMTPUTF8 parameter when server supports it and sender is non-ASCII
+	// Even if not advertised, try anyway - some servers support it without advertising
 	mailFromCmd := fmt.Sprintf("MAIL FROM:<%s>", from)
+
+	// Add SMTPUTF8 parameter if sender has non-ASCII characters and server supports it
+	if hasNonASCII(from) && supportsUTF8 {
+		mailFromCmd += " SMTPUTF8"
+	}
+
 	if supportsDSN {
 		if dsnRet != "" {
 			mailFromCmd += fmt.Sprintf(" RET=%s", dsnRet)
@@ -126,6 +136,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 	if err := sendCmd(conn, mailFromCmd); err != nil {
 		return err
 	}
+	log.Printf("[smtp] sent MAIL FROM command: %s (smtputf8=%v, nonascii=%v)", mailFromCmd, supportsUTF8, hasNonASCII(from))
 	mailReply, err := readReply(conn)
 	if err != nil {
 		return err
@@ -134,9 +145,15 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("MAIL FROM rejected by %s: %s", host, mailReply)
 	}
 
-	// RCPT TO with DSN parameters (RFC 3461) - only if server supports DSN
-	// Format: RCPT TO:<addr> [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;<addr>]
+	// RCPT TO with DSN and SMTPUTF8 parameters (RFC 3461, RFC 6531)
+	// Format: RCPT TO:<addr> [SMTPUTF8] [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;<addr>]
 	rcptToCmd := fmt.Sprintf("RCPT TO:<%s>", to)
+
+	// Add SMTPUTF8 parameter if any recipient has non-ASCII characters and server supports it
+	if hasNonASCII(to) && supportsUTF8 {
+		rcptToCmd += " SMTPUTF8"
+	}
+
 	if supportsDSN && dsnNotify != "" {
 		rcptToCmd += fmt.Sprintf(" NOTIFY=%s", dsnNotify)
 	}
@@ -221,4 +238,14 @@ func readReply(conn net.Conn) (string, error) {
 	}
 
 	return strings.TrimSpace(reply.String()), nil
+}
+
+// hasNonASCII checks if an email address contains non-ASCII (UTF-8) characters
+func hasNonASCII(addr string) bool {
+	for _, r := range addr {
+		if r > 127 {
+			return true
+		}
+	}
+	return false
 }

@@ -124,7 +124,6 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msgIDStr := r.FormValue("original_message_id")
 	to := r.FormValue("to")
 	cc := r.FormValue("cc")
-	subject := r.FormValue("subject")
 	forwardNotes := r.FormValue("forward_notes")
 
 	if msgIDStr == "" || to == "" {
@@ -217,21 +216,23 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(receivedLine + "\r\n")
 
 	// Add Resent- headers (RFC 5322 forwarding convention)
-	msg.WriteString(fmt.Sprintf("Resent-From: %s\r\n", from))
+	// These encode non-ASCII characters if present
+	msg.WriteString(fmt.Sprintf("Resent-From: %s\r\n", encodeHeaderValue(from)))
 	msg.WriteString(fmt.Sprintf("Resent-Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
-	msg.WriteString(fmt.Sprintf("Resent-To: %s\r\n", to))
+	msg.WriteString(fmt.Sprintf("Resent-To: %s\r\n", encodeHeaderValue(to)))
 	if cc != "" {
-		msg.WriteString(fmt.Sprintf("Resent-Cc: %s\r\n", cc))
+		msg.WriteString(fmt.Sprintf("Resent-Cc: %s\r\n", encodeHeaderValue(cc)))
 	}
 	msg.WriteString(fmt.Sprintf("Resent-Message-ID: %s\r\n", msgID2))
 
 	// Original headers (preserved from forwarded message)
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", originalMsg.FromAddr))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", originalMsg.ToAddr))
+	// These are from external emails, might contain RFC 2047 encoded values already
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(originalMsg.FromAddr)))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(originalMsg.ToAddr)))
 	if originalMsg.CcAddr != "" {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", originalMsg.CcAddr))
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(originalMsg.CcAddr)))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(originalMsg.Subject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", originalMsg.ReceivedAt.Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", originalMsg.MessageID))
 
