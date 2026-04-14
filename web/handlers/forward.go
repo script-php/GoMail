@@ -230,11 +230,10 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
 	msg.WriteString(fmt.Sprintf("Reply-To: %s\r\n", encodeHeaderValue(originalMsg.FromAddr)))
 
-	// Preserve original message's addresses in message body context
-	// (not as email headers to avoid DMARC issues)
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(originalMsg.ToAddr)))
-	if originalMsg.CcAddr != "" {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(originalMsg.CcAddr)))
+	// Use the actual forward recipient, not the original message's recipient
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
+	if cc != "" {
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(cc)))
 	}
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(originalMsg.Subject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", originalMsg.ReceivedAt.Format(time.RFC1123Z)))
@@ -304,19 +303,39 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Generate boundary for multipart message if HTML is available
+	boundary := fmt.Sprintf("boundary_%d", time.Now().UnixNano())
+
+	// Build MIME headers based on whether we have HTML content
 	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+	if originalMsg.HTMLBody != "" {
+		// Create multipart/alternative with both text and HTML
+		msg.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n", boundary))
+	} else {
+		// Plain text only
+		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	}
 	msg.WriteString("\r\n")
 
 	// Add forwarding note if provided
 	if forwardNotes != "" {
+		if originalMsg.HTMLBody != "" {
+			msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+			msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+			msg.WriteString("\r\n")
+		}
 		msg.WriteString("--- Forwarded message ---\r\n")
 		msg.WriteString(forwardNotes)
 		msg.WriteString("\r\n\r\n")
 	}
 
 	// Add original message body
+	if originalMsg.HTMLBody != "" {
+		// Text part
+		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+		msg.WriteString("\r\n")
+	}
 	msg.WriteString("--- Original Message ---\r\n")
 	msg.WriteString("From: " + originalMsg.FromAddr + "\r\n")
 	msg.WriteString("To: " + originalMsg.ToAddr + "\r\n")
@@ -327,6 +346,15 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString("Subject: " + originalMsg.Subject + "\r\n")
 	msg.WriteString("\r\n")
 	msg.WriteString(originalMsg.TextBody)
+
+	// Add HTML part if available
+	if originalMsg.HTMLBody != "" {
+		msg.WriteString(fmt.Sprintf("\r\n--%s\r\n", boundary))
+		msg.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
+		msg.WriteString("\r\n")
+		msg.WriteString(originalMsg.HTMLBody)
+		msg.WriteString(fmt.Sprintf("\r\n--%s--\r\n", boundary))
+	}
 
 	// Rebuild messageToEnqueue with complete message content
 	if len(arcHeadersFromOriginal) > 0 {
@@ -350,4 +378,47 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
 	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+}
+
+// extractHeaderValue extracts a single header value from raw headers string.
+// Returns empty string if header not found. Handles folded headers (continuation lines).
+func extractHeaderValue(rawHeaders, headerName string) string {
+	if rawHeaders == "" {
+		return ""
+	}
+
+	// Case-insensitive search for the header
+	headerNameLower := strings.ToLower(headerName)
+	lines := strings.Split(rawHeaders, "\r\n")
+
+	for i, line := range lines {
+		if line == "" {
+			break // End of headers
+		}
+
+		// Split on first ':'
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		if strings.ToLower(strings.TrimSpace(parts[0])) == headerNameLower {
+			value := strings.TrimSpace(parts[1])
+
+			// Handle continuation lines (RFC 5322 header folding)
+			// Continued lines start with space or tab
+			for i+1 < len(lines) && len(lines[i+1]) > 0 {
+				nextLine := lines[i+1]
+				if nextLine[0] != ' ' && nextLine[0] != '\t' {
+					break
+				}
+				value += " " + strings.TrimSpace(nextLine)
+				i++
+			}
+
+			return value
+		}
+	}
+
+	return ""
 }
