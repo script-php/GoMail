@@ -125,6 +125,8 @@ func (s *Session) handleCommand(line string) {
 		s.handleRCPT(arg)
 	case "DATA":
 		s.handleDATA()
+	case "BDAT":
+		s.handleBDAT(arg)
 	case "RSET":
 		s.handleRSET()
 	case "NOOP":
@@ -156,6 +158,7 @@ func (s *Session) handleEHLO(arg string) {
 		"PIPELINING",
 		"DSN",
 		"SMTPUTF8",
+		"CHUNKING",
 	}
 
 	if !s.tls && s.tlsConfig != nil {
@@ -326,6 +329,62 @@ func (s *Session) handleDATA() {
 
 	s.state = StateReady
 	// Data is now in s.data — will be processed by the inbound handler
+}
+
+func (s *Session) handleBDAT(arg string) {
+	if s.state != StateRcpt && s.state != StateData {
+		s.send(503, "Bad sequence of commands")
+		return
+	}
+
+	// Parse "BDAT <length> [LAST]"
+	parts := strings.Fields(arg)
+	if len(parts) < 1 {
+		s.send(501, "Syntax error in BDAT command")
+		return
+	}
+
+	var length int64
+	_, err := fmt.Sscanf(parts[0], "%d", &length)
+	if err != nil || length < 0 {
+		s.send(501, "Invalid chunk size")
+		return
+	}
+
+	isLast := len(parts) > 1 && strings.ToUpper(parts[1]) == "LAST"
+
+	// Read exactly 'length' bytes from connection
+	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	chunk := make([]byte, length)
+
+	n, err := io.ReadFull(s.reader, chunk)
+	if err != nil {
+		log.Printf("[smtp] BDAT read error from %s: %v", s.clientAddr, err)
+		s.send(452, "Failed to read chunk")
+		return
+	}
+
+	// Check total size including this chunk
+	totalSize := int64(s.data.Len()) + int64(n)
+	if totalSize > s.maxSize {
+		s.send(552, "Message exceeds maximum size")
+		s.reset()
+		return
+	}
+
+	// Append chunk to message data
+	s.data.Write(chunk)
+
+	// If LAST flag received, message transmission is complete
+	if isLast {
+		s.state = StateReady
+		// Data is now in s.data — will be processed by the inbound handler
+		// Don't send response here; let inbound.go handle it after processMessage
+	} else {
+		// Expect more BDAT chunks - send OK and keep state as StateData
+		s.send(250, "OK")
+		s.state = StateData
+	}
 }
 
 func (s *Session) handleRSET() {

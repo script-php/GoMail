@@ -210,14 +210,25 @@
   - **Status:** ✅ Operational - external SMTP servers can now declare UTF8 support and send international addresses
   - **Priority:** Completed
 
+- ✅ **CHUNKING/BDAT** (RFC 3030) (FIXED April 15, 2026) - Full binary data transmission with chunking
+  - **Implementation:** BDAT command handler in `handleBDAT()`; CHUNKING advertised in EHLO response
+  - **Behavior:** 
+    - Client sends `BDAT <length> [LAST]` followed by exactly `<length>` bytes of raw data
+    - No dot-stuffing required; binary-safe byte streaming
+    - Multiple BDAT chunks can be sent before LAST flag
+    - Size limit enforced per message (same as DATA, default 25MB)
+  - **Protocol flow:**
+    - `BDAT 1000` → server reads 1000 bytes → `250 OK` → expect more chunks
+    - `BDAT 500 LAST` → server reads 500 bytes, marks complete → `250 OK` → message ready for delivery
+  - **Fallback:** Clients that don't support CHUNKING continue using standard DATA command
+  - **Status:** ✅ Operational - clients can now send large messages via binary streaming
+  - **RFC compliance:** Full RFC 3030 support for CHUNKING extension
+  - **Priority:** Completed
+
 - ❌ **SMTP AUTH** (RFC 4954) - Not implemented
   - **Note:** Not required for webmail-only application (GoMail uses web UI for sending, no external clients)
   - **Status:** Intentionally omitted - out of scope for webmail
   - **Priority:** Not applicable
-
-- ❌ **CHUNKING/BDAT** (RFC 3030) - Not supported
-  - Impact: No alternative delivery for large messages
-  - **Priority:** Low
 
 ### Outbound Security
 - ❌ **MTA-STS enforcement (outbound)** - Policy is served but **never checked** when sending to remote domains
@@ -397,8 +408,9 @@ openssl s_client -connect yourdomain.com:25 -starttls smtp
 **Overall Status:** ✅ **Production-ready for basic SMTP** with ⚠️ several items needing wiring
 
 GoMail implements the **essential SMTP standards** needed for reliable email delivery:
-- ✅ RFC 5321 (SMTP, EHLO, message delivery)
+- ✅ RFC 5321 (SMTP, EHLO, message delivery, CHUNKING/BDAT)
 - ✅ RFC 3464 (DSN — generation on permanent failure + SMTP extension)
+- ✅ RFC 3030 (CHUNKING/BDAT — binary streaming with chunked transmission)
 - ✅ RFC 6376 (DKIM signing/verification)
 - ✅ RFC 6531 (SMTPUTF8 — Non-ASCII email addresses)
 - ✅ RFC 7208 (SPF verification — **full compliance with all mechanisms, modifiers, macro expansion, and DNS counting**)
@@ -407,7 +419,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-14, 2026):**
+**Recently Fixed (April 6-15, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -420,6 +432,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **Max connections enforcement** - Semaphore-based limiter in SMTP accept loop prevents resource exhaustion
 - ✅ **Reverse DNS (PTR) verification** - FCrDNS lookup on inbound connections with logging
 - ✅ **SMTPUTF8 full support** - RFC 6531 now fully implemented; send and receive international email addresses natively
+- ✅ **CHUNKING/BDAT support** - RFC 3030 binary data streaming with chunked transmission
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)

@@ -198,6 +198,31 @@ func (s *InboundServer) runSession(sess *Session) {
 				}
 				sess.reset()
 			}
+		} else if cmd == "BDAT" {
+			// Handle BDAT (RFC 3030 CHUNKING)
+			var arg string
+			if len(parts) > 1 {
+				arg = parts[1]
+			}
+
+			// Rate limit messages on first chunk (StateRcpt)
+			if sess.state == StateRcpt && !s.rateLimiter.AllowMessage(sess.clientIP) {
+				sess.send(451, "Too many messages, try again later")
+				continue
+			}
+
+			sess.handleBDAT(arg)
+
+			// If LAST chunk was received (state transitions back to StateReady with data), process message
+			if sess.state == StateReady && sess.data.Len() > 0 {
+				if err := s.processMessage(sess); err != nil {
+					log.Printf("[smtp] message processing error from %s: %v", sess.clientAddr, err)
+					sess.send(451, "Message processing failed, try again later")
+				} else {
+					sess.send(250, "OK message accepted for delivery")
+				}
+				sess.reset()
+			}
 		} else {
 			sess.handleCommand(line)
 		}
