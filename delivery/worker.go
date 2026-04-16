@@ -50,6 +50,13 @@ func NewPool(cfg *config.Config, db *store.DB, tlsCfg *tls.Config) *Pool {
 
 // Start launches the delivery workers.
 func (p *Pool) Start() {
+	// Recover any stale entries stuck in "sending" status from previous crashes
+	if recovered, err := p.db.RecoverStaleQueueEntries(); err != nil {
+		log.Printf("[delivery] stale queue recovery error: %v", err)
+	} else if recovered > 0 {
+		log.Printf("[delivery] recovered %d stale queue entries", recovered)
+	}
+
 	schedule := NewRetrySchedule(p.cfg.Delivery.RetryIntervals)
 
 	for i := 0; i < p.cfg.Delivery.QueueWorkers; i++ {
@@ -113,10 +120,10 @@ func (w *Worker) processQueue() {
 
 	// Deliver outside the lock
 	var deliveryErr error
-	
+
 	// Prepare message with ARC headers
 	messageWithARC := w.addARCHeaders(entry.RawMessage, entry.MailFrom, parseRecipientDomain(entry.RcptTo))
-	
+
 	if w.isLocalRecipient(entry.RcptTo) {
 		deliveryErr = w.deliverLocal(entry, messageWithARC)
 	} else {
@@ -141,21 +148,35 @@ func (w *Worker) processQueue() {
 	}
 
 	if deliveryErr != nil {
+		smtpCode := extractSMTPCode(deliveryErr.Error())
+		isPermanent := isPermanentFailure(smtpCode)
 		entry.Attempts++
-		if entry.Attempts >= entry.MaxAttempts {
-			log.Printf("[delivery] worker %d: permanent failure for %s->%s: %v",
-				w.id, entry.MailFrom, entry.RcptTo, deliveryErr)
+
+		if isPermanent {
+			// Permanent failure - stop retrying immediately
+			log.Printf("[delivery] worker %d: permanent failure (code %d) for %s->%s after %d attempt(s): %v",
+				w.id, smtpCode, entry.MailFrom, entry.RcptTo, entry.Attempts, deliveryErr)
 			w.db.UpdateQueueEntry(entry.ID, "failed", entry.Attempts, time.Now().UTC(), deliveryErr.Error())
-			
+
 			// Send DSN if requested
-			smtpCode := extractSMTPCode(deliveryErr.Error())
+			if err := w.sendDSNReport(entry, deliveryErr.Error(), smtpCode); err != nil {
+				log.Printf("[delivery] DSN send failed: %v", err)
+			}
+		} else if entry.Attempts >= entry.MaxAttempts {
+			// Temporary failure but max attempts reached
+			log.Printf("[delivery] worker %d: temporary failure (code %d) but max attempts (%d) reached for %s->%s: %v",
+				w.id, smtpCode, entry.MaxAttempts, entry.MailFrom, entry.RcptTo, deliveryErr)
+			w.db.UpdateQueueEntry(entry.ID, "failed", entry.Attempts, time.Now().UTC(), deliveryErr.Error())
+
+			// Send DSN if requested
 			if err := w.sendDSNReport(entry, deliveryErr.Error(), smtpCode); err != nil {
 				log.Printf("[delivery] DSN send failed: %v", err)
 			}
 		} else {
+			// Temporary failure - retry
 			nextRetry := w.schedule.NextRetry(entry.Attempts)
-			log.Printf("[delivery] worker %d: temporary failure for %s->%s (attempt %d/%d), retry at %s: %v",
-				w.id, entry.MailFrom, entry.RcptTo, entry.Attempts, entry.MaxAttempts, nextRetry.Format(time.RFC3339), deliveryErr)
+			log.Printf("[delivery] worker %d: temporary failure (code %d) for %s->%s (attempt %d/%d), retry at %s: %v",
+				w.id, smtpCode, entry.MailFrom, entry.RcptTo, entry.Attempts, entry.MaxAttempts, nextRetry.Format(time.RFC3339), deliveryErr)
 			w.db.UpdateQueueEntry(entry.ID, "pending", entry.Attempts, nextRetry, deliveryErr.Error())
 		}
 	} else {
@@ -339,14 +360,14 @@ func (w *Worker) addARCHeaders(msg []byte, mailFrom, rcptDomain string) []byte {
 	instance := auth.NextArcInstance(msg)
 	highest := auth.GetHighestArcInstance(msg)
 	log.Printf("[delivery] ARC chain: detecting instance for message size=%d, highest_found=%d, next_instance=%d", len(msg), highest, instance)
-	
+
 	arcHeaders, err := auth.ARCChainSigner(
 		senderDomain,
 		domain.DKIMSelector,
 		signer.PrivateKey,
-		"pass",   // SPF (originating from GoMail, trusted)
-		"pass",   // DKIM (will sign this message)
-		"pass",   // DMARC
+		"pass", // SPF (originating from GoMail, trusted)
+		"pass", // DKIM (will sign this message)
+		"pass", // DMARC
 		w.cfg.Server.Hostname,
 		string(msg),
 		instance, // instance: i=1 for new, i=2+ for forwarding
@@ -394,6 +415,44 @@ func extractSMTPCode(errMsg string) int {
 	}
 	// Default to generic server error if no code found
 	return 550
+}
+
+// isPermanentFailure determines if an SMTP error is permanent (should not retry) or temporary.
+// RFC 5321: The first digit indicates:
+//   - 4xx = Permanent negative reply
+//   - 5xx = Transient negative reply (but some 5xx codes like 554, 550 are actually permanent in practice)
+//
+// Permanent failures (fail immediately, no retry):
+//   - 550: Unrouteable address (user/domain unknown)
+//   - 551: User not local; please try <forward-path>
+//   - 552: Storage limit exceeded
+//   - 553: Invalid address
+//   - 554: Message rejected
+//   - 500, 501, 502, 504, 505: Command/syntax errors
+//
+// Temporary failures (should retry):
+//   - 421, 450, 451, 452, 455: Service temporarily unavailable
+//   - 503: Service unavailable (also temporary despite 5xx)
+func isPermanentFailure(smtpCode int) bool {
+	// Permanent failures - fail immediately
+	if smtpCode == 550 || smtpCode == 551 || smtpCode == 552 || smtpCode == 553 || smtpCode == 554 ||
+		smtpCode == 500 || smtpCode == 501 || smtpCode == 502 || smtpCode == 504 || smtpCode == 505 {
+		return true
+	}
+
+	// Temporary failures - should retry
+	if smtpCode == 421 || smtpCode == 450 || smtpCode == 451 || smtpCode == 452 || smtpCode == 455 ||
+		smtpCode == 503 {
+		return false
+	}
+
+	// Default heuristic:
+	// - 4xx codes are usually permanent
+	// - 5xx codes are usually temporary (except the ones we already handled above)
+	if smtpCode >= 400 && smtpCode < 500 {
+		return true
+	}
+	return false
 }
 
 // sendDSNReport sends a Delivery Status Notification (DSN) for a delivery failure.
@@ -461,21 +520,21 @@ func (w *Worker) deliverDSN(senderEmail string, dsnReport string) error {
 	)
 
 	msg := &store.Message{
-		AccountID:      account.ID,
-		MessageID:      fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname),
-		Direction:      "inbound",
-		MailFrom:       fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
-		RcptTo:         senderEmail,
-		FromAddr:       fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
-		ToAddr:         senderEmail,
-		Subject:        parsed.Subject,
-		TextBody:       parsed.TextBody,
-		HTMLBody:       parsed.HTMLBody,
-		RawHeaders:     receivedHeader + parsed.RawHeaders,
-		RawMessage:     append([]byte(receivedHeader), dsnReport...),
-		Size:           int64(len(dsnReport)),
-		IsRead:         false,
-		ReceivedAt:     time.Now(),
+		AccountID:  account.ID,
+		MessageID:  fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname),
+		Direction:  "inbound",
+		MailFrom:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
+		RcptTo:     senderEmail,
+		FromAddr:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
+		ToAddr:     senderEmail,
+		Subject:    parsed.Subject,
+		TextBody:   parsed.TextBody,
+		HTMLBody:   parsed.HTMLBody,
+		RawHeaders: receivedHeader + parsed.RawHeaders,
+		RawMessage: append([]byte(receivedHeader), dsnReport...),
+		Size:       int64(len(dsnReport)),
+		IsRead:     false,
+		ReceivedAt: time.Now(),
 	}
 
 	// Store in Inbox
@@ -557,6 +616,3 @@ Final-Recipient: rfc822; %s
 
 	return msg, nil
 }
-
-
-

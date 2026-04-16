@@ -554,6 +554,47 @@ func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry 
 	return err
 }
 
+// RecoverStaleQueueEntries finds entries stuck in "sending" status for >30 minutes and resets them to "pending".
+// This handles the case where the worker process crashed mid-delivery.
+// Returns the number of entries recovered.
+func (db *DB) RecoverStaleQueueEntries() (int, error) {
+	// Find entries stuck in "sending" status for more than 30 minutes
+	staleBefore := time.Now().UTC().Add(-30 * time.Minute)
+
+	rows, err := db.Query(`
+		SELECT id, next_retry
+		FROM outbound_queue
+		WHERE status = 'sending' AND updated_at < datetime(?)
+	`, sqliteTime(staleBefore))
+	if err != nil {
+		return 0, fmt.Errorf("querying stale entries: %w", err)
+	}
+	defer rows.Close()
+
+	var recovered int
+	for rows.Next() {
+		var id int64
+		var nextRetry string
+		if err := rows.Scan(&id, &nextRetry); err != nil {
+			return recovered, fmt.Errorf("scanning stale entry: %w", err)
+		}
+
+		// Reset to pending with immediate retry (1 minute from now)
+		newRetryTime := time.Now().UTC().Add(1 * time.Minute)
+		if err := db.UpdateQueueEntry(id, "pending", 0, newRetryTime, "recovered from stale sending status"); err != nil {
+			return recovered, fmt.Errorf("updating stale entry %d: %w", id, err)
+		}
+		recovered++
+	}
+
+	if recovered > 0 {
+		// Log the recovery through fmt rather than log package to avoid circular imports
+		fmt.Printf("[store] recovered %d stale queue entries from sending status\n", recovered)
+	}
+
+	return recovered, rows.Err()
+}
+
 // DeleteQueueEntry removes a completed/failed entry from the queue.
 func (db *DB) DeleteQueueEntry(id int64) error {
 	_, err := db.Exec(`DELETE FROM outbound_queue WHERE id = ?`, id)

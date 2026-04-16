@@ -285,9 +285,26 @@
   - **Priority:** Medium
 
 ### Queue Reliability
-- ❌ **Stale queue recovery** - If process crashes mid-delivery, entries stuck in `"sending"` status forever
-  - Impact: Messages can be permanently lost on crash
-  - **Priority:** High (data loss risk)
+- ✅ **Stale queue recovery** (FIXED April 16, 2026) - Automatic recovery of entries stuck in "sending" status
+  - **Problem**: If worker crashes mid-delivery, entries stuck in "sending" status forever with no retry
+  - **Solution**: On worker pool startup, find entries with status="sending" updated >30 min ago and reset to "pending"
+  - **Implementation**: `RecoverStaleQueueEntries()` in store/messages.go, called at Pool.Start()
+  - **Behavior**: Recovered entries get new next_retry = 1 minute from now
+  - **Impact**: Messages no longer lost on crash; automatic recovery on restart
+  - **Priority:** Completed
+
+- ✅ **Improved error handling** (FIXED April 16, 2026) - Smart retry strategy based on SMTP error codes
+  - **Permanent failures (4xx)**: Errors like 550, 554, 553 fail immediately without retry
+    - These indicate: user unknown, domain non-existent, message format rejected
+    - Retrying won't help; generate DSN immediately
+  - **Temporary failures (5xx)**: Errors like 451, 452, 500 use normal retry schedule
+    - These indicate: server busy, resource unavailable, temporary outage
+    - Retry with exponential backoff (up to 48 hours)
+  - **Special case (451)**: Treated as temporary despite being 4xx code
+  - **Logging**: Codes now logged clearly (e.g., "permanent failure (code 550) ...")
+  - **MaxAttempts**: Config controls retry ceiling (default 6 attempts)
+  - **Impact**: Faster failure on unrecoverable errors; proper retry for transient issues
+  - **Priority:** Completed
 
 - ❌ **Session rotation** - No token rotation after login
   - Impact: Session token reuse risk if leaked
@@ -318,13 +335,9 @@
 ## PRIORITY RECOMMENDATIONS
 
 ### **CRITICAL** (Fix immediately)
-1. **Wire up web rate limiter** - Middleware exists, just needs registration
-   - File: `web/server.go`
-   - Effort: 15 minutes
-
-2. **Stale queue recovery** - Timeout entries stuck in `"sending"` for >15 minutes
-   - File: `delivery/worker.go`
-   - Effort: 1 hour
+1. ~~**Stale queue recovery**~~ - ✅ FIXED April 16, 2026
+   - Automatic recovery of entries stuck in "sending" status
+   - Messages no longer lost on crash
 
 ### **HIGH Priority** (Should implement soon)
 1. **Attachment upload in compose** - File upload + multipart message building
@@ -419,7 +432,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-15, 2026):**
+**Recently Fixed (April 6-16, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -433,6 +446,8 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **Reverse DNS (PTR) verification** - FCrDNS lookup on inbound connections with logging
 - ✅ **SMTPUTF8 full support** - RFC 6531 now fully implemented; send and receive international email addresses natively
 - ✅ **CHUNKING/BDAT support** - RFC 3030 binary data streaming with chunked transmission
+- ✅ **Stale queue recovery** - Automatic recovery of entries stuck in "sending" status; no message loss on crash
+- ✅ **Smart error handling on delivery** - Different retry strategy based on SMTP error codes (4xx vs 5xx)
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
