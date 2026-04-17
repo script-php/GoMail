@@ -9,7 +9,7 @@
             <strong>Error:</strong> {{.Error}}
         </div>
         {{end}}
-        <form method="POST" action="/send">
+        <form method="POST" action="/send" enctype="multipart/form-data" id="compose-form">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <div class="compose-body">
                 <div class="compose-field">
@@ -51,6 +51,17 @@
                 </div>
                 <textarea id="body" name="body" class="compose-textarea" required
                           placeholder="Write your message...">{{if .Prefill}}{{index .Prefill "body"}}{{end}}</textarea>
+                <div class="compose-attachments">
+                    <label for="attachments">Attachments (max 25MB total)</label>
+                    <div class="attachments-input-wrapper">
+                        <button type="button" class="btn btn-secondary" id="attachments-btn">
+                            + Add Files
+                        </button>
+                        <input type="file" id="attachments" name="attachments" multiple style="display: none;">
+                        <span class="attachments-help">Hold Ctrl+Click (or Cmd+Click on Mac) to select multiple files</span>
+                    </div>
+                    <div id="attachments-list" class="attachments-list"></div>
+                </div>
             </div>
             <div class="compose-actions">
                 <button type="submit" class="btn btn-primary">Send</button>
@@ -59,4 +70,6 @@
         </form>
     </div>
 </div>
+
+<script src="/static/attachments.js"></script>
 {{end}}

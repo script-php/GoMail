@@ -89,22 +89,23 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	}
 
 	msg := &store.Message{
-		AccountID:  accountID,
-		MessageID:  fmt.Sprintf("%d@%s", time.Now().UnixNano(), q.cfg.Server.Hostname),
-		Direction:  "outbound",
-		MailFrom:   from,
-		RcptTo:     string(rcptJSON),
-		FromAddr:   from,
-		ToAddr:     toAddr,
-		CcAddr:     ccAddr,
-		Subject:    subject,
-		TextBody:   textBody,
-		HTMLBody:   htmlBody,
-		RawHeaders: rawHeaders,
-		RawMessage: signedMessage,
-		Size:       int64(len(signedMessage)),
-		IsRead:     true, // Outbound messages are already "read"
-		ReceivedAt: time.Now(),
+		AccountID:      accountID,
+		MessageID:      fmt.Sprintf("%d@%s", time.Now().UnixNano(), q.cfg.Server.Hostname),
+		Direction:      "outbound",
+		MailFrom:       from,
+		RcptTo:         string(rcptJSON),
+		FromAddr:       from,
+		ToAddr:         toAddr,
+		CcAddr:         ccAddr,
+		Subject:        subject,
+		TextBody:       textBody,
+		HTMLBody:       htmlBody,
+		RawHeaders:     rawHeaders,
+		RawMessage:     signedMessage,
+		Size:           int64(len(signedMessage)),
+		HasAttachments: parsed != nil && len(parsed.Attachments) > 0,
+		IsRead:         true, // Outbound messages are already "read"
+		ReceivedAt:     time.Now(),
 	}
 
 	// Assign outbound message to Sent folder
@@ -116,6 +117,20 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	msgID, err := q.db.SaveMessage(msg)
 	if err != nil {
 		return fmt.Errorf("saving outbound message: %w", err)
+	}
+
+	// Save attachments from the parsed message
+	if parsed != nil && len(parsed.Attachments) > 0 {
+		records, err := parser.SaveAttachments(parsed.Attachments, msgID, q.cfg.Store.AttachmentsPath)
+		if err != nil {
+			log.Printf("[delivery] attachment save error: %v", err)
+		} else {
+			for _, rec := range records {
+				if _, err := q.db.SaveAttachment(rec); err != nil {
+					log.Printf("[delivery] failed to save attachment record: %v", err)
+				}
+			}
+		}
 	}
 
 	// Update sent folder counts
@@ -132,8 +147,8 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 			RawMessage:  signedMessage,
 			MaxAttempts: q.cfg.Delivery.MaxRetries,
 			NextRetry:   time.Now().UTC(),
-			DSNNotify:   "FAILURE",  // Request failure notifications from remote server
-			DSNRet:      "FULL",     // Request full message in failure report
+			DSNNotify:   "FAILURE", // Request failure notifications from remote server
+			DSNRet:      "FULL",    // Request full message in failure report
 			DSNEnvID:    fmt.Sprintf("%d@%s", msgID, q.cfg.Server.Hostname),
 		}
 
