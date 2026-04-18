@@ -274,6 +274,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	// DKIM
 	dkimResult, dkimDetail := auth.VerifyDKIM(rawMessage)
+	dkimDomain := auth.GetDKIMDomain(rawMessage)
 	authBuilder.AddDKIM(dkimResult, dkimDetail, "", "")
 	log.Printf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail)
 
@@ -289,7 +290,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	fromDomain := extractDomain(parsed.From)
 	spfDomain := extractDomain(mailFrom)
 
-	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, "")
+	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, dkimDomain)
 	authBuilder.AddDMARC(dmarcResult.Result, dmarcResult.Details, fromDomain)
 	log.Printf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details)
 
@@ -392,8 +393,25 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// Determine folder based on auth results
 		var folderID *int64
 
+		// Check if this is an automated message (DSN, MDN, read receipt, etc.)
+		// These legitimately have SPF "none" since they have no envelope sender
+		contentType := parsed.Headers.Get("Content-Type")
+		isAutomatedMessage := strings.Contains(strings.ToLower(contentType), "multipart/report") ||
+			strings.Contains(strings.ToLower(contentType), "multipart/delivery-status") ||
+			strings.Contains(strings.ToLower(parsed.Subject), "return receipt") ||
+			strings.Contains(strings.ToLower(parsed.Subject), "delivery report") ||
+			parsed.MDNRequestedBy != "" // MDN messages have this set
+
 		// Route to inbox ONLY if all three authentications pass
-		allAuthPass := spfResult == "pass" && dkimResult == "pass" && dmarcResult.Result == "pass"
+		// For automated messages, allow SPF="none" if DKIM and DMARC pass
+		var allAuthPass bool
+		if isAutomatedMessage {
+			// For automated messages: SPF can be "none", but DKIM and DMARC must pass
+			allAuthPass = dkimResult == "pass" && dmarcResult.Result == "pass"
+		} else {
+			// For regular messages: require all three
+			allAuthPass = spfResult == "pass" && dkimResult == "pass" && dmarcResult.Result == "pass"
+		}
 		authFailed := arcFailed || !allAuthPass
 
 		if authFailed {
