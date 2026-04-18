@@ -144,6 +144,7 @@ func (w *Worker) processQueue() {
 			entry.DSNNotify,
 			entry.DSNRet,
 			entry.DSNEnvID,
+			w.cfg.Delivery.GetNetwork(),
 		)
 	}
 

@@ -17,7 +17,8 @@ import (
 // This is used by the delivery worker for outbound messages.
 // DSN parameters (dsnNotify, dsnRet, dsnEnvID) are optional and can be empty.
 // requireTLS: if true, fails delivery if TLS cannot be established; if false, uses opportunistic TLS
-func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID string) error {
+// network: "tcp" (both IPv4 and IPv6), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
+func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string) error {
 	// Extract recipient domain
 	parts := strings.SplitN(to, "@", 2)
 	if len(parts) != 2 {
@@ -59,7 +60,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			// Enforce TLS requirements based on policy mode
 			if policy.Mode == "enforce" {
 				// Enforce mode: require TLS
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID, network)
 				if err == nil {
 					return nil // Success
 				}
@@ -67,7 +68,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 				log.Printf("[mta-sts] ENFORCE delivery to %s failed: %v, trying next MX", mx.Host, err)
 			} else if policy.Mode == "testing" {
 				// Testing mode: log violations but allow delivery
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network)
 				if err == nil {
 					log.Printf("[mta-sts] TESTING delivery to %s succeeded", mx.Host)
 					return nil
@@ -77,7 +78,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			}
 		} else {
 			// No policy or mode=none: use normal delivery with original requireTLS setting
-			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID)
+			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network)
 			if err == nil {
 				return nil // Success
 			}
@@ -91,10 +92,11 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
 // requireTLS: if true, fails delivery if TLS cannot be established; if false, uses opportunistic TLS
-func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID string) error {
-	// Connect to port 25 (IPv4 only)
+// network: "tcp" (both IPv4 and IPv6), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
+func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string) error {
+	// Connect to port 25
 	addr := host + ":25"
-	conn, err := net.DialTimeout("tcp4", addr, 30*time.Second)
+	conn, err := net.DialTimeout(network, addr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", addr, err)
 	}

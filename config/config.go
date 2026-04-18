@@ -102,9 +102,19 @@ type MailConfig struct {
 }
 
 type DeliveryConfig struct {
-	QueueWorkers   int   `json:"queue_workers"`
-	RetryIntervals []int `json:"retry_intervals"`
-	MaxRetries     int   `json:"max_retries"`
+	QueueWorkers   int    `json:"queue_workers"`
+	RetryIntervals []int  `json:"retry_intervals"`
+	MaxRetries     int    `json:"max_retries"`
+	Network        string `json:"network"` // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
+}
+
+// GetNetwork returns the network type for outbound connections (default "tcp" for both IPv4 and IPv6).
+// Valid values: "tcp" (both), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
+func (d *DeliveryConfig) GetNetwork() string {
+	if d.Network == "" || (d.Network != "tcp4" && d.Network != "tcp6" && d.Network != "tcp") {
+		return "tcp" // Default: both IPv4 and IPv6
+	}
+	return d.Network
 }
 
 type DNSConfig struct {

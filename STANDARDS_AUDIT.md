@@ -77,6 +77,7 @@
 - ✅ **CSRF protection** - HMAC-SHA256 of session token
 - ✅ **Security headers** - HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy (security/headers.go)
 - ✅ **Compose** - Plain text with To, Cc, Subject, Body; priority headers; read receipt option
+- ✅ **Attachment upload in compose** - File selection, multipart/mixed message building, RFC 2045 base64 encoding (web/handlers/compose.go, templates/compose.html, templates/attachments.js)
 - ✅ **Reply & Forward** - With ARC signing on forwarded messages
 - ✅ **Folder system** - Inbox, Sent, Spam, Drafts, Trash with unread/total counts (store/folders.go)
 - ✅ **Admin panel** - Domain and account management
@@ -274,15 +275,18 @@
   - **Priority:** Low
 
 ### IPv6
-- ❌ **IPv6 outbound** - Hardcoded `"tcp4"` in smtp/outbound.go
-  - Impact: Cannot reach IPv6-only mail servers
-  - **Priority:** Medium
+- ✅ **IPv6 outbound** (FIXED April 18, 2026) - Configurable network protocol (tcp4/tcp6/tcp)
+  - **Implementation:** Added `network` field to DeliveryConfig; SendMail() passes network param to net.DialTimeout()
+  - **Behavior:**
+    - `"tcp"` (default) - Dual-stack: tries IPv4 and IPv6, uses whichever connects; falls back if IPv6 unavailable
+    - `"tcp4"` - IPv4 only
+    - `"tcp6"` - IPv6 only
+  - **Result:** Can now reach IPv6-only mail servers; automatic fallback if IPv6 disabled on server
+  - **Config:** Set `delivery.network` in config.json (defaults to "tcp")
+  - **Status:** ✅ Operational - GoMail now supports both IPv4 and IPv6 outbound delivery
+  - **Priority:** Complete
 
 ### Web/Compose
-- ❌ **Attachment upload in compose** - Only plain text sending; no file upload
-  - Impact: Users can't attach files from webmail
-  - **Priority:** High (basic webmail feature)
-
 - ❌ **HTML compose** - Only `text/plain; charset=UTF-8`
   - Impact: No rich text email composition
   - **Priority:** Medium
@@ -347,10 +351,6 @@
    - Messages no longer lost on crash
 
 ### **HIGH Priority** (Should implement soon)
-1. **Attachment upload in compose** - File upload + multipart message building
-   - Files: `web/handlers/compose.go`, templates
-   - Effort: 1-2 days
-   - Impact: Enables users to attach files from webmail UI
 
 ### **MEDIUM Priority** (Nice to have)
 1. **IPv6 outbound** - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
@@ -390,15 +390,7 @@
 
 ## QUICK WINS (Code already exists, just needs wiring)
 
-1. **Wire web rate limiter** ✏️ 15 minutes
-   - Register middleware from `web/middleware.go` in `web/server.go`
-   - Already fully implemented
-
-2. **Add IPv6** ✏️ 30 minutes
-   - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
-
-3. **Stale queue recovery** ✏️ 1 hour
-   - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
+*(All quick wins completed!)*
 
 ---
 
@@ -440,7 +432,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving and **outbound enforcement**)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-16, 2026):**
+**Recently Fixed (April 6-18, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -457,10 +449,13 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **Stale queue recovery** - Automatic recovery of entries stuck in "sending" status; no message loss on crash
 - ✅ **Smart error handling on delivery** - Different retry strategy based on SMTP error codes (4xx vs 5xx)
 - ✅ **MTA-STS enforcement (outbound)** - RFC 8461 policy fetching, validation, and TLS enforcement on delivery
+- ✅ **RFC 2047 filename decoding** - Attachment filenames from encoded-word format properly decoded
+- ✅ **IPv6 outbound support** - Configurable network protocol (tcp/tcp4/tcp6) with automatic fallback
+- ✅ **Attachment upload in compose** - Full support for file uploads with multipart/mixed RFC 2045 encoding, drag-drop UI, live validation (max 10 files, 25MB total)
 
 **What needs immediate attention:**
-- ⚠️ Web rate limiter not wired (middleware exists, not registered)
-- IPv6 outbound support (15 min quick fix)
+
+*(Nothing blocking! All critical and quick-win items complete.)*
 
 **What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, and various optional modern features.
 
