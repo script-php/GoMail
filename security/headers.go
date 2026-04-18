@@ -29,9 +29,7 @@ func SecureHeaders(next http.Handler, tlsEnabled bool) http.Handler {
 
 		// Content Security Policy
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
-
-		// Referrer policy
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
 		// Permissions policy

@@ -16,6 +16,7 @@ import (
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/dns"
+	"gomail/reporting"
 	"gomail/smtp"
 	"gomail/store"
 	tlsconfig "gomail/tls"
@@ -91,8 +92,17 @@ func main() {
 	// Create delivery queue for the web interface (per-domain DKIM from DB)
 	queue := delivery.NewQueue(db, cfg)
 
+	// Start DMARC report scheduler (weekly reports)
+	// Create a wrapper function to queue DMARC reports for delivery
+	enqueueFunc := func(from, to, message string) error {
+		// Queue the DMARC report for delivery through the SMTP system
+		// Use account ID 0 for system-generated reports
+		return queue.Enqueue(from, []string{to}, []byte(message), 0)
+	}
+	reporting.ScheduleWeeklyReports(cfg, db, enqueueFunc)
+
 	// Start web server
-	webServer := web.NewServer(cfg, db, queue)
+	webServer := web.NewServer(cfg, db, queue, enqueueFunc)
 
 	if cfg.Web.IsTLSEnabled() {
 		// TLS mode: HTTPS on listen_addr, HTTP redirect + ACME on http_addr

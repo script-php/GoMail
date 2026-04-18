@@ -2,8 +2,11 @@ package auth
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // DMARCResult represents the outcome of a DMARC check.
@@ -26,9 +29,12 @@ const (
 
 // DMARCCheckResult holds the full result of a DMARC evaluation.
 type DMARCCheckResult struct {
-	Result  DMARCResult
-	Policy  DMARCPolicy
-	Details string
+	Result       DMARCResult
+	Policy       DMARCPolicy
+	Details      string
+	ReportMailto []string // rua= aggregate report recipients
+	ForensicMail []string // ruf= forensic report recipients
+	PercentApply int      // pct= percentage (0-100)
 }
 
 // CheckDMARC evaluates DMARC policy for a message given SPF and DKIM results.
@@ -36,20 +42,46 @@ type DMARCCheckResult struct {
 // spfDomain is the domain from the envelope sender that SPF was checked against.
 func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimResult string, dkimDomain string) DMARCCheckResult {
 	if fromDomain == "" {
-		return DMARCCheckResult{DMARCNone, PolicyNone, "no From domain"}
+		return DMARCCheckResult{
+			Result:       DMARCNone,
+			Policy:       PolicyNone,
+			Details:      "no From domain",
+			ReportMailto: nil,
+			ForensicMail: nil,
+			PercentApply: 100,
+		}
 	}
 
 	// Look up DMARC record
 	dmarcRecord, err := lookupDMARC(fromDomain)
 	if err != nil || dmarcRecord == "" {
-		return DMARCCheckResult{DMARCNone, PolicyNone, "no DMARC record found"}
+		return DMARCCheckResult{
+			Result:       DMARCNone,
+			Policy:       PolicyNone,
+			Details:      "no DMARC record found",
+			ReportMailto: nil,
+			ForensicMail: nil,
+			PercentApply: 100,
+		}
 	}
 
 	// Parse DMARC tags
 	tags := parseDMARCTags(dmarcRecord)
 
+	// Determine policy: use sp= for subdomains, p= for organizational domain
 	policy := PolicyNone
-	switch tags["p"] {
+	isSubdomain := isSubdomainOfOrg(fromDomain)
+
+	var policyTag string
+	if isSubdomain && tags["sp"] != "" {
+		// Subdomain has sp= policy
+		policyTag = tags["sp"]
+	} else {
+		// Use main policy
+		policyTag = tags["p"]
+	}
+
+	switch policyTag {
 	case "reject":
 		policy = PolicyReject
 	case "quarantine":
@@ -82,11 +114,98 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 
 	// DMARC passes if either SPF or DKIM is aligned and passes
 	if spfAligned || dkimAligned {
-		return DMARCCheckResult{DMARCPass, policy, "aligned authentication passed"}
+		return DMARCCheckResult{
+			Result:       DMARCPass,
+			Policy:       policy,
+			Details:      "aligned authentication passed",
+			ReportMailto: parseReportAddresses(tags["rua"]),
+			ForensicMail: parseReportAddresses(tags["ruf"]),
+			PercentApply: 100,
+		}
+	}
+
+	// Check pct= (percentage sampling) for failures: only apply policy to pct% of messages
+	pct := 100
+	if tags["pct"] != "" {
+		pct = parsePct(tags["pct"])
+		if !shouldApplyPolicy(pct) {
+			// Randomly sampled out - report as pass to avoid applying policy
+			return DMARCCheckResult{
+				Result:       DMARCPass,
+				Policy:       policy,
+				Details:      fmt.Sprintf("failed auth but excluded by pct=%s sampling", tags["pct"]),
+				ReportMailto: parseReportAddresses(tags["rua"]),
+				ForensicMail: parseReportAddresses(tags["ruf"]),
+				PercentApply: pct,
+			}
+		}
 	}
 
 	details := fmt.Sprintf("policy=%s; spf_aligned=%v; dkim_aligned=%v", policy, spfAligned, dkimAligned)
-	return DMARCCheckResult{DMARCFail, policy, details}
+	return DMARCCheckResult{
+		Result:       DMARCFail,
+		Policy:       policy,
+		Details:      details,
+		ReportMailto: parseReportAddresses(tags["rua"]),
+		ForensicMail: parseReportAddresses(tags["ruf"]),
+		PercentApply: pct,
+	}
+}
+
+// isSubdomainOfOrg returns true if domain is a subdomain of its organizational domain.
+func isSubdomainOfOrg(domain string) bool {
+	parts := strings.Split(domain, ".")
+	return len(parts) > 2 // More than 2 labels means it's a subdomain
+}
+
+// parsePct parses the pct= tag value (percentage, 0-100).
+// Returns 100 if invalid or not specified (default: apply to all).
+func parsePct(pctStr string) int {
+	if pctStr == "" {
+		return 100
+	}
+	var pct int
+	fmt.Sscanf(pctStr, "%d", &pct)
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
+}
+
+// parseReportAddresses parses rua= or ruf= values into individual email addresses.
+// Format: "mailto:address1@example.com,mailto:address2@example.com"
+func parseReportAddresses(reportTag string) []string {
+	if reportTag == "" {
+		return nil
+	}
+
+	var addresses []string
+	for _, part := range strings.Split(reportTag, ",") {
+		part = strings.TrimSpace(part)
+		// Remove "mailto:" prefix if present
+		if strings.HasPrefix(part, "mailto:") {
+			part = strings.TrimPrefix(part, "mailto:")
+		}
+		if part != "" {
+			addresses = append(addresses, part)
+		}
+	}
+	return addresses
+}
+
+// shouldApplyPolicy returns true if the message should have the policy applied
+// based on the percentage sampling. Returns true with probability pct/100.
+func shouldApplyPolicy(pct int) bool {
+	if pct >= 100 {
+		return true
+	}
+	if pct <= 0 {
+		return false
+	}
+	return rand.Intn(100) < pct
 }
 
 // lookupDMARC looks up the DMARC TXT record for a domain.
@@ -156,12 +275,18 @@ func checkAlignment(fromDomain, authDomain, mode string) bool {
 	return getOrgDomain(fromDomain) == getOrgDomain(authDomain)
 }
 
-// getOrgDomain returns the organizational domain (last two labels).
-// This is simplified — a full implementation would use the public suffix list.
+// getOrgDomain returns the organizational domain using the public suffix list (RFC 7489 §3.2).
+// This properly handles domains like co.uk, com.br, etc.
 func getOrgDomain(domain string) string {
-	parts := strings.Split(domain, ".")
-	if len(parts) <= 2 {
-		return domain
+	// Use the public suffix list to determine the registrable domain
+	registrableDomain, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil {
+		// Fallback to last two labels if PSL lookup fails
+		parts := strings.Split(domain, ".")
+		if len(parts) <= 2 {
+			return domain
+		}
+		return strings.Join(parts[len(parts)-2:], ".")
 	}
-	return strings.Join(parts[len(parts)-2:], ".")
+	return registrableDomain
 }

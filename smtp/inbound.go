@@ -12,19 +12,21 @@ import (
 
 	"gomail/auth"
 	"gomail/config"
+	"gomail/dns"
 	"gomail/parser"
 	"gomail/store"
 )
 
 // InboundServer listens for incoming SMTP connections.
 type InboundServer struct {
-	cfg         *config.Config
-	db          *store.DB
-	tlsConfig   *tls.Config
-	rateLimiter *RateLimiter
-	listener    net.Listener
-	wg          sync.WaitGroup
-	quit        chan struct{}
+	cfg           *config.Config
+	db            *store.DB
+	tlsConfig     *tls.Config
+	rateLimiter   *RateLimiter
+	listener      net.Listener
+	wg            sync.WaitGroup
+	quit          chan struct{}
+	connSemaphore chan struct{} // Limits concurrent connections
 }
 
 // NewInboundServer creates a new inbound SMTP server.
@@ -37,7 +39,8 @@ func NewInboundServer(cfg *config.Config, db *store.DB, tlsCfg *tls.Config) *Inb
 			cfg.SMTP.RateLimit.ConnectionsPerMinute,
 			cfg.SMTP.RateLimit.MessagesPerMinute,
 		),
-		quit: make(chan struct{}),
+		quit:          make(chan struct{}),
+		connSemaphore: make(chan struct{}, cfg.SMTP.MaxConnections),
 	}
 }
 
@@ -89,11 +92,21 @@ func (s *InboundServer) acceptLoop() {
 			continue
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.handleConnection(conn)
-		}()
+		// Try to acquire connection slot
+		select {
+		case s.connSemaphore <- struct{}{}:
+			// Slot acquired, handle the connection
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer func() { <-s.connSemaphore }() // Release slot when done
+				s.handleConnection(conn)
+			}()
+		default:
+			// No slots available, reject connection
+			log.Printf("[smtp] max connections reached: rejecting connection from %s", ip)
+			conn.Close()
+		}
 	}
 }
 
@@ -104,6 +117,19 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		log.Printf("[smtp] error loading domains: %v", err)
 		conn.Close()
 		return
+	}
+
+	// Verify reverse DNS (PTR) for the connecting IP
+	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	ptrHostname, ptrValid, err := dns.VerifyPTR(ip)
+	if err != nil {
+		log.Printf("[smtp] PTR lookup failed for %s: %v", ip, err)
+	} else {
+		if ptrValid {
+			log.Printf("[smtp] PTR verified for %s: %s", ip, ptrHostname)
+		} else {
+			log.Printf("[smtp] PTR hostname %s does not resolve back to %s (forward confirmation failed)", ptrHostname, ip)
+		}
 	}
 
 	accountExists := func(email string) bool {
@@ -121,6 +147,8 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		s.cfg.SMTP.MaxRecipients,
 		time.Duration(s.cfg.SMTP.ReadTimeout)*time.Second,
 		time.Duration(s.cfg.SMTP.WriteTimeout)*time.Second,
+		ptrHostname,
+		ptrValid,
 	)
 
 	// Override the DATA handler to intercept the message
@@ -170,6 +198,31 @@ func (s *InboundServer) runSession(sess *Session) {
 				}
 				sess.reset()
 			}
+		} else if cmd == "BDAT" {
+			// Handle BDAT (RFC 3030 CHUNKING)
+			var arg string
+			if len(parts) > 1 {
+				arg = parts[1]
+			}
+
+			// Rate limit messages on first chunk (StateRcpt)
+			if sess.state == StateRcpt && !s.rateLimiter.AllowMessage(sess.clientIP) {
+				sess.send(451, "Too many messages, try again later")
+				continue
+			}
+
+			sess.handleBDAT(arg)
+
+			// If LAST chunk was received (state transitions back to StateReady with data), process message
+			if sess.state == StateReady && sess.data.Len() > 0 {
+				if err := s.processMessage(sess); err != nil {
+					log.Printf("[smtp] message processing error from %s: %v", sess.clientAddr, err)
+					sess.send(451, "Message processing failed, try again later")
+				} else {
+					sess.send(250, "OK message accepted for delivery")
+				}
+				sess.reset()
+			}
 		} else {
 			sess.handleCommand(line)
 		}
@@ -185,6 +238,15 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	log.Printf("[smtp] processing message from=%s to=%v ip=%s size=%d",
 		mailFrom, rcptTo, clientIP, len(rawMessage))
+
+	// Log PTR verification result
+	if sess.ptrValid {
+		log.Printf("[smtp] PTR verified: %s", sess.ptrHostname)
+	} else if sess.ptrHostname != "" {
+		log.Printf("[smtp] PTR unverified: %s (no forward confirmation)", sess.ptrHostname)
+	} else {
+		log.Printf("[smtp] PTR: no reverse DNS records found")
+	}
 
 	// --- Add Received header ---
 	receivedHeader := fmt.Sprintf("Received: from %s\r\n\tby %s\r\n\twith SMTP%s\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
@@ -212,6 +274,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	// DKIM
 	dkimResult, dkimDetail := auth.VerifyDKIM(rawMessage)
+	dkimDomain := auth.GetDKIMDomain(rawMessage)
 	authBuilder.AddDKIM(dkimResult, dkimDetail, "", "")
 	log.Printf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail)
 
@@ -221,20 +284,43 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		return fmt.Errorf("parsing message: %w", err)
 	}
 
+	log.Printf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
+		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments))
+
 	fromDomain := extractDomain(parsed.From)
 	spfDomain := extractDomain(mailFrom)
 
-	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, "")
+	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, dkimDomain)
 	authBuilder.AddDMARC(dmarcResult.Result, dmarcResult.Details, fromDomain)
 	log.Printf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details)
 
+	// Record DMARC feedback for aggregate reporting (RFC 7489)
+	// Determine disposition based on policy and auth results
+	disposition := "none"
+	dkimPass := dkimResult == "pass"
+	spfPass := spfResult == "pass"
+	if !dkimPass && !spfPass {
+		if dmarcResult.Policy == "reject" {
+			disposition = "reject"
+		} else if dmarcResult.Policy == "quarantine" {
+			disposition = "quarantine"
+		}
+	}
+	if err := s.db.SaveDMARCFeedback(fromDomain, clientIP, spfDomain, dkimResult, string(spfResult), disposition); err != nil {
+		log.Printf("[smtp] warning: failed to save DMARC feedback: %v", err)
+	}
+
 	authResults := authBuilder.Build()
+
+	// Prepend Authentication-Results header to raw message so clients can see it
+	authResultsHeader := authResults + "\r\n"
+	rawMessage = append([]byte(authResultsHeader), rawMessage...)
 
 	// --- Validate ARC Chain (if present) ---
 	arcValidation := auth.ValidateARCChain(rawMessage)
 	switch arcValidation.Status {
 	case "pass":
-		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d", 
+		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d",
 			arcValidation.HighestValid)
 	case "fail":
 		log.Printf("[smtp] ARC ✗ FAIL: %s", arcValidation.Details)
@@ -278,7 +364,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// Note: DMARC enforcement is now done per-recipient via folder assignment below
 		// p=reject and p=quarantine both result in messages going to spam folder
 		// p=none messages go to inbox normally
-		
+
 		// Check if DMARC failed for this domain
 		if dmarcResult.Result == "fail" {
 			switch dmarcResult.Policy {
@@ -304,40 +390,56 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 		accountID := account.ID
 
-		// Determine folder based on auth failure and direction
+		// Determine folder based on auth results
 		var folderID *int64
-		
-		if arcFailed {
-			// ARC validation failed - quarantine to spam
-			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
-			if err != nil {
-				log.Printf("[smtp] error getting spam folder: %v", err)
-			} else if spamFolder != nil {
-				folderID = &spamFolder.ID
-				log.Printf("[smtp] ARC failed: quarantining to spam folder=%d (reason: %s)", 
-					spamFolder.ID, arcValidation.Details)
+
+		// Check if this is an automated message (DSN, MDN, read receipt, etc.)
+		// These legitimately have SPF "none" since they have no envelope sender
+		contentType := parsed.Headers.Get("Content-Type")
+		isAutomatedMessage := strings.Contains(strings.ToLower(contentType), "multipart/report") ||
+			strings.Contains(strings.ToLower(contentType), "multipart/delivery-status") ||
+			strings.Contains(strings.ToLower(parsed.Subject), "return receipt") ||
+			strings.Contains(strings.ToLower(parsed.Subject), "delivery report") ||
+			parsed.MDNRequestedBy != "" // MDN messages have this set
+
+		// Route to inbox ONLY if all three authentications pass
+		// For automated messages, allow SPF="none" if DKIM and DMARC pass
+		var allAuthPass bool
+		if isAutomatedMessage {
+			// For automated messages: SPF can be "none", but DKIM and DMARC must pass
+			allAuthPass = dkimResult == "pass" && dmarcResult.Result == "pass"
+		} else {
+			// For regular messages: require all three
+			allAuthPass = spfResult == "pass" && dkimResult == "pass" && dmarcResult.Result == "pass"
+		}
+		authFailed := arcFailed || !allAuthPass
+
+		if authFailed {
+			// Any auth failure → spam folder
+			if arcFailed {
+				log.Printf("[smtp] ARC failed: quarantining to spam (reason: %s)", arcValidation.Details)
 			} else {
-				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
+				log.Printf("[smtp] auth check failed - SPF: %s, DKIM: %s, DMARC: %s - quarantining to spam",
+					spfResult, dkimResult, dmarcResult.Result)
 			}
-		} else if dmarcResult.Result == "fail" && (dmarcResult.Policy == "quarantine" || dmarcResult.Policy == "reject") {
-			// DMARC quarantine/reject - move to spam
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
 				log.Printf("[smtp] error getting spam folder: %v", err)
 			} else if spamFolder != nil {
 				folderID = &spamFolder.ID
-				log.Printf("[smtp] quarantining mail from %s to spam folder=%d (DMARC %s)", fromDomain, spamFolder.ID, dmarcResult.Policy)
+				log.Printf("[smtp] message routed to spam folder=%d", spamFolder.ID)
 			} else {
 				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
 			}
 		} else {
-			// Normal inbound messages go to Inbox folder
+			// All auth passed - route to inbox
 			inboxFolder, err := s.db.GetFolderByType(accountID, "inbox")
 			if err != nil {
 				log.Printf("[smtp] error getting inbox folder for account %d: %v", accountID, err)
 			} else if inboxFolder != nil {
 				folderID = &inboxFolder.ID
-				log.Printf("[smtp] assigning inbound mail to inbox folder=%d for account %d", inboxFolder.ID, accountID)
+				log.Printf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
+					spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID)
 			} else {
 				log.Printf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID)
 			}

@@ -41,11 +41,47 @@
 
     <!-- Sidebar -->
     <nav class="sidebar" id="sidebar">
+        {{if not .AdminPanel}}
         <a href="/compose" class="compose-btn">
             <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#202124"/></svg>
             <span>Compose</span>
         </a>
+        {{end}}
         <ul class="nav-links">
+            {{if .AdminPanel}}
+            {{if and .Account .Account.IsAdmin}}
+            <li class="{{if eq .AdminPanel "dashboard"}}active{{end}}">
+                <a href="/admin">
+                    <span class="nav-icon">&#128202;</span>
+                    <span class="nav-text">Dashboard</span>
+                </a>
+            </li>
+            <li class="{{if eq .AdminPanel "domains"}}active{{end}}">
+                <a href="/admin/domains">
+                    <span class="nav-icon">&#127760;</span>
+                    <span class="nav-text">Domains</span>
+                </a>
+            </li>
+            <li class="{{if eq .AdminPanel "accounts"}}active{{end}}">
+                <a href="/admin/accounts">
+                    <span class="nav-icon">&#128100;</span>
+                    <span class="nav-text">Accounts</span>
+                </a>
+            </li>
+            <li class="{{if eq .AdminPanel "dmarc"}}active{{end}}">
+                <a href="/admin/dmarc-feedback">
+                    <span class="nav-icon">&#128231;</span>
+                    <span class="nav-text">DMARC Reports</span>
+                </a>
+            </li>
+            {{end}}
+            {{else}}
+            <li class="{{if eq .Section "inbox"}}active{{end}}">
+                <a href="/inbox">
+                    <span class="nav-icon">&#128194;</span>
+                    <span class="nav-text">All mails</span>
+                </a>
+            </li>
             {{if .Folders}}
             {{range .Folders}}
             <li class="{{if eq $.ActiveFolder .ID}}active{{end}}">
@@ -71,14 +107,24 @@
                 </a>
             </li>
             {{end}}
+            {{end}}
             {{if and .Account .Account.IsAdmin}}
             <li class="nav-divider"></li>
-            <li class="{{if eq .Section "admin"}}active{{end}}">
-                <a href="/admin/domains">
+            {{if .AdminPanel}}
+            <li>
+                <a href="/">
+                    <span class="nav-icon">&#9993;</span>
+                    <span class="nav-text">Mail</span>
+                </a>
+            </li>
+            {{else}}
+            <li>
+                <a href="/admin">
                     <span class="nav-icon">&#9881;</span>
                     <span class="nav-text">Admin</span>
                 </a>
             </li>
+            {{end}}
             {{end}}
         </ul>
     </nav>
@@ -86,7 +132,11 @@
 
     <main class="{{if .Section}}with-sidebar{{end}}">
         <div class="content-area">
-            {{template "content" .}}
+            {{if eq .Section "welcome"}}
+                {{template "welcome-content" .}}
+            {{else}}
+                {{template "content" .}}
+            {{end}}
         </div>
     </main>
     <script src="/static/app.js"></script>

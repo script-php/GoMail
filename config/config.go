@@ -19,6 +19,7 @@ type Config struct {
 	DNS      DNSConfig      `json:"dns"`
 	Security SecurityConfig `json:"security"`
 	MDN      MDNConfig      `json:"mdn"`
+	DMARC    DMARCConfig    `json:"dmarc"`
 	Logging  LoggingConfig  `json:"logging"`
 }
 
@@ -62,12 +63,13 @@ type StoreConfig struct {
 }
 
 type WebConfig struct {
-	ListenAddr    string         `json:"listen_addr"`
-	HTTPAddr      string         `json:"http_addr"`
-	EnableTLS     *bool          `json:"enable_tls"`
-	SessionSecret string         `json:"session_secret"`
-	SessionMaxAge int            `json:"session_max_age"`
-	BootstrapAdmin BootstrapAdmin `json:"bootstrap_admin"`
+	ListenAddr      string         `json:"listen_addr"`
+	HTTPAddr        string         `json:"http_addr"`
+	EnableTLS       *bool          `json:"enable_tls"`
+	SessionSecret   string         `json:"session_secret"`
+	SessionMaxAge   int            `json:"session_max_age"`
+	BootstrapAdmin  BootstrapAdmin `json:"bootstrap_admin"`
+	RateLimitPerMin int            `json:"rate_limit_per_minute"`
 }
 
 // IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).
@@ -76,6 +78,16 @@ func (w *WebConfig) IsTLSEnabled() bool {
 		return true
 	}
 	return *w.EnableTLS
+}
+
+// GetRateLimitPerMin returns the web rate limit per minute (default 300).
+// This only applies to non-static requests (CSS/JS are exempt).
+func (w *WebConfig) GetRateLimitPerMin() int {
+	// Debug: log what value was loaded from config
+	if w.RateLimitPerMin <= 0 {
+		return 300 // Default: 300 req/min per IP (5 req/sec), static assets exempt
+	}
+	return w.RateLimitPerMin
 }
 
 // BootstrapAdmin is the initial admin created on first run (before any accounts exist).
@@ -100,14 +112,18 @@ type DNSConfig struct {
 }
 
 type SecurityConfig struct {
-	CSRFKey            string `json:"csrf_key"`
-	AuthEnforcement    string `json:"auth_enforcement"`    // "none", "observe", "quarantine", "reject"
-	QuarantineFolder   string `json:"quarantine_folder"`   // Folder name for failed auth emails (default: "Spam")
+	CSRFKey          string `json:"csrf_key"`
+	AuthEnforcement  string `json:"auth_enforcement"`  // "none", "observe", "quarantine", "reject"
+	QuarantineFolder string `json:"quarantine_folder"` // Folder name for failed auth emails (default: "Spam")
 }
 
 type MDNConfig struct {
-	Enabled string `json:"enabled"`  // "yes" or "no" (default: "no")
-	Mode    string `json:"mode"`     // "auto" or "manual" (default: "manual")
+	Enabled string `json:"enabled"` // "yes" or "no" (default: "no")
+	Mode    string `json:"mode"`    // "auto" or "manual" (default: "manual")
+}
+
+type DMARCConfig struct {
+	SendReports bool `json:"send_reports"` // Enable/disable DMARC report sending (default: false)
 }
 
 type LoggingConfig struct {
@@ -211,7 +227,7 @@ func (c *Config) Validate() error {
 		c.DNS.CacheTTL = 300
 	}
 	if c.Security.AuthEnforcement == "" {
-		c.Security.AuthEnforcement = "observe"  // observe, quarantine, reject, none
+		c.Security.AuthEnforcement = "observe" // observe, quarantine, reject, none
 	}
 	if c.Security.QuarantineFolder == "" {
 		c.Security.QuarantineFolder = "Spam"

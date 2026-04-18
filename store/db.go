@@ -348,12 +348,13 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 
 
 // addColumn adds a new column to a table (SQLite compatible)
-// This is the safest operation - only ADD COLUMN with DEFAULT value is applied
+// For nullable columns, SQLite will automatically fill existing rows with NULL
+// For NOT NULL columns, a DEFAULT value is required for safety
 func (db *DB) addColumn(tableName string, col ColumnChange) error {
-	// Safety check: only allow ADD with a default value or NOT NULL
-	// This prevents data loss
-	if col.Default == nil && !col.NotNull {
-		fmt.Printf("[db] ⚠️  SKIPPED: Adding nullable column %s without default (unsafe)\n", col.Name)
+	// Safety check: NOT NULL columns need a DEFAULT value
+	// Nullable columns are safe - SQLite fills with NULL automatically
+	if col.NotNull && col.Default == nil {
+		fmt.Printf("[db] ⚠️  SKIPPED: Adding NOT NULL column %s without default (unsafe)\n", col.Name)
 		fmt.Printf("[db] ⚠️  Add DEFAULT value to schema.sql to enable this change\n")
 		return nil
 	}

@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -52,4 +54,19 @@ func getRealClientIP(r *http.Request) string {
 		clientAddr = clientAddr[:idx]
 	}
 	return clientAddr
+}
+
+// encodeHeaderValue encodes a header value using RFC 2047 if it contains non-ASCII characters
+// Format: =?UTF-8?B?base64_encoded_value?=
+func encodeHeaderValue(value string) string {
+	// Check if value contains non-ASCII characters
+	for _, r := range value {
+		if r > 127 {
+			// Contains non-ASCII: encode with RFC 2047
+			encoded := base64.StdEncoding.EncodeToString([]byte(value))
+			return fmt.Sprintf("=?UTF-8?B?%s?=", encoded)
+		}
+	}
+	// All ASCII: return as-is
+	return value
 }

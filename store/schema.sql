@@ -124,3 +124,25 @@ CREATE INDEX IF NOT EXISTS idx_messages_msgid         ON messages(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_message    ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_queue_status           ON outbound_queue(status, next_retry);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires       ON sessions(expires_at);
+-- DMARC feedback records for aggregate report generation (RFC 7489)
+CREATE TABLE IF NOT EXISTS dmarc_feedback (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain              TEXT NOT NULL,  -- From header domain
+    source_ip           TEXT NOT NULL,  -- Remote IP
+    envelope_from_domain TEXT,          -- MAIL FROM domain
+    dkim_result         TEXT,           -- pass, fail, neutral, none, policy, error
+    spf_result          TEXT,           -- pass, fail, neutral, none, softfail, temperror, permerror
+    disposition         TEXT,           -- none, quarantine, reject (from policy application)
+    received_at         DATETIME NOT NULL DEFAULT (datetime('now')),
+    sent_at             DATETIME        -- When this record was included in a sent report (NULL if not yet sent)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dmarc_feedback_domain ON dmarc_feedback(domain);
+CREATE INDEX IF NOT EXISTS idx_dmarc_feedback_received ON dmarc_feedback(received_at);
+
+-- Track when DMARC reports were last sent for each domain
+CREATE TABLE IF NOT EXISTS dmarc_report_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain          TEXT NOT NULL UNIQUE,  -- Domain the report was for
+    last_sent_at    DATETIME NOT NULL      -- When the last report was sent for this domain
+);

@@ -127,6 +127,33 @@ func (db *DB) CountDomainAccounts(domainID int64) (int, error) {
 	return count, err
 }
 
+// GetDomainsWithFeedback returns all domains that have DMARC feedback records.
+func (db *DB) GetDomainsWithFeedback() ([]*Domain, error) {
+	// Get all unique domains from DMARC feedback (these are sender domains with DMARC records)
+	rows, err := db.Query(`
+		SELECT DISTINCT domain
+		FROM dmarc_feedback
+		ORDER BY domain`)
+	if err != nil {
+		return nil, fmt.Errorf("listing domains with feedback: %w", err)
+	}
+	defer rows.Close()
+
+	var domains []*Domain
+	for rows.Next() {
+		var domainName string
+		if err := rows.Scan(&domainName); err != nil {
+			return nil, fmt.Errorf("scanning domain row: %w", err)
+		}
+		// Create a minimal Domain struct with just the domain name
+		// (we don't need DKIM keys for report generation, just the domain)
+		domains = append(domains, &Domain{
+			Domain: domainName,
+		})
+	}
+	return domains, rows.Err()
+}
+
 // --- Account CRUD ---
 
 // CreateAccount adds a new user account.
@@ -140,18 +167,18 @@ func (db *DB) CreateAccount(a *Account) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("creating account: %w", err)
 	}
-	
+
 	accountID, err := result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
-	
+
 	// Create default folders for the account
 	if err := db.DefaultFolders(accountID); err != nil {
 		// Log error but don't fail account creation
 		fmt.Printf("[warn] failed to create default folders for account %d: %v\n", accountID, err)
 	}
-	
+
 	return accountID, nil
 }
 
@@ -525,6 +552,47 @@ func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry 
 		status, attempts, sqliteTime(nextRetry), lastError, id,
 	)
 	return err
+}
+
+// RecoverStaleQueueEntries finds entries stuck in "sending" status for >30 minutes and resets them to "pending".
+// This handles the case where the worker process crashed mid-delivery.
+// Returns the number of entries recovered.
+func (db *DB) RecoverStaleQueueEntries() (int, error) {
+	// Find entries stuck in "sending" status for more than 30 minutes
+	staleBefore := time.Now().UTC().Add(-30 * time.Minute)
+
+	rows, err := db.Query(`
+		SELECT id, next_retry
+		FROM outbound_queue
+		WHERE status = 'sending' AND updated_at < datetime(?)
+	`, sqliteTime(staleBefore))
+	if err != nil {
+		return 0, fmt.Errorf("querying stale entries: %w", err)
+	}
+	defer rows.Close()
+
+	var recovered int
+	for rows.Next() {
+		var id int64
+		var nextRetry string
+		if err := rows.Scan(&id, &nextRetry); err != nil {
+			return recovered, fmt.Errorf("scanning stale entry: %w", err)
+		}
+
+		// Reset to pending with immediate retry (1 minute from now)
+		newRetryTime := time.Now().UTC().Add(1 * time.Minute)
+		if err := db.UpdateQueueEntry(id, "pending", 0, newRetryTime, "recovered from stale sending status"); err != nil {
+			return recovered, fmt.Errorf("updating stale entry %d: %w", id, err)
+		}
+		recovered++
+	}
+
+	if recovered > 0 {
+		// Log the recovery through fmt rather than log package to avoid circular imports
+		fmt.Printf("[store] recovered %d stale queue entries from sending status\n", recovered)
+	}
+
+	return recovered, rows.Err()
 }
 
 // DeleteQueueEntry removes a completed/failed entry from the queue.

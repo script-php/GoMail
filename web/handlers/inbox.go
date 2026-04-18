@@ -39,11 +39,11 @@ func NewInboxHandler(db *store.DB, sm *security.SessionManager) *InboxHandler {
 				return fmt.Sprintf("%d B", size)
 			}
 		},
-		"add": func(a, b int) int { return a + b },
+		"add":      func(a, b int) int { return a + b },
 		"subtract": func(a, b int) int { return a - b },
 	}
 
-	tmpl := templates.LoadTemplate(funcMap, "base", "inbox")
+	tmpl := templates.LoadTemplate(funcMap, "base", "inbox", "welcome")
 
 	return &InboxHandler{
 		db:         db,
@@ -193,17 +193,43 @@ func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
 	folders, _ := h.db.ListFolders(account.ID)
 
 	data := map[string]interface{}{
-		"Title":       folder.Name,
-		"Messages":    messages,
-		"Page":        page,
-		"TotalPages":  (total + perPage - 1) / perPage,
-		"Total":       total,
-		"Unread":      unread,
-		"CSRFToken":   h.sessionMgr.GenerateCSRFToken(r),
-		"Section":     "folder",
-		"Account":     account,
-		"Folders":     folders,
+		"Title":        folder.Name,
+		"Messages":     messages,
+		"Page":         page,
+		"TotalPages":   (total + perPage - 1) / perPage,
+		"Total":        total,
+		"Unread":       unread,
+		"CSRFToken":    h.sessionMgr.GenerateCSRFToken(r),
+		"Section":      "folder",
+		"Account":      account,
+		"Folders":      folders,
 		"ActiveFolder": folderID,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[web] template error: %v", err)
+	}
+}
+
+// Welcome shows the welcome/home page.
+func (h *InboxHandler) Welcome(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
+
+	data := map[string]interface{}{
+		"Title":     "Welcome",
+		"Unread":    unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+		"Section":   "welcome",
+		"Account":   account,
+		"Folders":   folders,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

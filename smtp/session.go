@@ -26,32 +26,35 @@ const (
 
 // Session represents a single SMTP session with a connected client.
 type Session struct {
-	conn       net.Conn
-	reader     *bufio.Reader
-	writer     *bufio.Writer
-	state      SessionState
-	hostname   string
-	domains       []string // all accepted domains
-	accountExists func(email string) bool // checks if a local account exists
-	clientAddr    string
-	clientIP      string
-	ehlo       string
-	mailFrom   string
-	rcptTo     []string
-	dsnNotify  map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
-	dsnRET     string // FULL or HDRS
-	dsnEnvID   string // Envelope ID
-	data       bytes.Buffer
-	tls        bool
-	tlsConfig  *tls.Config
-	maxSize    int64
-	maxRcpt    int
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	conn            net.Conn
+	reader          *bufio.Reader
+	writer          *bufio.Writer
+	state           SessionState
+	hostname        string
+	domains         []string                // all accepted domains
+	accountExists   func(email string) bool // checks if a local account exists
+	clientAddr      string
+	clientIP        string
+	ptrHostname     string // reverse DNS hostname (if verified)
+	ptrValid        bool   // true if forward-confirmed reverse DNS
+	ehlo            string
+	mailFrom        string
+	rcptTo          []string
+	dsnNotify       map[string]string // map recipient -> notify flags (SUCCESS,FAILURE,DELAY)
+	dsnRET          string            // FULL or HDRS
+	dsnEnvID        string            // Envelope ID
+	data            bytes.Buffer
+	tls             bool
+	tlsConfig       *tls.Config
+	maxSize         int64
+	maxRcpt         int
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	smtputf8Enabled bool // true if client advertised SMTPUTF8 support
 }
 
 // NewSession creates a new SMTP session for the given connection.
-func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration) *Session {
+func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool) *Session {
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
@@ -65,6 +68,8 @@ func NewSession(conn net.Conn, hostname string, domains []string, accountExists 
 		accountExists: accountExists,
 		clientAddr:    remoteAddr,
 		clientIP:      ip,
+		ptrHostname:   ptrHostname,
+		ptrValid:      ptrValid,
 		tlsConfig:     tlsCfg,
 		maxSize:       maxSize,
 		maxRcpt:       maxRcpt,
@@ -120,6 +125,8 @@ func (s *Session) handleCommand(line string) {
 		s.handleRCPT(arg)
 	case "DATA":
 		s.handleDATA()
+	case "BDAT":
+		s.handleBDAT(arg)
 	case "RSET":
 		s.handleRSET()
 	case "NOOP":
@@ -139,6 +146,10 @@ func (s *Session) handleEHLO(arg string) {
 	s.reset()
 	s.state = StateReady
 
+	// Check if client supports SMTPUTF8
+	// This is detected from the EHLO argument in the actual handshake
+	// For now, we always advertise it (RFC 6531)
+
 	lines := []string{
 		fmt.Sprintf("%s greets %s", s.hostname, arg),
 		fmt.Sprintf("SIZE %d", s.maxSize),
@@ -146,6 +157,8 @@ func (s *Session) handleEHLO(arg string) {
 		"ENHANCEDSTATUSCODES",
 		"PIPELINING",
 		"DSN",
+		"SMTPUTF8",
+		"CHUNKING",
 	}
 
 	if !s.tls && s.tlsConfig != nil {
@@ -209,6 +222,11 @@ func (s *Session) handleMAIL(arg string) {
 		return
 	}
 
+	// Check for UTF8 parameter (RFC 6531)
+	if strings.Contains(strings.ToUpper(arg), "UTF8") {
+		s.smtputf8Enabled = true
+	}
+
 	// Parse DSN parameters (RET, ENVID)
 	s.parseDSNMailParams(arg)
 
@@ -260,10 +278,10 @@ func (s *Session) handleRCPT(arg string) {
 	}
 
 	s.rcptTo = append(s.rcptTo, to)
-	
+
 	// Parse DSN parameters (NOTIFY, ORCPT)
 	s.parseDSNRcptParams(to, arg)
-	
+
 	s.state = StateRcpt
 	s.send(250, "OK")
 }
@@ -311,6 +329,62 @@ func (s *Session) handleDATA() {
 
 	s.state = StateReady
 	// Data is now in s.data — will be processed by the inbound handler
+}
+
+func (s *Session) handleBDAT(arg string) {
+	if s.state != StateRcpt && s.state != StateData {
+		s.send(503, "Bad sequence of commands")
+		return
+	}
+
+	// Parse "BDAT <length> [LAST]"
+	parts := strings.Fields(arg)
+	if len(parts) < 1 {
+		s.send(501, "Syntax error in BDAT command")
+		return
+	}
+
+	var length int64
+	_, err := fmt.Sscanf(parts[0], "%d", &length)
+	if err != nil || length < 0 {
+		s.send(501, "Invalid chunk size")
+		return
+	}
+
+	isLast := len(parts) > 1 && strings.ToUpper(parts[1]) == "LAST"
+
+	// Read exactly 'length' bytes from connection
+	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	chunk := make([]byte, length)
+
+	n, err := io.ReadFull(s.reader, chunk)
+	if err != nil {
+		log.Printf("[smtp] BDAT read error from %s: %v", s.clientAddr, err)
+		s.send(452, "Failed to read chunk")
+		return
+	}
+
+	// Check total size including this chunk
+	totalSize := int64(s.data.Len()) + int64(n)
+	if totalSize > s.maxSize {
+		s.send(552, "Message exceeds maximum size")
+		s.reset()
+		return
+	}
+
+	// Append chunk to message data
+	s.data.Write(chunk)
+
+	// If LAST flag received, message transmission is complete
+	if isLast {
+		s.state = StateReady
+		// Data is now in s.data — will be processed by the inbound handler
+		// Don't send response here; let inbound.go handle it after processMessage
+	} else {
+		// Expect more BDAT chunks - send OK and keep state as StateData
+		s.send(250, "OK")
+		s.state = StateData
+	}
 }
 
 func (s *Session) handleRSET() {
@@ -421,7 +495,7 @@ func (s *Session) parseDSNMailParams(arg string) {
 // Format: RCPT TO:<addr> [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;addr]
 func (s *Session) parseDSNRcptParams(recipient, arg string) {
 	var notify string
-	
+
 	// Look for NOTIFY parameter
 	upperArg := strings.ToUpper(arg)
 	if strings.Contains(upperArg, "NOTIFY=") {
@@ -435,7 +509,7 @@ func (s *Session) parseDSNRcptParams(recipient, arg string) {
 			}
 		}
 	}
-	
+
 	// Store NOTIFY flags for this recipient
 	if notify != "" && notify != "NEVER" {
 		s.dsnNotify[recipient] = notify
