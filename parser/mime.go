@@ -132,13 +132,13 @@ func extractFilename(headers textproto.MIMEHeader, ctParams map[string]string) s
 		_, dParams, err := mime.ParseMediaType(disposition)
 		if err == nil {
 			if name := dParams["filename"]; name != "" {
-				return name
+				return decodeRFC2047(name)
 			}
 		}
 	}
 	// Fallback to Content-Type name parameter
 	if name := ctParams["name"]; name != "" {
-		return name
+		return decodeRFC2047(name)
 	}
 	return "unnamed"
 }
