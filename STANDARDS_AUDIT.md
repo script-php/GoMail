@@ -231,9 +231,16 @@
   - **Priority:** Not applicable
 
 ### Outbound Security
-- ❌ **MTA-STS enforcement (outbound)** - Policy is served but **never checked** when sending to remote domains
-  - Impact: GoMail ignores remote domains' MTA-STS policies
-  - **Priority:** Medium
+- ✅ **MTA-STS enforcement (outbound)** (FIXED April 18, 2026) - Policy fetching and validation on delivery
+  - **Implementation:** Fetch remote domain's `/.well-known/mta-sts.txt` before delivery; cache respecting `max_age`
+  - **Behavior:**
+    - **enforce mode:** Require TLS, fail delivery if unavailable; only deliver to MX hosts listed in policy
+    - **testing mode:** Log violations but allow delivery to proceed unencrypted
+    - **mode unspecified:** Use normal opportunistic TLS (compatible with non-MTA-STS domains)
+  - **MX validation:** Only attempt delivery to MX records listed in remote policy; skip non-whitelisted MX hosts
+  - **Caching:** Policies cached respecting RFC 8461 max_age field; default 1 hour if unspecified
+  - **RFC compliance:** Full RFC 8461 MTA-STS enforcement on outbound
+  - **Status:** ✅ Operational - GoMail now enforces remote domains' MTA-STS policies when sending mail
 
 - ❌ **DANE verification** (RFC 7672) - Can generate TLSA records but **cannot verify** remote servers' TLSA records
   - Impact: No DNSSEC-based certificate validation on outbound
@@ -355,8 +362,9 @@
    - Impact: Prevents message loss on crash
 
 3. **MTA-STS enforcement on outbound** - Fetch/cache remote policies before delivery
-   - Files: `smtp/outbound.go`, `mta_sts/policy.go`
+   - Files: `smtp/outbound.go`, `mta_sts/policy.go`, `mta_sts/fetcher.go`
    - Effort: 1-2 days
+   - **Status:** ✅ COMPLETED April 18, 2026
 
 4. **List-Unsubscribe headers** (RFC 8058)
    - File: `web/handlers/compose.go`
@@ -429,7 +437,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 7208 (SPF verification — **full compliance with all mechanisms, modifiers, macro expansion, and DNS counting**)
 - ✅ RFC 7489 (DMARC verification)
 - ✅ RFC 8617 (ARC chain signing + cryptographic verification)
-- ✅ RFC 8461 (MTA-STS policy serving)
+- ✅ RFC 8461 (MTA-STS policy serving and **outbound enforcement**)
 - ✅ RFC 3798 (MDN read receipts)
 
 **Recently Fixed (April 6-16, 2026):**
@@ -448,10 +456,11 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **CHUNKING/BDAT support** - RFC 3030 binary data streaming with chunked transmission
 - ✅ **Stale queue recovery** - Automatic recovery of entries stuck in "sending" status; no message loss on crash
 - ✅ **Smart error handling on delivery** - Different retry strategy based on SMTP error codes (4xx vs 5xx)
+- ✅ **MTA-STS enforcement (outbound)** - RFC 8461 policy fetching, validation, and TLS enforcement on delivery
 
 **What needs immediate attention:**
 - ⚠️ Web rate limiter not wired (middleware exists, not registered)
-- ⚠️ Stale queue entries never recovered after crash
+- IPv6 outbound support (15 min quick fix)
 
 **What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, and various optional modern features.
 

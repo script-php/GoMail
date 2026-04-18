@@ -10,6 +10,7 @@ import (
 	"time"
 
 	godns "gomail/dns"
+	"gomail/mta_sts"
 )
 
 // SendMail delivers a message to a remote SMTP server via MX lookup.
@@ -24,6 +25,12 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 	}
 	domain := parts[1]
 
+	// Fetch MTA-STS policy for recipient domain
+	policy := mta_sts.FetchPolicy(domain)
+	if policy != nil {
+		log.Printf("[mta-sts] policy mode for %s: %s", domain, policy.Mode)
+	}
+
 	// MX lookup
 	mxRecords, err := godns.LookupMX(domain)
 	if err != nil {
@@ -33,12 +40,50 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 	// Try each MX in preference order
 	var lastErr error
 	for _, mx := range mxRecords {
-		err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID)
-		if err == nil {
-			return nil // Success
+		// Check MTA-STS policy: validate MX host is in policy if policy exists
+		if policy != nil && policy.Mode != "none" {
+			// Check if this MX host is allowed by the policy
+			hostAllowed := false
+			for _, policyMX := range policy.MXHosts {
+				if strings.EqualFold(mx.Host, policyMX) {
+					hostAllowed = true
+					break
+				}
+			}
+
+			if !hostAllowed {
+				log.Printf("[mta-sts] MX host %s not in policy for %s, skipping", mx.Host, domain)
+				continue
+			}
+
+			// Enforce TLS requirements based on policy mode
+			if policy.Mode == "enforce" {
+				// Enforce mode: require TLS
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID)
+				if err == nil {
+					return nil // Success
+				}
+				lastErr = err
+				log.Printf("[mta-sts] ENFORCE delivery to %s failed: %v, trying next MX", mx.Host, err)
+			} else if policy.Mode == "testing" {
+				// Testing mode: log violations but allow delivery
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID)
+				if err == nil {
+					log.Printf("[mta-sts] TESTING delivery to %s succeeded", mx.Host)
+					return nil
+				}
+				lastErr = err
+				log.Printf("[mta-sts] TESTING violation for %s: %v", mx.Host, err)
+			}
+		} else {
+			// No policy or mode=none: use normal delivery with original requireTLS setting
+			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID)
+			if err == nil {
+				return nil // Success
+			}
+			lastErr = err
+			log.Printf("[smtp] delivery to %s failed: %v, trying next MX", mx.Host, err)
 		}
-		lastErr = err
-		log.Printf("[smtp] delivery to %s failed: %v, trying next MX", mx.Host, err)
 	}
 
 	return fmt.Errorf("all MX hosts failed for %s: %w", domain, lastErr)
