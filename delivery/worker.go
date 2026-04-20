@@ -145,6 +145,7 @@ func (w *Worker) processQueue() {
 			entry.DSNRet,
 			entry.DSNEnvID,
 			w.cfg.Delivery.GetNetwork(),
+			w.db,
 		)
 	}
 
@@ -524,9 +525,9 @@ func (w *Worker) deliverDSN(senderEmail string, dsnReport string) error {
 		AccountID:  account.ID,
 		MessageID:  fmt.Sprintf("%d@%s", time.Now().UnixNano(), w.cfg.Server.Hostname),
 		Direction:  "inbound",
-		MailFrom:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
+		MailFrom:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Domain),
 		RcptTo:     senderEmail,
-		FromAddr:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Hostname),
+		FromAddr:   fmt.Sprintf("Mailer-Daemon@%s", w.cfg.Server.Domain),
 		ToAddr:     senderEmail,
 		Subject:    parsed.Subject,
 		TextBody:   parsed.TextBody,

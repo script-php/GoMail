@@ -146,3 +146,18 @@ CREATE TABLE IF NOT EXISTS dmarc_report_log (
     domain          TEXT NOT NULL UNIQUE,  -- Domain the report was for
     last_sent_at    DATETIME NOT NULL      -- When the last report was sent for this domain
 );
+
+-- TLS-RPT failure records for TLS report generation (RFC 8460)
+CREATE TABLE IF NOT EXISTS tls_failures (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_domain    TEXT NOT NULL,      -- Remote domain we tried to deliver to
+    failure_reason      TEXT NOT NULL,      -- tls-required, certificate-host-mismatch, certificate-expired, certificate-not-trusted, connection-refused, other
+    sending_mta_ip      TEXT,               -- Our IP address
+    receiving_mx_hostname TEXT,             -- Remote MX hostname
+    receiving_ip        TEXT,               -- Remote MX IP
+    attempted_at        DATETIME NOT NULL DEFAULT (datetime('now')),
+    sent_at             DATETIME            -- When this record was included in a sent report (NULL if not yet sent)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tls_failures_domain ON tls_failures(recipient_domain);
+CREATE INDEX IF NOT EXISTS idx_tls_failures_attempted ON tls_failures(attempted_at);

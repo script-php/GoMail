@@ -30,6 +30,7 @@ type AdminHandler struct {
 	tmplAccounts      *template.Template
 	tmplAccountEdit   *template.Template
 	tmplDMARCFeedback *template.Template
+	tmplTLSRPT        *template.Template
 	enqueueFunc       reporting.EnqueueFunc
 }
 
@@ -62,6 +63,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplAccounts := templates.LoadTemplate(funcMap, "base", "admin_accounts", "welcome")
 	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit", "welcome")
 	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback", "welcome")
+	tmplTLSRPT := templates.LoadTemplate(funcMap, "base", "admin_tls_rpt", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
@@ -73,6 +75,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		tmplAccounts:      tmplAccounts,
 		tmplAccountEdit:   tmplAccountEdit,
 		tmplDMARCFeedback: tmplDMARCFeedback,
+		tmplTLSRPT:        tmplTLSRPT,
 		enqueueFunc:       enqueueFunc,
 	}
 }
@@ -757,6 +760,150 @@ func (h *AdminHandler) SendDMARCReportsNow(w http.ResponseWriter, r *http.Reques
 	// Redirect back to DMARC feedback page with success message
 	w.Header().Set("X-Report-Status", fmt.Sprintf("Reports sent: %d/%d domains", sent, total))
 	http.Redirect(w, r, "/admin/dmarc-feedback?sent=1", http.StatusSeeOther)
+}
+
+// TLSRPTReports displays TLS-RPT failure statistics.
+func (h *AdminHandler) TLSRPTReports(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get time range query parameters (default to last 30 days)
+	now := time.Now()
+	defaultStart := now.AddDate(0, 0, -30)
+	startStr := r.URL.Query().Get("start")
+	if startStr == "" {
+		startStr = defaultStart.Format("2006-01-02")
+	}
+	startTime, _ := time.Parse("2006-01-02", startStr)
+
+	// Get all TLS failures for the time period
+	rows, err := h.db.Query(`
+		SELECT recipient_domain, failure_reason, COUNT(*) as count,
+		       SUM(CASE WHEN sending_mta_ip IS NOT NULL THEN 1 ELSE 0 END) as with_ip
+		FROM tls_failures
+		WHERE attempted_at >= datetime(?)
+		GROUP BY recipient_domain, failure_reason
+		ORDER BY recipient_domain ASC, count DESC
+	`, startTime.Format(time.RFC3339))
+	if err != nil {
+		log.Printf("[admin] error querying TLS failures: %v", err)
+		http.Error(w, "Error querying TLS failures", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type TLSFailureRow struct {
+		Domain        string
+		FailureReason string
+		Count         int
+		WithIP        int
+	}
+
+	var failures []TLSFailureRow
+	for rows.Next() {
+		var row TLSFailureRow
+		if err := rows.Scan(&row.Domain, &row.FailureReason, &row.Count, &row.WithIP); err != nil {
+			log.Printf("[admin] error scanning TLS failure row: %v", err)
+			continue
+		}
+		failures = append(failures, row)
+	}
+
+	// Get count of unreported failures
+	var unreportedCount int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM tls_failures WHERE sent_at IS NULL
+	`).Scan(&unreportedCount)
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":           "TLS-RPT Reports",
+		"Failures":        failures,
+		"StartStr":        startStr,
+		"EndStr":          now.Format("2006-01-02"),
+		"Unread":          unread,
+		"CSRFToken":       h.sessionMgr.GenerateCSRFToken(r),
+		"Section":         "admin",
+		"AdminPanel":      "tls-rpt",
+		"Account":         account,
+		"UnreportedCount": unreportedCount,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplTLSRPT.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// SendTLSRPTReportsNow generates and sends TLS-RPT reports immediately (for testing).
+func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+
+	// Trigger TLS-RPT report sending (last 7 days)
+	endTime := time.Now().UTC()
+	startTime := endTime.AddDate(0, 0, -7)
+
+	domains, err := h.db.GetDomainsWithTLSFailures()
+	if err != nil {
+		log.Printf("[admin] error getting domains with TLS failures: %v", err)
+		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	sent := 0
+	for _, domain := range domains {
+		report, err := reporting.GenerateTLSReport(h.db, h.cfg.Server.Hostname, domain, startTime, endTime)
+		if err != nil {
+			log.Printf("[admin] failed to generate TLS-RPT for %s: %v", domain, err)
+			continue
+		}
+
+		recipientEmail, err := reporting.ExtractTLSRPTAddress(domain)
+		if err != nil {
+			log.Printf("[admin] failed to extract TLS-RPT address for %s: %v", domain, err)
+			continue
+		}
+
+		// Use our organization's domain as sender
+		senderEmail := fmt.Sprintf("postmaster@%s", h.cfg.Server.Domain)
+		messageBody := reporting.BuildTLSRPTEmail(h.cfg.Server.Domain, senderEmail, report, recipientEmail)
+
+		if err := h.enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
+			log.Printf("[admin] failed to enqueue TLS-RPT report for %s: %v", domain, err)
+			continue
+		}
+
+		if err := h.db.MarkTLSFailuresAsReported(domain, startTime, endTime); err != nil {
+			log.Printf("[admin] failed to mark TLS-RPT as reported for %s: %v", domain, err)
+		}
+
+		sent++
+		log.Printf("[admin] queued TLS-RPT for %s -> %s", domain, recipientEmail)
+	}
+
+	// Log the action
+	log.Printf("[admin] user %s triggered manual TLS-RPT reports (total: %d, sent: %d)", account.Email, len(domains), sent)
+
+	// Redirect back to TLS-RPT page with success message
+	http.Redirect(w, r, "/admin/tls-rpt?sent=1", http.StatusSeeOther)
 }
 
 // extractPubKeyBase64 extracts the base64 public key from PEM format.

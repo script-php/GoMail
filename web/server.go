@@ -133,6 +133,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/admin/account/delete/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.AccountDelete)))
 	mux.Handle("/admin/dmarc-feedback", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DMARCFeedback)))
 	mux.Handle("/admin/dmarc-reports-manual", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.SendDMARCReportsNow)))
+	mux.Handle("/admin/tls-rpt", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.TLSRPTReports)))
+	mux.Handle("/admin/tls-rpt-manual", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.SendTLSRPTReportsNow)))
 }
 
 // GetHTTPServer returns the underlying http.Server for TLS configuration.

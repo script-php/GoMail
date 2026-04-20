@@ -1,0 +1,239 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>TLS-RPT Reports</h2>
+        <p class="subtitle">TLS connection failures to remote mail servers</p>
+        <div class="admin-actions">
+            {{if gt .UnreportedCount 0}}
+            <span class="badge" style="background: #ff9800; color: white; padding: 5px 10px; border-radius: 3px;">
+                {{.UnreportedCount}} unreported failure(s)
+            </span>
+            {{end}}
+            <form method="POST" action="/admin/tls-rpt-manual" style="display: inline;">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="btn btn-success" title="Generate and send TLS-RPT reports immediately for testing">
+                    📧 Send Reports Now
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <div class="filter-section">
+        <form method="GET" class="filter-form">
+            <label>Start Date:</label>
+            <input type="date" name="start" value="{{.StartStr}}">
+            <button type="submit" class="btn btn-primary">Filter</button>
+        </form>
+    </div>
+
+    <div class="info-box" style="background: #e3f2fd; border-left: 4px solid #2196f3; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>ℹ️ About TLS-RPT:</strong>
+        <p>TLS-RPT (RFC 8460) reports are automatically generated weekly (Sundays at 00:00 UTC) and sent to remote domains' TLS-RPT addresses.</p>
+        <p>These reports help remote mail server administrators detect and fix TLS certificate or configuration issues.</p>
+    </div>
+
+    {{if not .Failures}}
+    <div class="empty-state">
+        <p>No TLS failures recorded. All connections to remote servers were successful!</p>
+    </div>
+    {{else}}
+    <div class="feedback-stats">
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Remote Domain</th>
+                    <th>Failure Reason</th>
+                    <th>Count</th>
+                    <th>With Source IP</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{$prevDomain := ""}}
+                {{range .Failures}}
+                <tr>
+                    {{if ne .Domain $prevDomain}}
+                    <td><strong>{{.Domain}}</strong></td>
+                    {{else}}
+                    <td></td>
+                    {{end}}
+                    <td>
+                        {{if eq .FailureReason "certificate-expired"}}
+                        <span class="badge badge-danger">Certificate Expired</span>
+                        {{else if eq .FailureReason "certificate-not-trusted"}}
+                        <span class="badge badge-danger">Certificate Not Trusted</span>
+                        {{else if eq .FailureReason "certificate-host-mismatch"}}
+                        <span class="badge badge-warning">Hostname Mismatch</span>
+                        {{else if eq .FailureReason "connection-refused"}}
+                        <span class="badge badge-danger">Connection Refused</span>
+                        {{else if eq .FailureReason "tls-required"}}
+                        <span class="badge badge-warning">TLS Required</span>
+                        {{else}}
+                        <span class="badge badge-info">{{.FailureReason}}</span>
+                        {{end}}
+                    </td>
+                    <td class="text-center">{{.Count}}</td>
+                    <td class="text-center">{{.WithIP}}</td>
+                </tr>
+                {{$prevDomain = .Domain}}
+                {{end}}
+            </tbody>
+        </table>
+    </div>
+    {{end}}
+
+    <style>
+    .filter-section {
+        margin: 20px 0;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 4px;
+    }
+
+    .filter-form {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+    }
+
+    .filter-form label {
+        font-weight: bold;
+    }
+
+    .filter-form input[type="date"] {
+        padding: 8px 12px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+    }
+
+    .admin-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+        border-bottom: 2px solid #eee;
+        padding-bottom: 15px;
+    }
+
+    .admin-header h2 {
+        margin: 0;
+        color: #333;
+    }
+
+    .admin-header .subtitle {
+        margin: 5px 0 0 0;
+        color: #666;
+        font-size: 14px;
+    }
+
+    .admin-actions {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+    }
+
+    .badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 3px;
+        font-size: 12px;
+        font-weight: bold;
+    }
+
+    .badge-success {
+        background: #4caf50;
+        color: white;
+    }
+
+    .badge-danger {
+        background: #f44336;
+        color: white;
+    }
+
+    .badge-warning {
+        background: #ff9800;
+        color: white;
+    }
+
+    .badge-info {
+        background: #2196f3;
+        color: white;
+    }
+
+    .admin-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 15px;
+    }
+
+    .admin-table thead th {
+        background: #f5f5f5;
+        padding: 12px;
+        text-align: left;
+        font-weight: bold;
+        border-bottom: 2px solid #ddd;
+    }
+
+    .admin-table tbody td {
+        padding: 12px;
+        border-bottom: 1px solid #eee;
+    }
+
+    .admin-table tbody tr:hover {
+        background: #f9f9f9;
+    }
+
+    .text-center {
+        text-align: center;
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 40px;
+        background: #f9f9f9;
+        border-radius: 4px;
+        color: #666;
+    }
+
+    .info-box {
+        border-radius: 4px;
+    }
+
+    .info-box p {
+        margin: 8px 0;
+        font-size: 14px;
+    }
+
+    .info-box p:last-child {
+        margin-bottom: 0;
+    }
+
+    .btn {
+        padding: 10px 15px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: bold;
+    }
+
+    .btn-primary {
+        background: #2196f3;
+        color: white;
+    }
+
+    .btn-primary:hover {
+        background: #1976d2;
+    }
+
+    .btn-success {
+        background: #4caf50;
+        color: white;
+    }
+
+    .btn-success:hover {
+        background: #45a049;
+    }
+    </style>
+</div>
+{{end}}

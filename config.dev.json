@@ -2,7 +2,8 @@
   "_comment": "GoMail Configuration — all settings for your mail server DEVELOPMENT",
 
   "server": {
-    "hostname": "mail.example.com"
+    "hostname": "mail.example.com",
+    "domain": "example.com"
   },
 
   "smtp": {

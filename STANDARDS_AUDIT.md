@@ -100,9 +100,10 @@
 - ✅ **Bootstrap admin** - First-run setup
 - ✅ **Graceful shutdown** - SIGINT/SIGTERM stops SMTP, workers, web in order (main.go)
 
-### Reporting (Parse Only)
-- ✅ **DMARC report parsing** - Incoming XML aggregate reports (reporting/dmarc.go)
-- ✅ **TLS-RPT report parsing** - Incoming JSON reports (reporting/tlsrpt.go)
+### Reporting (Send & Receive)
+- ✅ **DMARC report parsing & generation** - Incoming/outgoing XML aggregate reports (reporting/dmarc.go)
+- ✅ **TLS-RPT report parsing & generation** - Incoming/outgoing JSON reports (reporting/tlsrpt.go)
+- ✅ **Report compression** - Both DMARC and TLS-RPT reports gzip-compressed per RFC standards (reporting/scheduler.go, reporting/tlsrpt.go)
 
 ### Wired But Incomplete
 - ✅ **ARC cryptographic verification** (FIXED April 6, 2026) - Full DKIM-style signature verification for both ARC-Message-Signature and ARC-Seal
@@ -270,9 +271,10 @@
   - **Implementation:** Parses DMARC DNS records, extracts rua= addresses, generates RFC 7489-compliant XML, enqueues for delivery
   - **Priority:** Complete
 
-- ❌ **TLS-RPT report sending** (RFC 8460) - Can parse incoming reports but **never generates or sends** them
-  - Impact: Remote domains don't receive your TLS failure telemetry
-  - **Priority:** Low
+- ✅ **TLS-RPT report sending** (RFC 8460) (FIXED April 19, 2026) - Full report generation and delivery
+  - **Implementation:** Automatic weekly (Sunday 00:00 UTC) TLS failure reporting
+  - **Features:** Records TLS failures, categorizes by reason, generates RFC 8460 JSON, DNS lookup for rua= addresses, gzip compression, admin UI
+  - **Status:** ✅ Operational - Remote domains receive TLS failure telemetry
 
 ### IPv6
 - ✅ **IPv6 outbound** (FIXED April 18, 2026) - Configurable network protocol (tcp4/tcp6/tcp)
@@ -432,7 +434,7 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ RFC 8461 (MTA-STS policy serving and **outbound enforcement**)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Recently Fixed (April 6-18, 2026):**
+**Recently Fixed (April 6-20, 2026):**
 - ✅ **ARC cryptographic verification** - Full DKIM-style signature validation for both ARC-Message-Signature and ARC-Seal
 - ✅ **TLS enforcement per domain** - Configurable strict-TLS mode with require_tls flag per domain
 - ✅ **SPF specification compliance** - DNS lookup counter (max 10), `exists` mechanism, `exp=` modifier, full macro expansion
@@ -452,6 +454,22 @@ GoMail implements the **essential SMTP standards** needed for reliable email del
 - ✅ **RFC 2047 filename decoding** - Attachment filenames from encoded-word format properly decoded
 - ✅ **IPv6 outbound support** - Configurable network protocol (tcp/tcp4/tcp6) with automatic fallback
 - ✅ **Attachment upload in compose** - Full support for file uploads with multipart/mixed RFC 2045 encoding, drag-drop UI, live validation (max 10 files, 25MB total)
+- ✅ **TLS-RPT full implementation** (April 19-20, 2026)
+  - Database schema (`tls_failures` table) for tracking TLS connection failures by reason
+  - RFC 8460 JSON report generation with time ranges and failure statistics
+  - DNS TXT lookup for `_smtp._tls.<domain>` to extract `rua=` addresses with multiple recipient support
+  - Gzip-compressed + base64-encoded report attachments
+  - Admin UI dashboard showing TLS failures, manual trigger for testing
+  - Automatic weekly scheduler (Sunday 00:00 UTC) alongside DMARC reports
+- ✅ **Report compression** (April 19-20, 2026) - Both DMARC and TLS-RPT now use gzip
+  - Changed DMARC from raw XML to gzip + base64 encoding
+  - Proper RFC 5322 CRLF line endings in email headers
+- ✅ **Report sender identity** (April 19-20, 2026) - Organization domain as sender
+  - Added `server.domain` config field (e.g., `"domain": "synovawire.com"`)
+  - Reports sent from `postmaster@<server.domain>` instead of `postmaster@<server.hostname>`
+- ✅ **MTA-STS testing mode fix** (April 19, 2026) - Testing mode now allows delivery
+  - Fixed: `testing` mode was incorrectly skipping non-policy MX hosts
+  - Now: Attempts delivery with warnings; only `enforce` mode skips unlisted hosts
 
 **What needs immediate attention:**
 

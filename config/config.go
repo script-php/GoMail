@@ -25,6 +25,7 @@ type Config struct {
 
 type ServerConfig struct {
 	Hostname string `json:"hostname"`
+	Domain   string `json:"domain"`
 }
 
 type SMTPConfig struct {
