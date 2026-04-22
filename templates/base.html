@@ -74,6 +74,12 @@
                     <span class="nav-text">DMARC Reports</span>
                 </a>
             </li>
+            <li class="{{if eq .AdminPanel "tls-rpt"}}active{{end}}">
+                <a href="/admin/tls-rpt">
+                    <span class="nav-icon">&#128194;</span>
+                    <span class="nav-text">TLS-RPT Reports</span>
+                </a>
+            </li>
             {{end}}
             {{else}}
             <li class="{{if eq .Section "inbox"}}active{{end}}">

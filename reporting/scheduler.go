@@ -1,6 +1,8 @@
 package reporting
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -44,7 +46,7 @@ func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (
 
 	successCount := 0
 	for _, domain := range domains {
-		if sendReportForDomain(cfg, db, enqueueFunc, domain) {
+		if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain) {
 			successCount++
 		}
 	}
@@ -73,31 +75,44 @@ func runWeeklyReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 }
 
 func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
-	log.Printf("[dmarc] starting weekly report generation...")
+	log.Printf("[reporting] starting weekly report generation...")
 
-	// Get all unique domains with DMARC feedback
-	domains, err := db.GetDomainsWithFeedback()
+	// Generate DMARC reports
+	dmarcDomains, err := db.GetDomainsWithFeedback()
 	if err != nil {
 		log.Printf("[dmarc] ❌ error getting domains with feedback: %v", err)
-		return
-	}
-
-	if len(domains) == 0 {
-		log.Printf("[dmarc] ℹ️  no domains with feedback to report")
-		return
-	}
-
-	reportCount := 0
-	for _, domain := range domains {
-		if sendReportForDomain(cfg, db, enqueueFunc, domain) {
-			reportCount++
+	} else if len(dmarcDomains) > 0 {
+		dmarcReportCount := 0
+		for _, domain := range dmarcDomains {
+			if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain) {
+				dmarcReportCount++
+			}
 		}
+		log.Printf("[dmarc] ✅ weekly report generation complete (%d/%d domains reported)", dmarcReportCount, len(dmarcDomains))
+	} else {
+		log.Printf("[dmarc] ℹ️  no domains with DMARC feedback to report")
 	}
 
-	log.Printf("[dmarc] ✅ weekly report generation complete (%d/%d domains reported)", reportCount, len(domains))
+	// Generate TLS-RPT reports
+	tlsRptDomains, err := db.GetDomainsWithTLSFailures()
+	if err != nil {
+		log.Printf("[tls-rpt] ❌ error getting domains with TLS failures: %v", err)
+	} else if len(tlsRptDomains) > 0 {
+		tlsReportCount := 0
+		for _, domain := range tlsRptDomains {
+			if sendTLSRPTReportForDomain(cfg, db, enqueueFunc, domain) {
+				tlsReportCount++
+			}
+		}
+		log.Printf("[tls-rpt] ✅ weekly report generation complete (%d/%d domains reported)", tlsReportCount, len(tlsRptDomains))
+	} else {
+		log.Printf("[tls-rpt] ℹ️  no domains with TLS failures to report")
+	}
+
+	log.Printf("[reporting] ✅ all weekly reports generated")
 }
 
-func sendReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain) bool {
+func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain) bool {
 	// Get the time of the last successful report for this domain
 	// If never reported, this returns epoch time (Jan 1, 1970)
 	lastReportTime, err := db.GetLastDMARCReportTime(domain.Domain)
@@ -134,11 +149,11 @@ func sendReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFu
 	}
 
 	// Generate XML report
-	// Use server's own domain as sender (not the DMARC domain being reported)
+	// Use our organization's domain as sender
 	policy := PolicyPublished{Domain: domain.Domain, P: "none"}
 	reportXML, err := GenerateDMARCAggregateReport(
 		domain.Domain,
-		fmt.Sprintf("postmaster@%s", cfg.Server.Hostname),
+		fmt.Sprintf("postmaster@%s", cfg.Server.Domain),
 		cfg.Server.Hostname,
 		policy,
 		records,
@@ -153,7 +168,7 @@ func sendReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFu
 	// Send to rua= addresses (aggregate reports)
 	sentCount := 0
 	for _, reportAddr := range dmarcRecord.ReportMailto {
-		if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Hostname, reportAddr, reportXML); err != nil {
+		if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Domain, reportAddr, reportXML); err != nil {
 			log.Printf("[dmarc] ❌ %s→%s: error sending report: %v", domain.Domain, reportAddr, err)
 		} else {
 			sentCount++
@@ -392,32 +407,37 @@ func spfResultToString(pass, total int) string {
 func sendDMARCReport(cfg *config.Config, enqueueFunc EnqueueFunc, reportedDomain, senderDomain, toAddr, reportXML string) error {
 	reportID := fmt.Sprintf("%d@%s", time.Now().Unix(), reportedDomain)
 
-	// Base64 encode the XML report
-	xmlB64 := base64.StdEncoding.EncodeToString([]byte(reportXML))
+	// Gzip compress the XML report (RFC 7489 compliant)
+	var compressedBuf bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressedBuf)
+	gzipWriter.Write([]byte(reportXML))
+	gzipWriter.Close()
 
-	messageBody := fmt.Sprintf(`From: postmaster@%s
-To: %s
-Subject: DMARC Report for %s
-Message-ID: <%s>
-Date: %s
-Content-Type: multipart/mixed; boundary="boundary123"
-MIME-Version: 1.0
+	// Base64 encode the compressed XML
+	xmlB64 := base64.StdEncoding.EncodeToString(compressedBuf.Bytes())
 
---boundary123
-Content-Type: text/plain; charset=utf-8
-Content-Transfer-Encoding: 7bit
-
-This is the DMARC aggregate report for %s.
-
---boundary123
-Content-Type: application/xml; name="report.xml"
-Content-Transfer-Encoding: base64
-Content-Disposition: attachment; filename="report.xml"
-
-%s
-
---boundary123--
-`,
+	messageBody := fmt.Sprintf(
+		"From: postmaster@%s\r\n"+
+			"To: %s\r\n"+
+			"Subject: DMARC Report for %s\r\n"+
+			"Message-ID: <%s>\r\n"+
+			"Date: %s\r\n"+
+			"Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n"+
+			"MIME-Version: 1.0\r\n"+
+			"\r\n"+
+			"--boundary123\r\n"+
+			"Content-Type: text/plain; charset=utf-8\r\n"+
+			"Content-Transfer-Encoding: 7bit\r\n"+
+			"\r\n"+
+			"This is the DMARC aggregate report for %s.\r\n"+
+			"\r\n"+
+			"--boundary123\r\n"+
+			"Content-Type: application/gzip; name=\"report.xml.gz\"\r\n"+
+			"Content-Transfer-Encoding: base64\r\n"+
+			"Content-Disposition: attachment; filename=\"report.xml.gz\"\r\n"+
+			"\r\n"+
+			"%s\r\n"+
+			"--boundary123--\r\n",
 		senderDomain,
 		toAddr,
 		reportedDomain,
@@ -428,4 +448,57 @@ Content-Disposition: attachment; filename="report.xml"
 	)
 
 	return enqueueFunc(fmt.Sprintf("postmaster@%s", senderDomain), toAddr, messageBody)
+}
+
+// sendTLSRPTReportForDomain generates and sends a TLS-RPT report for a domain
+func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain string) bool {
+	// Calculate time range (last 7 days)
+	endTime := time.Now().UTC()
+	startTime := endTime.AddDate(0, 0, -7)
+
+	// Generate the report
+	report, err := GenerateTLSReport(db, cfg.Server.Domain, domain, startTime, endTime)
+	if err != nil {
+		log.Printf("[tls-rpt] failed to generate report for %s: %v", domain, err)
+		return false
+	}
+
+	// Extract TLS-RPT report addresses from DNS (may be multiple)
+	recipientEmails, err := ExtractTLSRPTAddresses(domain)
+	if err != nil {
+		log.Printf("[tls-rpt] failed to extract TLS-RPT addresses for %s: %v", domain, err)
+		// Even if we can't send, mark as attempted so we don't retry forever
+		_ = db.MarkTLSFailuresAsReported(domain, startTime, endTime)
+		return false
+	}
+
+	// Use our organization's domain as sender
+	senderEmail := fmt.Sprintf("postmaster@%s", cfg.Server.Domain)
+	messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, recipientEmails[0])
+
+	// Send to each recipient address
+	sentCount := 0
+	for _, recipientEmail := range recipientEmails {
+		if err := enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
+			log.Printf("[tls-rpt] failed to enqueue report for %s -> %s: %v", domain, recipientEmail, err)
+		} else {
+			sentCount++
+			log.Printf("[tls-rpt] ✅ queued TLS-RPT report for %s -> %s", domain, recipientEmail)
+		}
+	}
+
+	if sentCount == 0 {
+		log.Printf("[tls-rpt] failed to queue TLS-RPT report for %s to any recipient", domain)
+		return false
+	}
+
+	// Mark failures as reported
+	if err := db.MarkTLSFailuresAsReported(domain, startTime, endTime); err != nil {
+		log.Printf("[tls-rpt] warning: failed to mark TLS failures as reported for %s: %v", domain, err)
+		// Non-fatal error, report was sent successfully
+	}
+
+	log.Printf("[tls-rpt] ✅ generated and queued TLS-RPT report for %s (%d recipients, %d failures)",
+		domain, len(recipientEmails), report.Policies[0].Summary.TotalFailureSessionCount)
+	return true
 }
