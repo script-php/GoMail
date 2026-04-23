@@ -4,15 +4,16 @@ import "time"
 
 // Domain represents a mail domain managed by this server.
 type Domain struct {
-	ID             int64     `json:"id"`
-	Domain         string    `json:"domain"`
-	IsActive       bool      `json:"is_active"`
-	DKIMSelector   string    `json:"dkim_selector"`
-	DKIMAlgorithm  string    `json:"dkim_algorithm"`
-	DKIMPrivateKey string    `json:"-"`
-	DKIMPublicKey  string    `json:"dkim_public_key"`
-	RequireTLS     bool      `json:"require_tls"`     // Fail delivery if TLS unavailable (RFC 8689)
-	CreatedAt      time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	Domain          string    `json:"domain"`
+	IsActive        bool      `json:"is_active"`
+	DKIMSelector    string    `json:"dkim_selector"`
+	DKIMAlgorithm   string    `json:"dkim_algorithm"`
+	DKIMPrivateKey  string    `json:"-"`
+	DKIMPublicKey   string    `json:"dkim_public_key"`
+	RequireTLS      bool      `json:"require_tls"`      // Fail delivery if TLS unavailable (RFC 8689)
+	DANEEnforcement string    `json:"dane_enforcement"` // "disabled" (default), "optional" (log only), "required" (fail)
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Account represents a user mailbox.
@@ -34,7 +35,7 @@ type Account struct {
 type Message struct {
 	ID             int64     `json:"id"`
 	AccountID      int64     `json:"account_id"`
-	FolderID       *int64    `json:"folder_id,omitempty"`  // NULL = inbox (for legacy compatibility)
+	FolderID       *int64    `json:"folder_id,omitempty"` // NULL = inbox (for legacy compatibility)
 	MessageID      string    `json:"message_id"`
 	Direction      string    `json:"direction"` // "inbound" or "outbound"
 	MailFrom       string    `json:"mail_from"`
@@ -57,9 +58,9 @@ type Message struct {
 	DKIMResult     string    `json:"dkim_result"`
 	DMARCResult    string    `json:"dmarc_result"`
 	AuthResults    string    `json:"auth_results"`
-	MDNRequested   bool      `json:"mdn_requested"`    // Sender requested read receipt
-	MDNAddress     string    `json:"mdn_address"`      // Where to send MDN
-	MDNSent        bool      `json:"mdn_sent"`         // Whether MDN was sent
+	MDNRequested   bool      `json:"mdn_requested"` // Sender requested read receipt
+	MDNAddress     string    `json:"mdn_address"`   // Where to send MDN
+	MDNSent        bool      `json:"mdn_sent"`      // Whether MDN was sent
 	ReceivedAt     time.Time `json:"received_at"`
 	CreatedAt      time.Time `json:"created_at"`
 }
@@ -87,10 +88,10 @@ type QueueEntry struct {
 	NextRetry   time.Time `json:"next_retry"`
 	LastError   string    `json:"last_error"`
 	Status      string    `json:"status"`
-	DSNNotify   string    `json:"dsn_notify"`    // DSN NOTIFY flags
-	DSNRet      string    `json:"dsn_ret"`      // FULL or HDRS
-	DSNEnvID    string    `json:"dsn_envid"`    // Envelope ID
-	DSNSent     bool      `json:"dsn_sent"`     // Whether DSN was sent
+	DSNNotify   string    `json:"dsn_notify"` // DSN NOTIFY flags
+	DSNRet      string    `json:"dsn_ret"`    // FULL or HDRS
+	DSNEnvID    string    `json:"dsn_envid"`  // Envelope ID
+	DSNSent     bool      `json:"dsn_sent"`   // Whether DSN was sent
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

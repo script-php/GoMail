@@ -12,6 +12,7 @@ import (
 	godns "gomail/dns"
 	"gomail/mta_sts"
 	"gomail/store"
+	tlsconfig "gomail/tls"
 )
 
 // SendMail delivers a message to a remote SMTP server via MX lookup.
@@ -21,23 +22,30 @@ import (
 // network: "tcp" (both IPv4 and IPv6), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
 // db: database for recording TLS failures (optional, can be nil)
 func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB) error {
+	// Extract sender domain (for DANE/TLS settings lookup)
+	fromParts := strings.SplitN(from, "@", 2)
+	senderDomain := ""
+	if len(fromParts) == 2 {
+		senderDomain = fromParts[1]
+	}
+
 	// Extract recipient domain
 	parts := strings.SplitN(to, "@", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid recipient address: %s", to)
 	}
-	domain := parts[1]
+	recipientDomain := parts[1]
 
 	// Fetch MTA-STS policy for recipient domain
-	policy := mta_sts.FetchPolicy(domain)
+	policy := mta_sts.FetchPolicy(recipientDomain)
 	if policy != nil {
-		log.Printf("[mta-sts] policy mode for %s: %s", domain, policy.Mode)
+		log.Printf("[mta-sts] policy mode for %s: %s", recipientDomain, policy.Mode)
 	}
 
 	// MX lookup
-	mxRecords, err := godns.LookupMX(domain)
+	mxRecords, err := godns.LookupMX(recipientDomain)
 	if err != nil {
-		return fmt.Errorf("MX lookup for %s: %w", domain, err)
+		return fmt.Errorf("MX lookup for %s: %w", recipientDomain, err)
 	}
 
 	// Try each MX in preference order
@@ -58,10 +66,10 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			if policy.Mode == "enforce" {
 				// Enforce mode: skip hosts not in policy and require TLS
 				if !hostAllowed {
-					log.Printf("[mta-sts] MX host %s not in policy for %s, skipping", mx.Host, domain)
+					log.Printf("[mta-sts] MX host %s not in policy for %s, skipping", mx.Host, recipientDomain)
 					continue
 				}
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID, network, db, domain)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
 				if err == nil {
 					return nil // Success
 				}
@@ -70,9 +78,9 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			} else if policy.Mode == "testing" {
 				// Testing mode: log violations but allow delivery (even if host not in policy)
 				if !hostAllowed {
-					log.Printf("[mta-sts] TESTING: MX host %s not in policy for %s, but attempting anyway", mx.Host, domain)
+					log.Printf("[mta-sts] TESTING: MX host %s not in policy for %s, but attempting anyway", mx.Host, recipientDomain)
 				}
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, db, domain)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
 				if err == nil {
 					log.Printf("[mta-sts] TESTING delivery to %s succeeded", mx.Host)
 					return nil
@@ -82,7 +90,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			}
 		} else {
 			// No policy or mode=none: use normal delivery with original requireTLS setting
-			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, domain)
+			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
 			if err == nil {
 				return nil // Success
 			}
@@ -91,15 +99,16 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 		}
 	}
 
-	return fmt.Errorf("all MX hosts failed for %s: %w", domain, lastErr)
+	return fmt.Errorf("all MX hosts failed for %s: %w", recipientDomain, lastErr)
 }
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
 // requireTLS: if true, fails delivery if TLS cannot be established; if false, uses opportunistic TLS
 // network: "tcp" (both IPv4 and IPv6), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
 // db: database for recording TLS failures (optional, can be nil)
-// domain: recipient domain for TLS failure reporting (optional, used only if db != nil)
-func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, domain string) error {
+// recipientDomain: recipient domain for TLS failure reporting (optional, used only if db != nil)
+// senderDomain: sender domain for DANE/TLS enforcement settings lookup
+func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, senderDomain string) error {
 	// Connect to port 25
 	addr := host + ":25"
 	conn, err := net.DialTimeout(network, addr, 30*time.Second)
@@ -147,7 +156,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 				})
 				if err := clientTLS.Handshake(); err != nil {
 					// Record TLS failure for TLS-RPT reporting
-					if db != nil && domain != "" {
+					if db != nil && recipientDomain != "" {
 						failureReason := "certificate-not-trusted"
 						if strings.Contains(err.Error(), "certificate") {
 							if strings.Contains(err.Error(), "expired") {
@@ -162,7 +171,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 						if conn.LocalAddr() != nil {
 							clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
 						}
-						_ = db.RecordTLSFailure(domain, failureReason, clientIP, host, strings.Split(addr, ":")[0])
+						_ = db.RecordTLSFailure(recipientDomain, failureReason, clientIP, host, strings.Split(addr, ":")[0])
 					}
 
 					if requireTLS {
@@ -171,6 +180,70 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					log.Printf("[smtp] STARTTLS handshake with %s failed: %v (continuing with opportunistic TLS disabled)", host, err)
 				} else {
 					conn = clientTLS
+
+					// DANE verification (RFC 6698): Check certificate against TLSA records
+					// Fetch DANE enforcement setting from sender domain config
+					daneEnforcement := "disabled"
+					if db != nil && senderDomain != "" {
+						domainObj, err := db.GetDomainByName(senderDomain)
+						if err == nil && domainObj != nil && domainObj.DANEEnforcement != "" {
+							daneEnforcement = domainObj.DANEEnforcement
+						}
+					}
+
+					// Only query DANE if enforcement is not disabled (avoid unnecessary DNS queries)
+					if daneEnforcement != "disabled" {
+						daneValid, daneDetails, daneErr := tlsconfig.VerifyDANE(host, clientTLS)
+						clientIP := "unknown"
+						if conn.LocalAddr() != nil {
+							clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
+						}
+
+						if daneErr != nil {
+							log.Printf("[dane] DANE verification lookup failed for %s: %v", host, daneErr)
+							if daneEnforcement == "required" {
+								return fmt.Errorf("DANE verification required but lookup failed for %s: %v", host, daneErr)
+							} else if daneEnforcement == "optional" {
+								log.Printf("[dane] DANE enforcement OPTIONAL: allowing delivery despite lookup failure")
+							}
+						} else if daneValid {
+							log.Printf("[dane] DANE verification passed for %s: %s", host, daneDetails)
+						} else if daneDetails == "no TLSA records found (DANE not configured)" {
+							// No TLSA records found
+							if daneEnforcement == "required" {
+								// Record DANE verification failure for TLS-RPT reporting
+								if db != nil && recipientDomain != "" {
+									_ = db.RecordTLSFailure(recipientDomain, "tlsa-missing", clientIP, host,
+										strings.Split(addr, ":")[0])
+									log.Printf("[dane] DANE enforcement REQUIRED: no TLSA records found, recorded failure for TLS-RPT")
+								}
+								return fmt.Errorf("DANE verification required but no TLSA records found for %s", host)
+							} else if daneEnforcement == "optional" {
+								// optional mode: TLSA not configured, use standard TLS
+								log.Printf("[dane] no TLSA records for %s (DANE not configured, optional mode allows standard TLS)", host)
+							}
+						} else {
+							// TLSA records exist but certificate doesn't match
+							log.Printf("[dane] WARNING: DANE verification failed for %s: %s", host, daneDetails)
+
+							// Handle DANE enforcement level
+							if daneEnforcement == "required" {
+								// Record DANE verification failure for TLS-RPT reporting
+								if db != nil && recipientDomain != "" {
+									_ = db.RecordTLSFailure(recipientDomain, "tlsa-invalid-certificate", clientIP, host,
+										strings.Split(addr, ":")[0])
+									log.Printf("[dane] DANE enforcement REQUIRED: recorded failure for TLS-RPT")
+								}
+								return fmt.Errorf("DANE verification required but failed for %s: %s", host, daneDetails)
+							} else if daneEnforcement == "optional" {
+								// Log warning but continue - allow fallback to standard TLS
+								log.Printf("[dane] DANE enforcement OPTIONAL: allowing delivery despite DANE failure")
+							}
+						}
+					} else {
+						log.Printf("[dane] DANE verification disabled for %s (skipping TLSA queries)", host)
+					}
+
 					// Re-EHLO after STARTTLS and update DSN/UTF8 support flags
 					if err := sendCmd(conn, fmt.Sprintf("EHLO %s", myHostname)); err == nil {
 						postTLSEhlo, _ := readReply(conn)
@@ -182,12 +255,12 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		}
 	} else if requireTLS && !strings.Contains(ehloReply, "STARTTLS") {
 		// TLS required but server doesn't support STARTTLS
-		if db != nil && domain != "" {
+		if db != nil && recipientDomain != "" {
 			clientIP := "unknown"
 			if conn.LocalAddr() != nil {
 				clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
 			}
-			_ = db.RecordTLSFailure(domain, "connection-refused", clientIP, host, strings.Split(addr, ":")[0])
+			_ = db.RecordTLSFailure(recipientDomain, "connection-refused", clientIP, host, strings.Split(addr, ":")[0])
 		}
 		return fmt.Errorf("TLS required but %s does not support STARTTLS", host)
 	}

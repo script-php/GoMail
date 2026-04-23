@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS domains (
     dkim_private_key TEXT NOT NULL DEFAULT '',  -- PEM-encoded private key
     dkim_public_key  TEXT NOT NULL DEFAULT '',  -- Base64 public key for DNS
     require_tls     INTEGER NOT NULL DEFAULT 0,  -- 1 = fail if TLS unavailable, 0 = opportunistic TLS
+    dane_enforcement TEXT NOT NULL DEFAULT 'disabled',  -- disabled, optional, required
     created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 

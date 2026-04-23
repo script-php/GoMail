@@ -51,6 +51,16 @@
             </label>
         </div>
 
+        <div class="form-group">
+            <label for="dane_enforcement">DANE Verification (RFC 6698)</label>
+            <select id="dane_enforcement" name="dane_enforcement">
+                <option value="disabled" {{if eq .Domain.DANEEnforcement "disabled"}}selected{{end}}>Disabled (standard TLS only)</option>
+                <option value="optional" {{if eq .Domain.DANEEnforcement "optional"}}selected{{end}}>Optional (log warnings if TLSA records exist but don't match)</option>
+                <option value="required" {{if eq .Domain.DANEEnforcement "required"}}selected{{end}}>Required (fail delivery if TLSA records don't match)</option>
+            </select>
+            <small>DANE provides additional security by validating TLS certificates against DNS TLSA records. See <a href="https://tools.ietf.org/html/rfc6698" target="_blank">RFC 6698</a>.</small>
+        </div>
+
         <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Domain{{else}}Save Changes{{end}}</button>
     </form>
 

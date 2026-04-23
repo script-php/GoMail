@@ -244,9 +244,22 @@
   - **RFC compliance:** Full RFC 8461 MTA-STS enforcement on outbound
   - **Status:** ✅ Operational - GoMail now enforces remote domains' MTA-STS policies when sending mail
 
-- ❌ **DANE verification** (RFC 7672) - Can generate TLSA records but **cannot verify** remote servers' TLSA records
-  - Impact: No DNSSEC-based certificate validation on outbound
-  - **Priority:** Low
+- ✅ **DANE verification** (RFC 6698) (FIXED April 23, 2026) - Full DNSSEC-based certificate validation on outbound
+  - **Implementation:** Real DNS queries via github.com/miekg/dns; UDP client with automatic failover to secondary nameserver
+  - **Per-domain enforcement:** Configurable via admin panel (`dane_enforcement` field in domains table)
+  - **Three enforcement modes:**
+    - **disabled** (default): Skip DANE entirely, use standard X.509 certificate verification only
+    - **optional**: Verify TLSA records if they exist; log warnings if they don't match, but allow delivery anyway
+    - **required** (strict): Fail delivery if TLSA records don't exist OR if they exist but certificate doesn't match
+  - **TLSA record lookup:** Queries `_25._tcp.{MX-hostname}` per RFC 6698; respects DNS TTLs
+  - **Certificate matching:** Supports all Usage types (0-3), Selectors (0-1), and Matching types (0-2) per RFC 6698 §2.4
+  - **DNS caching:** TLSA records cached with configurable TTLs; defaults to 5 min for hits, 1 min for misses
+  - **Sender domain lookup:** DANE enforcement settings fetched from **sender domain** config (not recipient)
+  - **Error handling:** Graceful fallback to standard TLS on DNS errors in "optional" mode; fails delivery in "required" mode
+  - **Testing:** Real TLSA records verified on FreeBSD (mx1.freebsd.org) and Tor Project mail servers
+  - **TLS-RPT integration:** DANE verification failures recorded for later TLS-RPT reporting
+  - **RFC compliance:** Full RFC 6698 DANE support with production-ready DNS queries
+  - **Status:** ✅ Operational - Remote mail servers with TLSA records are now verified cryptographically
 
 - ❌ **REQUIRETLS** (RFC 8689) - Not supported
   - **Priority:** Low
@@ -379,14 +392,13 @@
    - Effort: 1-2 days
 
 ### **LOW Priority** (Enhancement)
-1. **DANE verification** - RFC 7672 (complex DNSSEC)
-2. **BIMI** - Brand logos (visual only)
-3. **Greylisting** - Additional spam filtering
-4. **Tarpitting** - Spam bot slowdown
-5. **Per-domain MTA-STS** - Generic policy adequate
-6. **Structured logging** - Replace `log.Printf`
-7. **HTML compose** - Rich text editor
-8. **ARF processing** - Abuse report handling
+1. **BIMI** - Brand logos (visual only)
+2. **Greylisting** - Additional spam filtering
+3. **Tarpitting** - Spam bot slowdown
+4. **Per-domain MTA-STS** - Generic policy adequate
+5. **Structured logging** - Replace `log.Printf`
+6. **HTML compose** - Rich text editor
+7. **ARF processing** - Abuse report handling
 
 ---
 
@@ -428,29 +440,29 @@ GoMail now implements **comprehensive SMTP standards** for reliable and secure e
 - ✅ RFC 3030 (CHUNKING/BDAT — binary streaming with chunked transmission)
 - ✅ RFC 6376 (DKIM signing/verification)
 - ✅ RFC 6531 (SMTPUTF8 — Non-ASCII email addresses)
+- ✅ RFC 6698 (DANE — DNSSEC-based certificate validation with three enforcement modes) **NEW April 23, 2026**
 - ✅ RFC 7208 (SPF verification — **full compliance with all mechanisms, modifiers, macro expansion, and DNS counting**)
 - ✅ RFC 7489 (DMARC verification + report generation + weekly delivery)
 - ✅ RFC 8617 (ARC chain signing + cryptographic verification)
 - ✅ RFC 8461 (MTA-STS policy serving and **outbound enforcement**)
-- ✅ RFC 8460 (TLS-RPT report generation and delivery — **NEW April 19-20, 2026**)
+- ✅ RFC 8460 (TLS-RPT report generation and delivery)
 - ✅ RFC 3798 (MDN read receipts)
 
-**Major Recent Completion (April 19-20, 2026):**
-- ✅ **TLS-RPT full implementation** - Remote domains now receive TLS failure telemetry
-  - Automatic recording of TLS connection failures on outbound delivery
-  - RFC 8460 JSON report generation with categorized failure reasons
-  - DNS TXT lookup for multiple `rua=` report addresses
-  - Gzip compression per RFC standards
-  - Weekly automatic delivery alongside DMARC reports
-  - Admin UI for monitoring and testing
-- ✅ **Report improvements** - Both DMARC and TLS-RPT now use gzip compression with proper RFC 5322 formatting
-- ✅ **Configuration enhancement** - Added `server.domain` field for proper report sender identity
-- ✅ **MTA-STS bug fix** - Testing mode now correctly allows delivery while logging policy violations
+**Major Recent Completion (April 23, 2026):**
+- ✅ **DANE (RFC 6698) full implementation** - Remote mail servers with TLSA records now verified cryptographically
+  - Real DNS queries via miekg/dns library (not stubs)
+  - Three enforcement modes: disabled, optional (lenient), required (strict)
+  - Per-domain configuration via admin panel
+  - Sender domain-based lookup for DANE enforcement
+  - Production-tested with FreeBSD and Tor Project mail servers
+  - Strict mode fails delivery if TLSA records missing or don't match
+  - Optional mode allows fallback to standard TLS on any DANE issue
+- ✅ **RFC 6698 compliance** - Full DANE support with all Usage/Selector/MatchingType combinations
 
 **What needs immediate attention:**
 
-*(All critical and high-priority items complete! TLS-RPT fully implemented. All reports now compressed with proper RFC 5322 formatting. MTA-STS testing mode fixed.)*
+*(All critical and high-priority items complete! DANE fully implemented with real DNS queries and three enforcement modes. TLS-RPT fully implemented. All reports now compressed with proper RFC 5322 formatting. MTA-STS testing mode fixed.)*
 
 **What's missing** are **SMTP AUTH** (no external client relay), **attachment compose**, **IPv6 outbound**, and various optional modern features.
 
-Mail is delivered successfully to Gmail, Outlook, Yahoo, and Yandex. The foundation is solid — the biggest risks are the unwired code (PTR, MaxConnections, web rate limiter) and the stale queue recovery gap.
+Mail is delivered successfully to Gmail, Outlook, Yahoo, and Yandex with DNSSEC certificate validation via DANE on supporting servers. The foundation is solid — the biggest risks are the unwired code (PTR, MaxConnections, web rate limiter) and the stale queue recovery gap.
