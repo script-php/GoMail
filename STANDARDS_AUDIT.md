@@ -9,7 +9,7 @@
 ## ✅ FULLY IMPLEMENTED
 
 ### Core RFC 5321 SMTP Compliance
-- ✅ **EHLO/HELO** - Both supported, EHLO preferred (smtp/session.go)
+- ✅ **EHLO/HELO** - Both supported, EHLO preferred; arguments validated per RFC 5321 (FQDN, address literals, or localhost only) (smtp/session.go)
 - ✅ **Line endings** - Handles CRLF, LF properly (bufio.Reader)
 - ✅ **8BITMIME** - Advertised in EHLO
 - ✅ **ENHANCEDSTATUSCODES** - Advertised in EHLO
@@ -340,8 +340,6 @@
 - ❌ **Greylisting** - No temporary rejection of unknown senders
   - **Priority:** Low
 - ❌ **Tarpitting** - No delays on failed commands
-  - **Priority:** Low
-- ❌ **HELO validation** - HELO argument stored but never validated (no FQDN check, no rDNS check)
   - **Priority:** Low
 - ❌ **Greeting delay** - 220 banner sent immediately
   - **Priority:** Low

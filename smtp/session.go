@@ -142,6 +142,12 @@ func (s *Session) handleCommand(line string) {
 }
 
 func (s *Session) handleEHLO(arg string) {
+	// Validate HELO/EHLO argument per RFC 5321 §4.1.1.1
+	if err := s.validateHeloEhlo(arg); err != nil {
+		s.send(501, fmt.Sprintf("Bad EHLO syntax: %v", err))
+		return
+	}
+
 	s.ehlo = arg
 	s.reset()
 	s.state = StateReady
@@ -176,10 +182,77 @@ func (s *Session) handleEHLO(arg string) {
 }
 
 func (s *Session) handleHELO(arg string) {
+	// Validate HELO/EHLO argument per RFC 5321 §4.1.1.1
+	if err := s.validateHeloEhlo(arg); err != nil {
+		s.send(501, fmt.Sprintf("Bad HELO syntax: %v", err))
+		return
+	}
+
 	s.ehlo = arg
 	s.reset()
 	s.state = StateReady
 	s.send(250, fmt.Sprintf("%s Hello %s", s.hostname, arg))
+}
+
+// validateHeloEhlo validates HELO/EHLO argument per RFC 5321 §4.1.1.1
+// Must be either a domain name or an address literal
+func (s *Session) validateHeloEhlo(arg string) error {
+	if arg == "" {
+		return fmt.Errorf("empty HELO/EHLO argument")
+	}
+
+	// Check for address literal format: [IPv4] or [IPv6:...]
+	if len(arg) > 2 && arg[0] == '[' && arg[len(arg)-1] == ']' {
+		inner := arg[1 : len(arg)-1]
+		// IPv6 check
+		if strings.Contains(inner, ":") {
+			// IPv6 address
+			if ip := net.ParseIP(inner); ip != nil && ip.To4() == nil {
+				log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (IPv6 literal)", arg, s.clientAddr)
+				return nil
+			}
+			return fmt.Errorf("invalid IPv6 address literal: %s", inner)
+		}
+		// IPv4 check
+		if ip := net.ParseIP(inner); ip != nil && ip.To4() != nil {
+			log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (IPv4 literal)", arg, s.clientAddr)
+			return nil
+		}
+		return fmt.Errorf("invalid IPv4 address literal: %s", inner)
+	}
+
+	// Domain name check: must contain at least one dot (FQDN) or be "localhost"
+	if arg == "localhost" {
+		log.Printf("[smtp] HELO/EHLO validation passed for 'localhost' from %s", s.clientAddr)
+		return nil
+	}
+
+	if !strings.Contains(arg, ".") {
+		return fmt.Errorf("domain name must be a FQDN (contain at least one dot), got: %s", arg)
+	}
+
+	// Basic sanity check: domain should not start with dot or hyphen
+	if strings.HasPrefix(arg, ".") || strings.HasPrefix(arg, "-") {
+		return fmt.Errorf("invalid domain format: starts with invalid character")
+	}
+
+	// Check each label is valid
+	labels := strings.Split(arg, ".")
+	for _, label := range labels {
+		if label == "" {
+			return fmt.Errorf("domain contains empty label")
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("domain label exceeds 63 chars: %s", label)
+		}
+		// Labels should be alphanumeric + hyphens (but not start/end with hyphen)
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("domain label cannot start or end with hyphen: %s", label)
+		}
+	}
+
+	log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (domain name)", arg, s.clientAddr)
+	return nil
 }
 
 func (s *Session) handleSTARTTLS() {
