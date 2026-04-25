@@ -75,9 +75,26 @@
             <small>How long to wait before accepting mail from new sender/IP combinations (5-480 minutes, default 15 minutes).</small>
         </div>
 
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="tarpitting_enabled" name="tarpitting_enabled" value="1" {{if .Domain.TarpittingEnabled}}checked{{end}}>
+                Enable Tarpitting (spam bot slowdown)
+            </label>
+            <small>Tarpitting introduces artificial delays on repeated invalid SMTP commands, making spam campaigns inefficient while not affecting legitimate mail servers.</small>
+        </div>
+
+        <div class="form-group" id="tarpitting_delay_group" {{if not .Domain.TarpittingEnabled}}style="display:none;"{{end}}>
+            <label for="tarpitting_max_delay_seconds">Tarpitting Max Delay (seconds)</label>
+            <input type="number" id="tarpitting_max_delay_seconds" name="tarpitting_max_delay_seconds" min="1" max="30" value="{{.Domain.TarpittingMaxDelaySecs}}" placeholder="8">
+            <small>Maximum delay to apply (1-30 seconds, default 8 seconds). Progressive delays: 0s → 1s → 2s → 4s → max.</small>
+        </div>
+
         <script>
             document.getElementById('greylisting_enabled').addEventListener('change', function() {
                 document.getElementById('greylisting_delay_group').style.display = this.checked ? 'block' : 'none';
+            });
+            document.getElementById('tarpitting_enabled').addEventListener('change', function() {
+                document.getElementById('tarpitting_delay_group').style.display = this.checked ? 'block' : 'none';
             });
         </script>
 

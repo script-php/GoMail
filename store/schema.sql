@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS domains (
     dane_enforcement TEXT NOT NULL DEFAULT 'disabled',  -- disabled, optional, required
     greylisting_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = enable greylisting, 0 = disable
     greylisting_delay_minutes INTEGER NOT NULL DEFAULT 15,  -- Minutes to wait before accepting from new sender triplet
+    tarpitting_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = enable tarpitting, 0 = disable
+    tarpitting_max_delay_seconds INTEGER NOT NULL DEFAULT 8,  -- Max delay in seconds for repeated failures
     created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -181,3 +183,21 @@ CREATE TABLE IF NOT EXISTS greylisting (
 CREATE INDEX IF NOT EXISTS idx_greylisting_domain ON greylisting(recipient_domain);
 CREATE INDEX IF NOT EXISTS idx_greylisting_triplet ON greylisting(remote_ip, sender_email, recipient_email);
 CREATE INDEX IF NOT EXISTS idx_greylisting_first_seen ON greylisting(first_seen);
+
+-- Tarpitting: track failed SMTP commands per IP for spam mitigation
+CREATE TABLE IF NOT EXISTS tarpitting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_domain TEXT NOT NULL,         -- Domain this tarpitting record is for
+    remote_ip TEXT NOT NULL,                -- Sending server IP
+    failure_count INTEGER NOT NULL DEFAULT 1,  -- Number of failures from this IP
+    last_invalid_command TEXT NOT NULL DEFAULT 'unknown',  -- Type of last invalid command
+    first_failure DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we first saw a failure
+    last_failure DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we last saw a failure
+    whitelisted_at DATETIME,                -- When manually whitelisted (NULL = not whitelisted)
+    notes TEXT NOT NULL DEFAULT '',         -- Admin notes
+    UNIQUE(recipient_domain, remote_ip)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tarpitting_domain ON tarpitting(recipient_domain);
+CREATE INDEX IF NOT EXISTS idx_tarpitting_ip ON tarpitting(remote_ip);
+CREATE INDEX IF NOT EXISTS idx_tarpitting_first_failure ON tarpitting(first_failure);

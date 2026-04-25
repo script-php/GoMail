@@ -1,0 +1,103 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>Tarpitting: {{.Domain.Domain}}</h2>
+        <p class="subtitle">Manage artificial delays on repeated failed SMTP commands</p>
+        <div class="admin-actions">
+            <a href="/admin/domains" class="btn btn-secondary">← Back to Domains</a>
+        </div>
+    </div>
+
+    <div class="info-box" style="background: #e8f5e9; border-left: 4px solid #4caf50; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>✅ Tarpitting Status:</strong>
+        {{if .Domain.TarpittingEnabled}}
+        <span style="color: #4caf50; font-weight: bold;">ENABLED</span> 
+        (Max delay: {{.Domain.TarpittingMaxDelaySecs}} seconds)
+        {{else}}
+        <span style="color: #f44336; font-weight: bold;">DISABLED</span>
+        {{end}}
+        <p>Tarpitting introduces artificial delays on invalid SMTP commands, making spam campaigns inefficient while not affecting legitimate mail servers.</p>
+    </div>
+
+    <div class="info-box" style="background: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>How Tarpitting Works:</strong>
+        <ul style="margin: 10px 0 0 20px;">
+            <li><strong>1st invalid:</strong> 0s delay (free pass for typos)</li>
+            <li><strong>2nd invalid:</strong> 2s delay</li>
+            <li><strong>3rd invalid:</strong> 4s delay</li>
+            <li><strong>4th invalid:</strong> 8s delay</li>
+            <li><strong>5th invalid:</strong> 16s delay</li>
+            <li><strong>6+ invalid:</strong> max delay (capped)</li>
+            <li><strong>Reset:</strong> After 1 hour with no failures</li>
+        </ul>
+    </div>
+
+    {{if .Entries}}
+        <table class="admin-table" style="width: 100%; border-collapse: collapse;">
+            <thead style="background-color: #f5f5f5; border-bottom: 2px solid #ddd;">
+                <tr>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Remote IP</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Failures</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Last Command</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">First Seen</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Hours Ago</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Delay</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Status</th>
+                    <th style="padding: 12px; text-align: left; font-weight: 600;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .Entries}}
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 12px;"><code>{{.RemoteIP}}</code></td>
+                    <td style="padding: 12px;">{{.FailureCount}}</td>
+                    <td style="padding: 12px;">{{.LastInvalidCommand}}</td>
+                    <td style="padding: 12px;">{{.FirstFailure.Format "2006-01-02 15:04"}}</td>
+                    <td style="padding: 12px;">{{.HoursAgo}}h</td>
+                    <td style="padding: 12px;">
+                        {{if .WhitelistedAt.Valid}}
+                            <span style="color: #4caf50; font-weight: bold;">Whitelisted</span>
+                        {{else}}
+                            {{.DelaySeconds}}s
+                        {{end}}
+                    </td>
+                    <td style="padding: 12px;">
+                        {{if .WhitelistedAt.Valid}}
+                            <span style="background-color: #c8e6c9; color: #1b5e20; padding: 4px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600;">Whitelisted</span>
+                        {{else if gt .FailureCount 3}}
+                            <span style="background-color: #ffcdd2; color: #b71c1c; padding: 4px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600;">High Activity</span>
+                        {{else}}
+                            <span style="background-color: #fff9c4; color: #f57f17; padding: 4px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600;">Active</span>
+                        {{end}}
+                    </td>
+                    <td style="padding: 12px;">
+                        {{if not .WhitelistedAt.Valid}}
+                            <form method="post" style="display: inline;">
+                                <button type="submit" name="action" value="whitelist" class="btn btn-primary">Whitelist</button>
+                                <input type="hidden" name="entry_id" value="{{.ID}}">
+                                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                            </form>
+                        {{end}}
+                        <form method="post" style="display: inline;">
+                            <button type="submit" name="action" value="delete" class="btn btn-danger" onclick="return confirm('Delete this entry?')">Delete</button>
+                            <input type="hidden" name="entry_id" value="{{.ID}}">
+                            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                        </form>
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+    {{else}}
+        <p style="text-align: center; padding: 2rem; color: #999; font-style: italic;">No tarpitting entries for this domain.</p>
+    {{end}}
+
+    <div class="help-section" style="background-color: #f0f7ff; padding: 15px; border-radius: 4px; margin-top: 20px; border-left: 4px solid #2196f3;">
+        <h3 style="color: #1565c0; margin-top: 0;">Actions</h3>
+        <ul style="list-style-type: none; padding-left: 0; margin: 0;">
+            <li style="margin: 8px 0; padding-left: 20px; position: relative;"><span style="position: absolute; left: 0;">→</span> <strong>Whitelist:</strong> Stop applying delays to this IP (for trusted senders)</li>
+            <li style="margin: 8px 0; padding-left: 20px; position: relative;"><span style="position: absolute; left: 0;">→</span> <strong>Delete:</strong> Remove this entry from tracking</li>
+        </ul>
+    </div>
+</div>
+{{end}}

@@ -1,11 +1,11 @@
 # GoMail Comprehensive Code Audit
 
-**Date:** April 25, 2026  
+**Date:** April 26, 2026  
 **Analysis Method:** Source code verification (actual implementation checked against claims)  
 **Total Features Audited:** 47  
-**Fully Implemented:** 38 (81%)  
+**Fully Implemented:** 39 (83%)  
 **Partially Implemented:** 2 (4%)  
-**Not Implemented:** 7 (15%)
+**Not Implemented:** 6 (13%)
 
 ---
 
@@ -19,12 +19,12 @@ GoMail implements a **production-ready mailserver** with **comprehensive SMTP st
 ✅ Production-grade queue/retry system with stale entry recovery  
 ✅ International email support (SMTPUTF8, UTF-8 headers)  
 ✅ Advanced reporting (DMARC aggregate + TLS-RPT)  
-✅ Outbound security (MTA-STS enforcement, per-domain TLS, DANE verification)  
+✅ Outbound security (MTA-STS enforcement, per-domain TLS, DANE verification) 
+✅ Greylisting (anti-spam feature)  
+✅ Tarpitting (anti-spam feature) 
 
 ### Key Gaps
-❌ SMTP AUTH (intentionally omitted for webmail)  
-✅ Greylisting (anti-spam feature) — FULLY IMPLEMENTED  
-❌ Tarpitting (optional anti-spam feature)  
+❌ SMTP AUTH (intentionally omitted for webmail)
 ❌ HTML email composition (plain text only)  
 ❌ Session token rotation  
 ❌ VERP support  
@@ -468,11 +468,22 @@ capabilities := []string{
 - **Priority:** Medium (effective inbound spam mitigation for multi-domain mail server)
 
 #### 5.6 Tarpitting
-**Status:** ❌ **NOT IMPLEMENTED**  
-**Issue:**
-- No artificial delays on failed commands
-- No progressive delays on repeated failures
-- **Priority:** Low (optional spam mitigation)
+**Status:** ✅ **FULLY IMPLEMENTED** (April 26, 2026)  
+**Location:** [store/schema.sql](store/schema.sql), [store/messages.go](store/messages.go#L815-L920), [smtp/session.go](smtp/session.go#L535-L555), [web/handlers/admin.go](web/handlers/admin.go#L1075-L1120), [templates/admin_tarpitting.html](templates/admin_tarpitting.html)  
+**Details:**
+- **Per-domain configuration:** Each domain has `tarpitting_enabled` (bool) and `tarpitting_max_delay_seconds` (int, 1-30, default 8)
+- **Progressive delays:** Exponential backoff: 0s (1st failure) → 1s → 2s → 4s → 8s → 16s → ... up to configured max
+- **Per-IP tracking:** UNIQUE constraint on (recipient_domain, remote_ip) with failure_count and last_failure timestamp
+- **Smart whitelist:** Whitelisted IPs bypass delays; one-hour timeout resets failure counter
+- **Database schema:** Table `tarpitting` with fields: id, recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure, whitelisted_at, notes
+- **Indexes:** On domain, IP, first_seen for efficient lookups
+- **Applied on:** Invalid SMTP commands (RCPT TO failures, syntax errors)
+- **Admin control:** Dashboard at `/admin/tarpitting?domain={id}` shows failures per IP with whitelist/delete actions
+- **Domain edit form:** Checkbox to enable/disable + number input (1-30 seconds) for max delay configuration
+- **Logging:** Consistent `[smtp] tarpitting:` prefix showing delay and IP
+- **Default:** OFF for all new domains; admin can enable per-domain basis
+- **Priority:** Low (optional anti-spam feature)
+- **RFC Alignment:** Follows greylisting model (RFC 6647) with progressive penalties instead of uniform delays
 
 #### 5.7 HELO/EHLO Validation
 **Status:** ✅ **FULLY IMPLEMENTED** (April 24, 2026)  

@@ -342,6 +342,36 @@
 - **Logging:** Rate limit rejections logged (line 89)
 - **Status:** Production ready
 
+### Tarpitting
+✅ **YES** - Per-domain configurable progressive delays with exponential backoff
+- **Location:** [store/schema.sql](store/schema.sql), [store/messages.go](store/messages.go#L815-L920), [smtp/session.go](smtp/session.go#L535-L555), [web/handlers/admin.go](web/handlers/admin.go#L1075-L1120), [templates/admin_tarpitting.html](templates/admin_tarpitting.html)
+- **Features:**
+  - ✅ Per-domain enable/disable toggle (default: OFF)
+  - ✅ Configurable max delay per domain (1-30 seconds, default 8)
+  - ✅ Remote IP tracking with failure count
+  - ✅ Exponential backoff delays: 0s, 1s, 2s, 4s, 8s, 16s, ..., up to configured max
+  - ✅ One-hour timeout resets failure counter
+  - ✅ Whitelist functionality to bypass delays for legitimate sources
+  - ✅ Admin panel UI with dashboard and per-domain control
+- **Database:**
+  - Table: `tarpitting` with fields: id, recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure, whitelisted_at, notes
+  - Indexes on domain, remote_ip, and first_failure for fast lookups
+  - UNIQUE constraint on (recipient_domain, remote_ip)
+- **SMTP Integration:** Applied on invalid SMTP commands
+  - Calculates delay using `calculateTarpittingDelay(failureCount, maxDelay)`
+  - Applies delay via `time.Sleep()`
+  - Increments failure counter on invalid command
+- **Delay Calculation:**
+  - 1st failure: 0s (free pass)
+  - 2nd failure: min(1s, maxDelay)
+  - 3rd failure: min(2s, maxDelay)
+  - 4th failure: min(4s, maxDelay)
+  - 5th+ failures: Continues exponential backoff capped at maxDelay
+  - Example: 30s max with 11 failures = min(512s, 30s) = 30s delay
+- **Admin Control:** Checkbox to enable/disable + number input (1-30 seconds) for max delay configuration per domain
+- **Logging:** Consistent `[smtp] tarpitting:` prefix for monitoring
+- **Status:** Production ready
+
 ---
 
 ## 6. Web UI & Compose
@@ -478,6 +508,7 @@
 | PTR Verification | ✅ YES | Forward-confirmed |
 | Rate Limiting | ✅ YES | Per-IP limits |
 | Max Connections | ✅ YES | Semaphore based |
+| Tarpitting | ✅ YES | Per-domain configurable with exponential backoff |
 | Greylisting | ✅ YES | Per-domain configurable |
 | Attachment Upload | ✅ YES | 25MB limit |
 | Attachment Download | ✅ YES | Secure serving |

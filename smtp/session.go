@@ -141,6 +141,10 @@ func (s *Session) handleCommand(line string) {
 	case "VRFY":
 		s.send(252, "Cannot VRFY user, but will accept message and attempt delivery")
 	default:
+		// Apply tarpitting if enabled for any domain
+		if len(s.domains) > 0 {
+			s.applyTarpitting(s.domains[0], cmd)
+		}
 		s.send(502, "Command not recognized")
 	}
 }
@@ -339,12 +343,14 @@ func (s *Session) handleRCPT(arg string) {
 		}
 	}
 	if !accepted {
+		s.applyTarpitting(recipientDomain, "RCPT")
 		s.send(550, fmt.Sprintf("User not local; not accepting mail for %s", to))
 		return
 	}
 
 	// Verify the specific account exists
 	if s.accountExists != nil && !s.accountExists(to) {
+		s.applyTarpitting(recipientDomain, "RCPT")
 		s.send(550, fmt.Sprintf("No such user: %s", to))
 		return
 	}
@@ -515,6 +521,35 @@ func (s *Session) sendMulti(code int, message string) {
 	s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	fmt.Fprintf(s.writer, "%d-%s\r\n", code, message)
 	s.writer.Flush()
+}
+
+// applyTarpitting checks if tarpitting is enabled for a domain and applies delay if warranted
+func (s *Session) applyTarpitting(recipientDomain, commandType string) {
+	if s.db == nil {
+		return
+	}
+
+	domain, err := s.db.GetDomainByName(recipientDomain)
+	if err != nil || domain == nil || !domain.TarpittingEnabled {
+		return
+	}
+
+	// Check current failure count for this IP with domain's max delay setting
+	delay, err := s.db.CheckTarpittingWithMaxDelay(recipientDomain, s.clientIP, domain.TarpittingMaxDelaySecs)
+	if err != nil || delay < 0 { // -1 means whitelisted
+		return
+	}
+
+	// Apply delay if > 0 seconds
+	if delay > 0 {
+		log.Printf("[smtp] tarpitting: applying %ds delay to %s from %s (command: %s)", delay, recipientDomain, s.clientIP, commandType)
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+
+	// Increment failure counter
+	if err := s.db.IncrementTarpittingFailure(recipientDomain, s.clientIP, commandType); err != nil {
+		log.Printf("[smtp] tarpitting: error incrementing failure count for %s: %v", s.clientIP, err)
+	}
 }
 
 // extractAddress parses an address from MAIL FROM:<addr> or RCPT TO:<addr>.

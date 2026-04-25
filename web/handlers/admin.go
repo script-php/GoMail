@@ -32,6 +32,7 @@ type AdminHandler struct {
 	tmplDMARCFeedback *template.Template
 	tmplTLSRPT        *template.Template
 	tmplGreylisting   *template.Template
+	tmplTarpitting    *template.Template
 	enqueueFunc       reporting.EnqueueFunc
 }
 
@@ -66,6 +67,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback", "welcome")
 	tmplTLSRPT := templates.LoadTemplate(funcMap, "base", "admin_tls_rpt", "welcome")
 	tmplGreylisting := templates.LoadTemplate(funcMap, "base", "admin_greylisting", "welcome")
+	tmplTarpitting := templates.LoadTemplate(funcMap, "base", "admin_tarpitting", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
@@ -79,6 +81,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		tmplDMARCFeedback: tmplDMARCFeedback,
 		tmplTLSRPT:        tmplTLSRPT,
 		tmplGreylisting:   tmplGreylisting,
+		tmplTarpitting:    tmplTarpitting,
 		enqueueFunc:       enqueueFunc,
 	}
 }
@@ -232,6 +235,18 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 				domain.GreylistingDelayMins = delay
 			} else {
 				domain.GreylistingDelayMins = 15
+			}
+		}
+		domain.TarpittingEnabled = r.FormValue("tarpitting_enabled") == "1"
+		delayStr2 := r.FormValue("tarpitting_max_delay_seconds")
+		if delayStr2 == "" {
+			domain.TarpittingMaxDelaySecs = 8 // Default max delay
+		} else {
+			// Parse delay with error handling
+			if delay, err := strconv.Atoi(delayStr2); err == nil && delay > 0 {
+				domain.TarpittingMaxDelaySecs = delay
+			} else {
+				domain.TarpittingMaxDelaySecs = 8
 			}
 		}
 		domain.DKIMSelector = r.FormValue("dkim_selector")
@@ -1005,6 +1020,90 @@ func (h *AdminHandler) GreylistingEntries(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmplGreylisting.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// TarpittingEntries displays tarpitting entries for a domain.
+func (h *AdminHandler) TarpittingEntries(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get domain ID from query parameter
+	domainIDStr := r.URL.Query().Get("domain")
+	if domainIDStr == "" {
+		http.Error(w, "domain parameter required", http.StatusBadRequest)
+		return
+	}
+
+	domainID, err := strconv.ParseInt(domainIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid domain ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get domain
+	domain, err := h.db.GetDomain(domainID)
+	if err != nil || domain == nil {
+		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+
+	// Handle deletion if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "delete" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.DeleteTarpittingEntry(entryID); err != nil {
+				log.Printf("[admin] error deleting tarpitting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s deleted tarpitting entry %d from domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/tarpitting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Handle whitelist if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "whitelist" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.WhitelistTarpittingEntry(entryID); err != nil {
+				log.Printf("[admin] error whitelisting tarpitting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s whitelisted tarpitting entry %d in domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/tarpitting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Get tarpitting entries for the domain with max delay setting
+	entries, err := h.db.GetTarpittingEntriesByDomainWithMaxDelay(domain.Domain, domain.TarpittingMaxDelaySecs)
+	if err != nil {
+		log.Printf("[admin] error querying tarpitting entries: %v", err)
+		entries = []*store.TarpittingEntry{}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":      "Tarpitting Entries",
+		"Domain":     domain,
+		"Entries":    entries,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "tarpitting",
+		"Account":    account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplTarpitting.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[admin] template error: %v", err)
 	}
 }
