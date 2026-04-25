@@ -10,6 +10,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"gomail/store"
 )
 
 // SessionState represents the current state of an SMTP conversation.
@@ -50,11 +52,12 @@ type Session struct {
 	maxRcpt         int
 	readTimeout     time.Duration
 	writeTimeout    time.Duration
-	smtputf8Enabled bool // true if client advertised SMTPUTF8 support
+	smtputf8Enabled bool      // true if client advertised SMTPUTF8 support
+	db              *store.DB // database reference for greylisting checks and domain lookups
 }
 
 // NewSession creates a new SMTP session for the given connection.
-func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool) *Session {
+func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool, db *store.DB) *Session {
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
@@ -76,6 +79,7 @@ func NewSession(conn net.Conn, hostname string, domains []string, accountExists 
 		readTimeout:   readTimeout,
 		writeTimeout:  writeTimeout,
 		dsnNotify:     make(map[string]string),
+		db:            db,
 	}
 }
 
@@ -343,6 +347,32 @@ func (s *Session) handleRCPT(arg string) {
 	if s.accountExists != nil && !s.accountExists(to) {
 		s.send(550, fmt.Sprintf("No such user: %s", to))
 		return
+	}
+
+	// Check greylisting if enabled for this domain
+	if s.db != nil && s.mailFrom != "" {
+		domain, err := s.db.GetDomainByName(recipientDomain)
+		if err == nil && domain != nil && domain.GreylistingEnabled {
+			// Check greylisting status
+			status, err := s.db.CheckGreylist(recipientDomain, s.clientIP, s.mailFrom, to, domain.GreylistingDelayMins)
+			if err != nil {
+				log.Printf("[smtp] greylisting check error for %s from %s: %v", to, s.clientIP, err)
+			} else if status != nil {
+				if status.IsNew {
+					log.Printf("[smtp] greylisting: new triplet (IP=%s, FROM=%s, TO=%s), temporary rejection", s.clientIP, s.mailFrom, to)
+					s.send(450, "Mailbox temporarily unavailable")
+					return
+				}
+				if !status.IsWhitelisted && !status.DelayExpired {
+					log.Printf("[smtp] greylisting: triplet still in delay period (IP=%s, FROM=%s, TO=%s), temporary rejection", s.clientIP, s.mailFrom, to)
+					s.send(421, "Service temporarily unavailable")
+					return
+				}
+				if status.DelayExpired && !status.IsWhitelisted {
+					log.Printf("[smtp] greylisting: triplet whitelisted after delay (IP=%s, FROM=%s, TO=%s)", s.clientIP, s.mailFrom, to)
+				}
+			}
+		}
 	}
 
 	if len(s.rcptTo) >= s.maxRcpt {

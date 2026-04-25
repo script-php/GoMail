@@ -294,6 +294,27 @@
 - **Usage:** Stored in session, available in message processing context
 - **Status:** Production ready
 
+### Greylisting (RFC 6647)
+✅ **YES** - Per-domain configurable greylisting with smart cleanup
+- **Location:** [store/schema.sql](store/schema.sql) (greylisting table), [store/messages.go](store/messages.go) (`CheckGreylist()`, `CleanupGreylisting()`), [smtp/session.go](smtp/session.go) (handleRCPT integration), [web/handlers/admin.go](web/handlers/admin.go), [templates/admin_domain_edit.html](templates/admin_domain_edit.html)
+- **Features:**
+  - ✅ Per-domain enable/disable toggle (default: OFF)
+  - ✅ Configurable delay per domain (5-480 minutes, default 15)
+  - ✅ Sender triplet tracking: (remote_IP, sender_email, recipient_email, recipient_domain)
+  - ✅ Three-state lifecycle: NEW (reject 450) → DELAYING (reject 421) → WHITELISTED (accept 250)
+  - ✅ Admin panel UI with checkbox and delay input
+- **Database:**
+  - Table: `greylisting` with fields: id, recipient_domain, remote_ip, sender_email, recipient_email, first_seen, whitelisted_at, rejected_count
+  - Indexes on domain, triplet, and first_seen for fast lookups
+  - UNIQUE constraint on (recipient_domain, remote_ip, sender_email, recipient_email)
+- **SMTP Integration:** Validated in `handleRCPT()` after account verification
+  - New triplets: Send 450 "Mailbox temporarily unavailable", record entry
+  - Delaying triplets: Send 421 "Service temporarily unavailable" until delay expires
+  - Whitelisted triplets: Continue with normal acceptance (250)
+- **Cleanup Strategy:** Daily cleanup job removes rejected entries older than 30 days (where whitelisted_at IS NULL). Whitelisted senders remain in database permanently, preventing re-rejection after inactivity.
+- **Logging:** Consistent `[smtp] greylisting:` prefix for monitoring
+- **Status:** Production ready
+
 ### Rate Limiting by IP
 ✅ **YES** - Per-IP rate limiting on connections and messages
 - **Location:** [smtp/ratelimit.go](smtp/ratelimit.go) `RateLimiter` struct
@@ -457,6 +478,7 @@
 | PTR Verification | ✅ YES | Forward-confirmed |
 | Rate Limiting | ✅ YES | Per-IP limits |
 | Max Connections | ✅ YES | Semaphore based |
+| Greylisting | ✅ YES | Per-domain configurable |
 | Attachment Upload | ✅ YES | 25MB limit |
 | Attachment Download | ✅ YES | Secure serving |
 | Plain Text Compose | ✅ YES | Textarea input |

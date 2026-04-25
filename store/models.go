@@ -4,16 +4,18 @@ import "time"
 
 // Domain represents a mail domain managed by this server.
 type Domain struct {
-	ID              int64     `json:"id"`
-	Domain          string    `json:"domain"`
-	IsActive        bool      `json:"is_active"`
-	DKIMSelector    string    `json:"dkim_selector"`
-	DKIMAlgorithm   string    `json:"dkim_algorithm"`
-	DKIMPrivateKey  string    `json:"-"`
-	DKIMPublicKey   string    `json:"dkim_public_key"`
-	RequireTLS      bool      `json:"require_tls"`      // Fail delivery if TLS unavailable (RFC 8689)
-	DANEEnforcement string    `json:"dane_enforcement"` // "disabled" (default), "optional" (log only), "required" (fail)
-	CreatedAt       time.Time `json:"created_at"`
+	ID                   int64     `json:"id"`
+	Domain               string    `json:"domain"`
+	IsActive             bool      `json:"is_active"`
+	DKIMSelector         string    `json:"dkim_selector"`
+	DKIMAlgorithm        string    `json:"dkim_algorithm"`
+	DKIMPrivateKey       string    `json:"-"`
+	DKIMPublicKey        string    `json:"dkim_public_key"`
+	RequireTLS           bool      `json:"require_tls"`               // Fail delivery if TLS unavailable (RFC 8689)
+	DANEEnforcement      string    `json:"dane_enforcement"`          // "disabled" (default), "optional" (log only), "required" (fail)
+	GreylistingEnabled   bool      `json:"greylisting_enabled"`       // Enable greylisting for this domain
+	GreylistingDelayMins int       `json:"greylisting_delay_minutes"` // Minutes to wait before accepting from new sender triplet
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 // Account represents a user mailbox.

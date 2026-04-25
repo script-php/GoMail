@@ -31,6 +31,7 @@ type AdminHandler struct {
 	tmplAccountEdit   *template.Template
 	tmplDMARCFeedback *template.Template
 	tmplTLSRPT        *template.Template
+	tmplGreylisting   *template.Template
 	enqueueFunc       reporting.EnqueueFunc
 }
 
@@ -64,6 +65,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit", "welcome")
 	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback", "welcome")
 	tmplTLSRPT := templates.LoadTemplate(funcMap, "base", "admin_tls_rpt", "welcome")
+	tmplGreylisting := templates.LoadTemplate(funcMap, "base", "admin_greylisting", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
@@ -76,6 +78,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		tmplAccountEdit:   tmplAccountEdit,
 		tmplDMARCFeedback: tmplDMARCFeedback,
 		tmplTLSRPT:        tmplTLSRPT,
+		tmplGreylisting:   tmplGreylisting,
 		enqueueFunc:       enqueueFunc,
 	}
 }
@@ -218,6 +221,18 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 		domain.DANEEnforcement = r.FormValue("dane_enforcement")
 		if domain.DANEEnforcement == "" {
 			domain.DANEEnforcement = "disabled" // Default if not set
+		}
+		domain.GreylistingEnabled = r.FormValue("greylisting_enabled") == "1"
+		delayStr := r.FormValue("greylisting_delay_minutes")
+		if delayStr == "" {
+			domain.GreylistingDelayMins = 15 // Default delay
+		} else {
+			// Parse delay with error handling
+			if delay, err := strconv.Atoi(delayStr); err == nil && delay > 0 {
+				domain.GreylistingDelayMins = delay
+			} else {
+				domain.GreylistingDelayMins = 15
+			}
 		}
 		domain.DKIMSelector = r.FormValue("dkim_selector")
 		domain.DKIMAlgorithm = r.FormValue("dkim_algorithm")
@@ -908,6 +923,90 @@ func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Reque
 
 	// Redirect back to TLS-RPT page with success message
 	http.Redirect(w, r, "/admin/tls-rpt?sent=1", http.StatusSeeOther)
+}
+
+// GreylistingEntries displays greylisting entries for a domain.
+func (h *AdminHandler) GreylistingEntries(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get domain ID from query parameter
+	domainIDStr := r.URL.Query().Get("domain")
+	if domainIDStr == "" {
+		http.Error(w, "domain parameter required", http.StatusBadRequest)
+		return
+	}
+
+	domainID, err := strconv.ParseInt(domainIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid domain ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get domain
+	domain, err := h.db.GetDomain(domainID)
+	if err != nil || domain == nil {
+		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+
+	// Handle deletion if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "delete" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.DeleteGreylistingEntry(entryID); err != nil {
+				log.Printf("[admin] error deleting greylisting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s deleted greylisting entry %d from domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/greylisting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Handle whitelist if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "whitelist" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.WhitelistGreylistingEntry(entryID); err != nil {
+				log.Printf("[admin] error whitelisting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s whitelisted greylisting entry %d in domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/greylisting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Get greylisting entries for the domain
+	entries, err := h.db.GetGreylistingEntriesByDomain(domain.Domain)
+	if err != nil {
+		log.Printf("[admin] error querying greylisting entries: %v", err)
+		entries = []*store.GreylistEntry{}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":      "Greylisting Entries",
+		"Domain":     domain,
+		"Entries":    entries,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "greylisting",
+		"Account":    account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplGreylisting.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
 }
 
 // extractPubKeyBase64 extracts the base64 public key from PEM format.

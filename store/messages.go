@@ -11,9 +11,9 @@ import (
 // CreateDomain adds a new domain.
 func (db *DB) CreateDomain(d *Domain) (int64, error) {
 	result, err := db.Exec(`
-		INSERT INTO domains (domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm, d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement,
+		INSERT INTO domains (domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm, d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, boolToInt(d.GreylistingEnabled), d.GreylistingDelayMins,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("creating domain: %w", err)
@@ -24,11 +24,11 @@ func (db *DB) CreateDomain(d *Domain) (int64, error) {
 // GetDomain returns a domain by ID.
 func (db *DB) GetDomain(id int64) (*Domain, error) {
 	d := &Domain{}
-	var isActive, requireTLS int
+	var isActive, requireTLS, greylistingEnabled int
 	err := db.QueryRow(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, created_at
 		FROM domains WHERE id = ?`, id).Scan(
-		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &d.CreatedAt,
+		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &d.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -38,17 +38,18 @@ func (db *DB) GetDomain(id int64) (*Domain, error) {
 	}
 	d.IsActive = isActive == 1
 	d.RequireTLS = requireTLS == 1
+	d.GreylistingEnabled = greylistingEnabled == 1
 	return d, nil
 }
 
 // GetDomainByName returns a domain by its domain name.
 func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 	d := &Domain{}
-	var isActive, requireTLS int
+	var isActive, requireTLS, greylistingEnabled int
 	err := db.QueryRow(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, created_at
 		FROM domains WHERE domain = ?`, domain).Scan(
-		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &d.CreatedAt,
+		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &d.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -58,13 +59,14 @@ func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 	}
 	d.IsActive = isActive == 1
 	d.RequireTLS = requireTLS == 1
+	d.GreylistingEnabled = greylistingEnabled == 1
 	return d, nil
 }
 
 // ListDomains returns all domains.
 func (db *DB) ListDomains() ([]*Domain, error) {
 	rows, err := db.Query(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, dane_enforcement, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, created_at
 		FROM domains ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("listing domains: %w", err)
@@ -74,12 +76,13 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 	var domains []*Domain
 	for rows.Next() {
 		d := &Domain{}
-		var isActive, requireTLS int
-		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &d.CreatedAt); err != nil {
+		var isActive, requireTLS, greylistingEnabled int
+		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scanning domain row: %w", err)
 		}
 		d.IsActive = isActive == 1
 		d.RequireTLS = requireTLS == 1
+		d.GreylistingEnabled = greylistingEnabled == 1
 		domains = append(domains, d)
 
 	}
@@ -90,9 +93,9 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 func (db *DB) UpdateDomain(d *Domain) error {
 	_, err := db.Exec(`
 		UPDATE domains SET domain = ?, is_active = ?, dkim_selector = ?, dkim_algorithm = ?,
-		dkim_private_key = ?, dkim_public_key = ?, require_tls = ?, dane_enforcement = ? WHERE id = ?`,
+		dkim_private_key = ?, dkim_public_key = ?, require_tls = ?, dane_enforcement = ?, greylisting_enabled = ?, greylisting_delay_minutes = ? WHERE id = ?`,
 		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm,
-		d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, d.ID,
+		d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, boolToInt(d.GreylistingEnabled), d.GreylistingDelayMins, d.ID,
 	)
 	return err
 }
@@ -645,6 +648,156 @@ func (db *DB) DeleteSession(token string) error {
 func (db *DB) CleanExpiredSessions() error {
 	_, err := db.Exec(`DELETE FROM sessions WHERE expires_at <= datetime('now')`)
 	return err
+}
+
+// --- Greylisting ---
+
+// GreylistStatus represents the status of a sender triplet
+type GreylistStatus struct {
+	IsNew         bool      // New triplet (never seen)
+	IsWhitelisted bool      // Already accepted from this triplet
+	FirstSeen     time.Time // When we first saw this triplet
+	DelayExpired  bool      // Whether the delay has passed
+}
+
+// CheckGreylist checks if a sender triplet should be accepted or temporarily rejected.
+// Returns GreylistStatus with details about the triplet.
+// If not whitelisted yet and delay not expired: reject with 421
+// If new: reject with 450
+// Otherwise: accept and mark as whitelisted if not already
+func (db *DB) CheckGreylist(recipientDomain, remoteIP, senderEmail, recipientEmail string, delayMinutes int) (*GreylistStatus, error) {
+	status := &GreylistStatus{}
+	var whitelistedAt sql.NullTime
+
+	err := db.QueryRow(`
+		SELECT first_seen, whitelisted_at FROM greylisting
+		WHERE recipient_domain = ? AND remote_ip = ? AND sender_email = ? AND recipient_email = ?
+		LIMIT 1`,
+		recipientDomain, remoteIP, senderEmail, recipientEmail).Scan(&status.FirstSeen, &whitelistedAt)
+
+	if err == sql.ErrNoRows {
+		// New triplet - insert and reject
+		status.IsNew = true
+		_, err := db.Exec(`
+			INSERT INTO greylisting (recipient_domain, remote_ip, sender_email, recipient_email, first_seen, rejected_count)
+			VALUES (?, ?, ?, ?, datetime('now'), 1)`,
+			recipientDomain, remoteIP, senderEmail, recipientEmail)
+		if err != nil {
+			return nil, fmt.Errorf("recording greylisting entry: %w", err)
+		}
+		return status, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("checking greylisting: %w", err)
+	}
+
+	// Existing triplet
+	if whitelistedAt.Valid {
+		status.IsWhitelisted = true
+		return status, nil
+	}
+
+	// Not yet whitelisted - check if delay has passed
+	elapsed := time.Since(status.FirstSeen)
+	delayDuration := time.Duration(delayMinutes) * time.Minute
+	if elapsed >= delayDuration {
+		status.DelayExpired = true
+		// Mark as whitelisted
+		_, err := db.Exec(`
+			UPDATE greylisting SET whitelisted_at = datetime('now')
+			WHERE recipient_domain = ? AND remote_ip = ? AND sender_email = ? AND recipient_email = ?`,
+			recipientDomain, remoteIP, senderEmail, recipientEmail)
+		if err != nil {
+			return nil, fmt.Errorf("whitelisting greylisting entry: %w", err)
+		}
+	}
+
+	return status, nil
+}
+
+// CleanupGreylisting removes old greylisting entries that were never accepted (>30 days old).
+// Keeps whitelisted senders in the list permanently (they are proven safe).
+func (db *DB) CleanupGreylisting() error {
+	_, err := db.Exec(`
+		DELETE FROM greylisting
+		WHERE first_seen < datetime('now', '-30 days')
+		AND whitelisted_at IS NULL`)
+	if err != nil {
+		return fmt.Errorf("cleaning up greylisting: %w", err)
+	}
+	return nil
+}
+
+// GreylistEntry represents a greylisting entry for display in admin UI
+type GreylistEntry struct {
+	ID              int64
+	RecipientDomain string
+	RemoteIP        string
+	SenderEmail     string
+	RecipientEmail  string
+	FirstSeen       time.Time
+	WhitelistedAt   sql.NullTime
+	RejectedCount   int
+	Status          string // "NEW", "DELAYING", or "WHITELISTED"
+	HoursAgo        int    // How many hours since first_seen
+}
+
+// GetGreylistingEntriesByDomain returns all greylisting entries for a domain
+func (db *DB) GetGreylistingEntriesByDomain(recipientDomain string) ([]*GreylistEntry, error) {
+	rows, err := db.Query(`
+		SELECT id, recipient_domain, remote_ip, sender_email, recipient_email, first_seen, whitelisted_at, rejected_count
+		FROM greylisting
+		WHERE recipient_domain = ?
+		ORDER BY first_seen DESC`, recipientDomain)
+	if err != nil {
+		return nil, fmt.Errorf("querying greylisting entries: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*GreylistEntry
+	for rows.Next() {
+		e := &GreylistEntry{}
+		if err := rows.Scan(&e.ID, &e.RecipientDomain, &e.RemoteIP, &e.SenderEmail,
+			&e.RecipientEmail, &e.FirstSeen, &e.WhitelistedAt, &e.RejectedCount); err != nil {
+			return nil, fmt.Errorf("scanning greylisting entry: %w", err)
+		}
+
+		// Calculate status and hours ago
+		e.HoursAgo = int(time.Since(e.FirstSeen).Hours())
+		if e.WhitelistedAt.Valid {
+			e.Status = "WHITELISTED"
+		} else if e.HoursAgo > 0 {
+			// Assume 15 minute default delay; in real code could fetch from domain config
+			if e.HoursAgo*60 >= 15 { // More than 15 minutes
+				e.Status = "DELAYING"
+			} else {
+				e.Status = "NEW"
+			}
+		} else {
+			e.Status = "NEW"
+		}
+
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// DeleteGreylistingEntry removes a specific greylisting entry
+func (db *DB) DeleteGreylistingEntry(id int64) error {
+	_, err := db.Exec(`DELETE FROM greylisting WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("deleting greylisting entry: %w", err)
+	}
+	return nil
+}
+
+// WhitelistGreylistingEntry manually marks an entry as whitelisted
+func (db *DB) WhitelistGreylistingEntry(id int64) error {
+	_, err := db.Exec(`UPDATE greylisting SET whitelisted_at = datetime('now') WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("whitelisting entry: %w", err)
+	}
+	return nil
 }
 
 // --- Helpers ---

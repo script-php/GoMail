@@ -1,11 +1,11 @@
 # GoMail Comprehensive Code Audit
 
-**Date:** April 21, 2026  
+**Date:** April 25, 2026  
 **Analysis Method:** Source code verification (actual implementation checked against claims)  
 **Total Features Audited:** 47  
-**Fully Implemented:** 37 (79%)  
+**Fully Implemented:** 38 (81%)  
 **Partially Implemented:** 2 (4%)  
-**Not Implemented:** 8 (17%)
+**Not Implemented:** 7 (15%)
 
 ---
 
@@ -23,7 +23,8 @@ GoMail implements a **production-ready mailserver** with **comprehensive SMTP st
 
 ### Key Gaps
 ❌ SMTP AUTH (intentionally omitted for webmail)  
-❌ Greylisting & tarpitting (anti-spam features)  
+✅ Greylisting (anti-spam feature) — FULLY IMPLEMENTED  
+❌ Tarpitting (optional anti-spam feature)  
 ❌ HTML email composition (plain text only)  
 ❌ Session token rotation  
 ❌ VERP support  
@@ -448,11 +449,23 @@ capabilities := []string{
 - Prevents spam from single IP
 
 #### 5.5 Greylisting
-**Status:** ❌ **NOT IMPLEMENTED**  
-**Issue:**
-- No temporary rejection (450/421) of new sender triplets
-- No greylisting database
-- **Priority:** Low (optional spam mitigation)
+**Status:** ✅ **FULLY IMPLEMENTED** (April 25, 2026)  
+**Location:** [store/schema.sql](store/schema.sql), [store/messages.go](store/messages.go#L780-L850), [smtp/session.go](smtp/session.go#L340-L380), [main.go](main.go), [web/handlers/admin.go](web/handlers/admin.go), [templates/admin_domain_edit.html](templates/admin_domain_edit.html)  
+**Details:**
+- **Per-domain configuration:** Each domain has `greylisting_enabled` (bool) and `greylisting_delay_minutes` (int, default 15)
+- **Triplet tracking:** (remote_IP, sender_email, recipient_email, recipient_domain) with UNIQUE constraint
+- **Three states:**
+  - NEW: First time seeing triplet → reject 450 "Mailbox temporarily unavailable"
+  - DELAYING: Triplet exists, delay not expired → reject 421 "Service temporarily unavailable"
+  - WHITELISTED: After delay expires → accept 250 OK
+- **Database schema:** New `greylisting` table with fields: `id, recipient_domain, remote_ip, sender_email, recipient_email, first_seen, whitelisted_at, rejected_count`
+- **Indexes:** `idx_greylisting_domain`, `idx_greylisting_triplet` (composite), `idx_greylisting_first_seen` for efficient lookups
+- **SMTP Integration:** Validation in `handleRCPT()` after account verification, before max recipient check
+- **Admin Control:** Checkbox to enable/disable + number input (5-480 minutes) for delay configuration
+- **Maintenance:** Daily cleanup job removes only rejected entries (whitelisted_at IS NULL) older than 30 days; legitimate senders stay whitelisted permanently
+- **Default:** OFF for all new domains; admin can enable per-domain basis
+- **Logging:** Consistent `[smtp] greylisting:` prefix for monitoring and debugging
+- **Priority:** Medium (effective inbound spam mitigation for multi-domain mail server)
 
 #### 5.6 Tarpitting
 **Status:** ❌ **NOT IMPLEMENTED**  
@@ -961,7 +974,7 @@ capabilities := []string{
 | **Inbound Security** | PTR Verify | ✅ | Medium |
 | | Rate Limiting | ✅ | High |
 | | Max Connections | ✅ | High |
-| | Greylisting | ❌ | Low |
+| | Greylisting | ✅ | Medium |
 | | Tarpitting | ❌ | Low |
 | | HELO Validation | ✅ | Low |
 | **Web UI** | Attachment Upload | ✅ | High |

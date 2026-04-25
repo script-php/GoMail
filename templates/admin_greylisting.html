@@ -1,0 +1,244 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>Greylisting: {{.Domain.Domain}}</h2>
+        <p class="subtitle">Manage temporary sender rejections (triplet tracking)</p>
+        <div class="admin-actions">
+            <a href="/admin/domains" class="btn btn-secondary">← Back to Domains</a>
+        </div>
+    </div>
+
+    <div class="info-box" style="background: #e8f5e9; border-left: 4px solid #4caf50; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>✅ Greylisting Status:</strong>
+        {{if .Domain.GreylistingEnabled}}
+        <span style="color: #4caf50; font-weight: bold;">ENABLED</span> 
+        (Delay: {{.Domain.GreylistingDelayMins}} minutes)
+        {{else}}
+        <span style="color: #f44336; font-weight: bold;">DISABLED</span>
+        {{end}}
+        <p>Greylisting temporarily rejects new sender/IP combinations to combat spam. Legitimate senders automatically retry and are whitelisted.</p>
+    </div>
+
+    {{if not .Domain.GreylistingEnabled}}
+    <div class="warning-box" style="background: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>⚠️ Greylisting is disabled for this domain.</strong>
+        <p><a href="/admin/domain/edit/{{.Domain.ID}}">Enable it in domain settings →</a></p>
+    </div>
+    {{end}}
+
+    <div class="greylisting-stats">
+        {{if not .Entries}}
+        <div class="empty-state">
+            <p>No greylisting entries for {{.Domain.Domain}}. This is normal if the domain was just enabled or has no rejected senders.</p>
+        </div>
+        {{else}}
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Remote IP</th>
+                    <th>First Seen</th>
+                    <th>Age</th>
+                    <th>Rejections</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .Entries}}
+                <tr style="border-bottom: 1px solid #ddd;">
+                    <td>
+                        {{if eq .Status "WHITELISTED"}}
+                        <span style="background: #4caf50; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px;">✓ WHITELISTED</span>
+                        {{else if eq .Status "DELAYING"}}
+                        <span style="background: #ff9800; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px;">⏱ DELAYING</span>
+                        {{else}}
+                        <span style="background: #f44336; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px;">✗ NEW</span>
+                        {{end}}
+                    </td>
+                    <td style="font-family: monospace; font-size: 12px;" title="{{.SenderEmail}}">{{.SenderEmail}}</td>
+                    <td style="font-family: monospace; font-size: 12px;" title="{{.RecipientEmail}}">{{.RecipientEmail}}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{.RemoteIP}}</td>
+                    <td style="white-space: nowrap;">{{.FirstSeen.Format "2006-01-02 15:04"}}</td>
+                    <td>{{.HoursAgo}}h ago</td>
+                    <td style="text-align: center; font-weight: bold;">{{.RejectedCount}}</td>
+                    <td>
+                        {{if ne .Status "WHITELISTED"}}
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                            <input type="hidden" name="action" value="whitelist">
+                            <input type="hidden" name="entry_id" value="{{.ID}}">
+                            <button type="submit" class="btn-mini" title="Whitelist this sender immediately" style="background: #4caf50; color: white; padding: 4px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">
+                                ✓ Whitelist
+                            </button>
+                        </form>
+                        {{end}}
+                        <form method="POST" style="display: inline;">
+                            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="entry_id" value="{{.ID}}">
+                            <button type="submit" class="btn-mini" onclick="return confirm('Delete this entry?')" title="Remove this greylisting entry" style="background: #f44336; color: white; padding: 4px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">
+                                🗑 Delete
+                            </button>
+                        </form>
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+
+        <div class="legend" style="margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 4px;">
+            <strong>Legend:</strong>
+            <ul style="margin: 10px 0; margin-left: 20px;">
+                <li><span style="background: #f44336; color: white; padding: 3px 6px; border-radius: 2px; font-size: 11px;">✗ NEW</span> – First time seeing this sender/IP combination, currently rejected</li>
+                <li><span style="background: #ff9800; color: white; padding: 3px 6px; border-radius: 2px; font-size: 11px;">⏱ DELAYING</span> – Sender/IP has been seen, still within delay period</li>
+                <li><span style="background: #4caf50; color: white; padding: 3px 6px; border-radius: 2px; font-size: 11px;">✓ WHITELISTED</span> – Delay period passed and entry is now whitelisted (no longer rejected)</li>
+            </ul>
+        </div>
+        {{end}}
+    </div>
+
+    <div class="info-box" style="background: #f3e5f5; border-left: 4px solid #9c27b0; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>💡 How Greylisting Works:</strong>
+        <ol style="margin: 10px 0; margin-left: 20px;">
+            <li>New sender (IP + sender email + recipient) is <strong>rejected</strong> with SMTP code 450</li>
+            <li>Legitimate mail servers <strong>retry</strong> after a delay (the delay is {{.Domain.GreylistingDelayMins}} minutes)</li>
+            <li>After delay passes, the sender is <strong>whitelisted</strong> and emails go through normally</li>
+            <li>Spammy senders typically don't retry, so they never reach inboxes</li>
+        </ol>
+        <p><strong>Note:</strong> Whitelisted entries are kept permanently in the database. Entry cleanup removes only rejected entries older than 30 days.</p>
+    </div>
+</div>
+
+<style>
+.admin-panel {
+    max-width: 1000px;
+    margin: 20px auto;
+    padding: 20px;
+}
+
+.admin-header {
+    margin-bottom: 20px;
+    border-bottom: 2px solid #ccc;
+    padding-bottom: 15px;
+}
+
+.admin-header h2 {
+    margin: 0 0 5px 0;
+    color: #333;
+    font-size: 24px;
+}
+
+.admin-header .subtitle {
+    margin: 0;
+    color: #666;
+    font-size: 14px;
+}
+
+.admin-actions {
+    margin-top: 15px;
+}
+
+.btn, .btn-mini {
+    padding: 8px 16px;
+    margin-right: 10px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    text-decoration: none;
+    display: inline-block;
+}
+
+.btn-secondary, .btn-primary {
+    background: #2196f3;
+    color: white;
+}
+
+.btn:hover, .btn-primary:hover {
+    background: #1976d2;
+}
+
+.btn-secondary {
+    background: #666;
+}
+
+.btn-secondary:hover {
+    background: #555;
+}
+
+.empty-state {
+    padding: 40px 20px;
+    text-align: center;
+    color: #999;
+    background: #f9f9f9;
+    border-radius: 4px;
+    margin: 20px 0;
+}
+
+.admin-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.admin-table thead {
+    background: #f5f5f5;
+    font-weight: bold;
+    color: #333;
+}
+
+.admin-table th {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 2px solid #ddd;
+}
+
+.admin-table td {
+    padding: 12px;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.info-box {
+    border-radius: 4px;
+    margin: 15px 0;
+}
+
+.info-box strong {
+    display: block;
+    margin-bottom: 5px;
+}
+
+.warning-box {
+    background: #fff3e0;
+    border-left: 4px solid #ff9800;
+    padding: 15px;
+    border-radius: 4px;
+    margin: 15px 0;
+}
+
+.legend {
+    margin-top: 20px;
+    padding: 15px;
+    background: #f5f5f5;
+    border-radius: 4px;
+}
+
+.legend ul {
+    margin: 10px 0;
+    margin-left: 20px;
+}
+
+.legend li {
+    margin: 8px 0;
+}
+
+</style>
+{{end}}

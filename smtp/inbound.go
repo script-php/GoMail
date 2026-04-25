@@ -149,6 +149,7 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		time.Duration(s.cfg.SMTP.WriteTimeout)*time.Second,
 		ptrHostname,
 		ptrValid,
+		s.db,
 	)
 
 	// Override the DATA handler to intercept the message

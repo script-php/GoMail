@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS domains (
     dkim_public_key  TEXT NOT NULL DEFAULT '',  -- Base64 public key for DNS
     require_tls     INTEGER NOT NULL DEFAULT 0,  -- 1 = fail if TLS unavailable, 0 = opportunistic TLS
     dane_enforcement TEXT NOT NULL DEFAULT 'disabled',  -- disabled, optional, required
+    greylisting_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = enable greylisting, 0 = disable
+    greylisting_delay_minutes INTEGER NOT NULL DEFAULT 15,  -- Minutes to wait before accepting from new sender triplet
     created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -162,3 +164,20 @@ CREATE TABLE IF NOT EXISTS tls_failures (
 
 CREATE INDEX IF NOT EXISTS idx_tls_failures_domain ON tls_failures(recipient_domain);
 CREATE INDEX IF NOT EXISTS idx_tls_failures_attempted ON tls_failures(attempted_at);
+
+-- Greylisting triplet tracking for spam mitigation
+CREATE TABLE IF NOT EXISTS greylisting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_domain TEXT NOT NULL,         -- Domain this greylisting record is for
+    remote_ip TEXT NOT NULL,                -- Sending server IP
+    sender_email TEXT NOT NULL,             -- MAIL FROM address
+    recipient_email TEXT NOT NULL,          -- RCPT TO address
+    first_seen DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we first saw this triplet
+    whitelisted_at DATETIME,                -- When we first accepted a message from this triplet (NULL if never whitelisted)
+    rejected_count INTEGER NOT NULL DEFAULT 1,  -- Number of times we rejected this triplet
+    UNIQUE(recipient_domain, remote_ip, sender_email, recipient_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_greylisting_domain ON greylisting(recipient_domain);
+CREATE INDEX IF NOT EXISTS idx_greylisting_triplet ON greylisting(remote_ip, sender_email, recipient_email);
+CREATE INDEX IF NOT EXISTS idx_greylisting_first_seen ON greylisting(first_seen);

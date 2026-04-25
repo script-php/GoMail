@@ -44,6 +44,7 @@
                 <td class="actions">
                     <a href="/admin/domain/edit/{{.Domain.ID}}" class="btn btn-sm">Edit</a>
                     <a href="/admin/accounts?domain={{.Domain.ID}}" class="btn btn-sm">Accounts</a>
+                    <a href="/admin/greylisting?domain={{.Domain.ID}}" class="btn btn-sm">Greylisting</a>
                     <form method="POST" action="/admin/domain/delete/{{.Domain.ID}}" class="inline-form"
                           onsubmit="return confirm('Delete domain {{.Domain.Domain}} and all its accounts?')">
                         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">

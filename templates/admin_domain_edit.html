@@ -61,6 +61,26 @@
             <small>DANE provides additional security by validating TLS certificates against DNS TLSA records. See <a href="https://tools.ietf.org/html/rfc6698" target="_blank">RFC 6698</a>.</small>
         </div>
 
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="greylisting_enabled" name="greylisting_enabled" value="1" {{if .Domain.GreylistingEnabled}}checked{{end}}>
+                Enable Greylisting (spam mitigation)
+            </label>
+            <small>Greylisting temporarily rejects mail from unknown sender/IP combinations, allowing legitimate senders to retry after a delay while blocking most spam bots.</small>
+        </div>
+
+        <div class="form-group" id="greylisting_delay_group" {{if not .Domain.GreylistingEnabled}}style="display:none;"{{end}}>
+            <label for="greylisting_delay_minutes">Greylisting Delay (minutes)</label>
+            <input type="number" id="greylisting_delay_minutes" name="greylisting_delay_minutes" min="5" max="480" value="{{.Domain.GreylistingDelayMins}}" placeholder="15">
+            <small>How long to wait before accepting mail from new sender/IP combinations (5-480 minutes, default 15 minutes).</small>
+        </div>
+
+        <script>
+            document.getElementById('greylisting_enabled').addEventListener('change', function() {
+                document.getElementById('greylisting_delay_group').style.display = this.checked ? 'block' : 'none';
+            });
+        </script>
+
         <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Domain{{else}}Save Changes{{end}}</button>
     </form>
 
