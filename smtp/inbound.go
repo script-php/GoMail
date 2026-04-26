@@ -360,11 +360,106 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		messageID = fmt.Sprintf("%d.%s@%s", time.Now().UnixNano(), clientIP, s.cfg.Server.Hostname)
 	}
 
+	// --- Check if this is a DSN message (bounce/failure notification) ---
+	// DSNs arrive addressed to the original sender (not VERP address usually)
+	// but contain information about which recipients failed
+	isDSN := parser.IsDSNMessage(parsed.Subject, parsed.Headers, parsed.TextBody)
+	var dsnReport *parser.DSNReport
+	if isDSN {
+		// Pass the full raw message (which includes MIME structure) to ParseDSN
+		// so it can extract the message/delivery-status part
+		dsnReport, _ = parser.ParseDSN(string(rawMessage))
+		if dsnReport != nil {
+			log.Printf("[smtp] [verp] received DSN: original-id=%s status=%s", dsnReport.OriginalMessageID, dsnReport.Status)
+		}
+	}
+
 	// Deliver to each recipient
 	for _, rcpt := range rcptTo {
 		// Note: DMARC enforcement is now done per-recipient via folder assignment below
 		// p=reject and p=quarantine both result in messages going to spam folder
 		// p=none messages go to inbox normally
+
+		// Check if this recipient is a VERP bounce address
+		if s.db.IsVERPBounceAddress(rcpt) {
+			originalRecipient, err := s.db.DecodeVERP(rcpt)
+			if err == nil {
+				log.Printf("[smtp] [verp] detected bounce at VERP address %s for original recipient %s", rcpt, originalRecipient)
+
+				// Extract sender from the parsed From header
+				senderEmail := parsed.From
+				if senderEmail == "" {
+					senderEmail = mailFrom
+				}
+
+				// Extract bounce code and type from DSN if available, otherwise use subject heuristics
+				bounceCode := 0
+				bounceType := "unknown"
+				bounceReason := parsed.Subject
+
+				if isDSN && dsnReport != nil {
+					bounceType = parser.ExtractBounceType(dsnReport.Status)
+					bounceCode = parser.ExtractSMTPCode(dsnReport.DiagnosticCode)
+					if bounceCode == 0 && len(dsnReport.RecipientsStatus) > 0 {
+						bounceCode = parser.ExtractSMTPCode(dsnReport.RecipientsStatus[0].DiagnosticCode)
+					}
+					bounceReason = dsnReport.DiagnosticCode
+					if bounceReason == "" {
+						bounceReason = dsnReport.Status
+					}
+				} else {
+					// Fallback: try to extract SMTP code from message body or subject
+					if strings.Contains(strings.ToLower(parsed.Subject), "permanent") || strings.Contains(strings.ToLower(parsed.Subject), "failed") {
+						bounceType = "permanent"
+						bounceCode = 550 // Generic permanent failure
+					} else if strings.Contains(strings.ToLower(parsed.Subject), "temporary") || strings.Contains(strings.ToLower(parsed.Subject), "try again") {
+						bounceType = "temporary"
+						bounceCode = 421 // Service temporarily unavailable
+					}
+				}
+
+				// Record the bounce
+				if err := s.db.RecordVERPBounce(originalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
+					log.Printf("[smtp] [verp] error recording bounce: %v", err)
+				}
+
+				// Skip account lookup for VERP addresses (they don't have accounts)
+				continue
+			} else {
+				log.Printf("[smtp] [verp] could not decode VERP address %s: %v", rcpt, err)
+			}
+		}
+
+		// --- Handle DSN bounces that came to the original sender (not VERP address) ---
+		if isDSN && dsnReport != nil && len(dsnReport.RecipientsStatus) > 0 {
+			// Try to match DSN recipients to our sent messages and record VERP bounces
+			for _, recipStatus := range dsnReport.RecipientsStatus {
+				if recipStatus.FinalRecipient != "" {
+					log.Printf("[smtp] [verp] DSN failure for recipient: %s status: %s", recipStatus.FinalRecipient, recipStatus.Status)
+
+					// Extract sender - from Return-Path if available, otherwise From header
+					senderEmail := parsed.From
+					if senderEmail == "" {
+						senderEmail = mailFrom
+					}
+
+					bounceType := parser.ExtractBounceType(recipStatus.Status)
+					bounceCode := parser.ExtractSMTPCode(recipStatus.DiagnosticCode)
+					bounceReason := recipStatus.DiagnosticCode
+					if bounceReason == "" {
+						bounceReason = recipStatus.Status
+					}
+
+					// Record bounce with original recipient from DSN
+					if err := s.db.RecordVERPBounce(recipStatus.FinalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
+						log.Printf("[smtp] [verp] error recording DSN bounce: %v", err)
+					}
+				}
+			}
+
+			// DSN messages don't need to be stored as regular mail, skip account lookup
+			continue
+		}
 
 		// Check if DMARC failed for this domain
 		if dmarcResult.Result == "fail" {

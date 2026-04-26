@@ -1,0 +1,225 @@
+{{define "content"}}
+<div class="admin-panel">
+    <div class="admin-header">
+        <h2>VERP Bounce Tracker</h2>
+        <p class="subtitle">Automatic per-recipient bounce detection and tracking</p>
+        <div class="admin-actions">
+            <a href="/admin" class="btn btn-secondary">← Back to Admin</a>
+        </div>
+    </div>
+
+    <div class="info-box" style="background: #e3f2fd; border-left: 4px solid #2196f3; padding: 15px; margin: 15px 0; border-radius: 4px;">
+        <strong>📧 VERP (Variable Envelope Return Path):</strong>
+        <p>VERP automatically tracks which recipient bounced by encoding recipient information in the bounce address. Each outgoing message uses a unique bounce address, allowing automatic bounce classification without parsing bounce message bodies.</p>
+    </div>
+
+    {{if .SenderFilter}}
+    <div class="filter-section" style="background: #f5f5f5; padding: 12px; border-radius: 4px; margin-bottom: 15px;">
+        <strong>Filtered by Sender:</strong> {{.SenderFilter}}
+        <a href="/admin/verp-bounces" class="btn btn-sm btn-secondary">Clear Filter</a>
+    </div>
+    {{end}}
+
+    {{if .Bounces}}
+    <div class="stats-section" style="margin-bottom: 20px;">
+        <h3>Recent Bounces (Last 200)</h3>
+        <p style="color: #666; margin: 10px 0;">Total: {{len .Bounces}} bounce(s) recorded</p>
+        
+        {{if .Stats}}
+        <div style="background: #f9f9f9; padding: 12px; border-radius: 4px; margin: 10px 0;">
+            <strong>Bounce Summary:</strong>
+            <ul style="margin: 10px 0 0 20px; list-style: none;">
+                {{range $recipient, $count := .Stats}}
+                <li style="padding: 5px 0;">
+                    <code style="background: #eee; padding: 2px 6px; border-radius: 3px;">{{$recipient}}</code>
+                    - <strong>{{$count}}</strong> bounce(s)
+                </li>
+                {{end}}
+            </ul>
+        </div>
+        {{end}}
+    </div>
+
+    <table class="admin-table" style="width: 100%; border-collapse: collapse; margin-top: 15px;">
+        <thead style="background-color: #f5f5f5; border-bottom: 2px solid #ddd;">
+            <tr>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Original Recipient</th>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Sender</th>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Type</th>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Code</th>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Reason</th>
+                <th style="padding: 12px; text-align: left; font-weight: 600;">Received</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Bounces}}
+            <tr style="border-bottom: 1px solid #ddd; {{if eq .BounceType "permanent"}}background-color: #ffebee;{{else if eq .BounceType "temporary"}}background-color: #fff3e0;{{end}}">
+                <td style="padding: 12px;">
+                    <code style="background: #f5f5f5; padding: 4px 8px; border-radius: 3px; font-family: monospace;">{{.OriginalRecipient}}</code>
+                </td>
+                <td style="padding: 12px;">
+                    {{if .SenderEmail}}
+                    <a href="/admin/verp-bounces?sender={{.SenderEmail}}" title="Filter by sender">
+                        <code style="background: #f5f5f5; padding: 4px 8px; border-radius: 3px; font-family: monospace;">{{.SenderEmail}}</code>
+                    </a>
+                    {{end}}
+                </td>
+                <td style="padding: 12px;">
+                    {{if eq .BounceType "permanent"}}
+                    <span style="background: #f44336; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; font-weight: 600;">PERMANENT</span>
+                    {{else if eq .BounceType "temporary"}}
+                    <span style="background: #ff9800; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; font-weight: 600;">TEMPORARY</span>
+                    {{else}}
+                    <span style="background: #ccc; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; font-weight: 600;">UNKNOWN</span>
+                    {{end}}
+                </td>
+                <td style="padding: 12px; font-weight: 600;">
+                    {{if .BounceCode}}
+                    <code style="background: #f5f5f5; padding: 4px 8px; border-radius: 3px;">{{.BounceCode}}</code>
+                    {{else}}
+                    -
+                    {{end}}
+                </td>
+                <td style="padding: 12px; font-size: 13px; color: #666;">
+                    {{if .BounceReason}}
+                    {{.BounceReason}}
+                    {{else}}
+                    No reason provided
+                    {{end}}
+                </td>
+                <td style="padding: 12px; white-space: nowrap; font-size: 13px;">
+                    {{.BounceReceivedAt.Format "2006-01-02 15:04"}}
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+
+    {{else}}
+    <div class="info-box" style="background: #f1f8e9; border-left: 4px solid #4caf50; padding: 15px; margin: 15px 0; border-radius: 4px; text-align: center;">
+        <p style="margin: 0;">✅ No bounces recorded yet. VERP bounce tracking is working!</p>
+        <p style="margin: 5px 0 0 0; color: #666; font-size: 13px;">Bounces will appear here as they are detected.</p>
+    </div>
+    {{end}}
+
+    {{if .Senders}}
+    <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
+        <h3>Quick Filter by Sender</h3>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            {{range .Senders}}
+            <a href="/admin/verp-bounces?sender={{.}}" class="btn btn-sm btn-secondary">
+                {{.}}
+            </a>
+            {{end}}
+        </div>
+    </div>
+    {{end}}
+
+    <div style="margin-top: 30px; padding: 15px; background: #f9f9f9; border-radius: 4px; border-left: 4px solid #2196f3;">
+        <strong>ℹ️ How VERP Works:</strong>
+        <ol style="margin: 10px 0 0 20px;">
+            <li>Each outgoing message uses a unique bounce address: <code style="background: white; padding: 2px 4px;">sender+recipient_local=recipient_domain@yourdomain.com</code></li>
+            <li>If recipient bounces, bounce arrives at the VERP address</li>
+            <li>GoMail automatically decodes the recipient from the VERP address</li>
+            <li>Bounce is recorded with original recipient, bounce type, and error code</li>
+            <li>Admin can view, filter, and analyze bounces per sender</li>
+        </ol>
+    </div>
+</div>
+
+<style>
+.admin-panel {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.admin-header {
+    margin-bottom: 30px;
+}
+
+.admin-header h2 {
+    margin: 0 0 5px 0;
+    color: #333;
+    font-size: 28px;
+}
+
+.subtitle {
+    margin: 0 0 15px 0;
+    color: #666;
+    font-size: 14px;
+}
+
+.admin-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 15px;
+}
+
+.btn {
+    display: inline-block;
+    padding: 10px 16px;
+    border-radius: 4px;
+    text-decoration: none;
+    cursor: pointer;
+    font-size: 14px;
+    border: none;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.btn-secondary {
+    background-color: #f5f5f5;
+    color: #333;
+    border: 1px solid #ddd;
+}
+
+.btn-secondary:hover {
+    background-color: #e0e0e0;
+}
+
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+.admin-table {
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.admin-table tbody tr:hover {
+    background-color: #fafafa;
+}
+
+.info-box {
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.filter-section {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+code {
+    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+    font-size: 13px;
+}
+
+.stats-section {
+    background: white;
+    padding: 15px;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.stats-section h3 {
+    margin: 0 0 10px 0;
+    font-size: 16px;
+    color: #333;
+}
+</style>
+{{end}}

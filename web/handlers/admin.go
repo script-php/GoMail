@@ -33,6 +33,7 @@ type AdminHandler struct {
 	tmplTLSRPT        *template.Template
 	tmplGreylisting   *template.Template
 	tmplTarpitting    *template.Template
+	tmplVERPBounces   *template.Template
 	enqueueFunc       reporting.EnqueueFunc
 }
 
@@ -68,6 +69,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplTLSRPT := templates.LoadTemplate(funcMap, "base", "admin_tls_rpt", "welcome")
 	tmplGreylisting := templates.LoadTemplate(funcMap, "base", "admin_greylisting", "welcome")
 	tmplTarpitting := templates.LoadTemplate(funcMap, "base", "admin_tarpitting", "welcome")
+	tmplVERPBounces := templates.LoadTemplate(funcMap, "base", "admin_verp_bounces", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
@@ -82,6 +84,7 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		tmplTLSRPT:        tmplTLSRPT,
 		tmplGreylisting:   tmplGreylisting,
 		tmplTarpitting:    tmplTarpitting,
+		tmplVERPBounces:   tmplVERPBounces,
 		enqueueFunc:       enqueueFunc,
 	}
 }
@@ -1104,6 +1107,74 @@ func (h *AdminHandler) TarpittingEntries(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmplTarpitting.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// VERPBounces displays VERP bounce tracking statistics.
+func (h *AdminHandler) VERPBounces(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get filter from query parameters
+	senderFilter := r.URL.Query().Get("sender")
+	statusMsg := r.URL.Query().Get("status")
+
+	// Get recent VERP bounces (limit to 200 most recent)
+	var bounces []*store.VERPBounce
+	var err error
+	if senderFilter != "" {
+		bounces, err = h.db.ListVERPBounces(senderFilter, 200)
+	} else {
+		bounces, err = h.db.ListVERPBounces("", 200)
+	}
+	if err != nil {
+		log.Printf("[admin] error querying VERP bounces: %v", err)
+		bounces = []*store.VERPBounce{}
+	}
+
+	// Get bounce statistics for the current sender or all senders
+	var stats map[string]int
+	if senderFilter != "" {
+		stats, _ = h.db.GetVERPBounceStats(senderFilter, 7)
+	}
+
+	// Get unique senders for dropdown filter
+	var senders []string
+	for _, bounce := range bounces {
+		found := false
+		for _, s := range senders {
+			if s == bounce.SenderEmail {
+				found = true
+				break
+			}
+		}
+		if !found {
+			senders = append(senders, bounce.SenderEmail)
+		}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":        "VERP Bounce Tracker",
+		"Bounces":      bounces,
+		"Stats":        stats,
+		"Senders":      senders,
+		"SenderFilter": senderFilter,
+		"StatusMsg":    statusMsg,
+		"Unread":       unread,
+		"CSRFToken":    h.sessionMgr.GenerateCSRFToken(r),
+		"Section":      "admin",
+		"AdminPanel":   "verp",
+		"Account":      account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplVERPBounces.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[admin] template error: %v", err)
 	}
 }

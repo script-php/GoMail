@@ -107,6 +107,15 @@ type DeliveryConfig struct {
 	RetryIntervals []int  `json:"retry_intervals"`
 	MaxRetries     int    `json:"max_retries"`
 	Network        string `json:"network"` // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
+	EnableVERP     *bool  `json:"enable_verp"` // Enable per-recipient bounce tracking (default true)
+}
+
+// IsVERPEnabled returns whether VERP (Variable Envelope Return Path) is enabled (defaults to true).
+func (d *DeliveryConfig) IsVERPEnabled() bool {
+	if d.EnableVERP == nil {
+		return true
+	}
+	return *d.EnableVERP
 }
 
 // GetNetwork returns the network type for outbound connections (default "tcp" for both IPv4 and IPv6).

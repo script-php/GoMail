@@ -55,7 +55,8 @@
     "queue_workers": 4,
     "retry_intervals": [60, 300, 900, 3600, 14400, 86400],
     "max_retries": 6,
-    "network": "tcp"
+    "network": "tcp",
+    "enable_verp": false
   },
 
   "dns": {

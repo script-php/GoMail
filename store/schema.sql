@@ -88,22 +88,24 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 
 CREATE TABLE IF NOT EXISTS outbound_queue (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id    INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-    mail_from     TEXT    NOT NULL,
-    rcpt_to       TEXT    NOT NULL,      -- Single recipient per queue entry
-    raw_message   BLOB    NOT NULL,      -- DKIM-signed message to send
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    max_attempts  INTEGER NOT NULL DEFAULT 6,
-    next_retry    DATETIME NOT NULL DEFAULT (datetime('now')),
-    last_error    TEXT    NOT NULL DEFAULT '',
-    status        TEXT    NOT NULL DEFAULT 'pending', -- pending, sending, sent, failed
-    dsn_notify    TEXT    NOT NULL DEFAULT '',        -- DSN NOTIFY flags (SUCCESS,FAILURE,DELAY)
-    dsn_ret       TEXT    NOT NULL DEFAULT 'FULL',    -- FULL or HDRS
-    dsn_envid     TEXT    NOT NULL DEFAULT '',        -- Envelope ID for DSN reports
-    dsn_sent      INTEGER NOT NULL DEFAULT 0,         -- Whether DSN was sent (boolean)
-    created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
-    updated_at    DATETIME NOT NULL DEFAULT (datetime('now'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id          INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    mail_from           TEXT    NOT NULL,
+    rcpt_to             TEXT    NOT NULL,      -- Single recipient per queue entry
+    raw_message         BLOB    NOT NULL,      -- DKIM-signed message to send
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 6,
+    next_retry          DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_error          TEXT    NOT NULL DEFAULT '',
+    status              TEXT    NOT NULL DEFAULT 'pending', -- pending, sending, sent, failed
+    dsn_notify          TEXT    NOT NULL DEFAULT '',        -- DSN NOTIFY flags (SUCCESS,FAILURE,DELAY)
+    dsn_ret             TEXT    NOT NULL DEFAULT 'FULL',    -- FULL or HDRS
+    dsn_envid           TEXT    NOT NULL DEFAULT '',        -- Envelope ID for DSN reports
+    dsn_sent            INTEGER NOT NULL DEFAULT 0,         -- Whether DSN was sent (boolean)
+    verp_bounce_address TEXT    NOT NULL DEFAULT '',        -- VERP-encoded bounce address for MAIL FROM
+    original_recipient  TEXT    NOT NULL DEFAULT '',        -- Original recipient for bounce tracking
+    created_at          DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at          DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -201,3 +203,21 @@ CREATE TABLE IF NOT EXISTS tarpitting (
 CREATE INDEX IF NOT EXISTS idx_tarpitting_domain ON tarpitting(recipient_domain);
 CREATE INDEX IF NOT EXISTS idx_tarpitting_ip ON tarpitting(remote_ip);
 CREATE INDEX IF NOT EXISTS idx_tarpitting_first_failure ON tarpitting(first_failure);
+
+-- VERP bounce tracking for automatic recipient bounce detection
+CREATE TABLE IF NOT EXISTS verp_bounces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_recipient TEXT NOT NULL,       -- Original recipient that bounced (e.g., user@external.com)
+    sender_email TEXT NOT NULL,             -- Sender who sent the message (e.g., newsletter@example.com)
+    bounce_address TEXT NOT NULL,           -- VERP bounce address that received the bounce
+    bounce_type TEXT NOT NULL DEFAULT 'unknown',  -- permanent, temporary, unknown
+    bounce_code INTEGER,                    -- SMTP error code (e.g., 550, 421)
+    bounce_reason TEXT NOT NULL DEFAULT '', -- Human-readable bounce reason
+    queue_entry_id INTEGER,                 -- Reference to original queue entry if available
+    bounce_received_at DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we received the bounce
+    recorded_at DATETIME NOT NULL DEFAULT (datetime('now'))  -- When we recorded this bounce
+);
+
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_recipient ON verp_bounces(original_recipient);
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_sender ON verp_bounces(sender_email);
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_received ON verp_bounces(bounce_received_at);
