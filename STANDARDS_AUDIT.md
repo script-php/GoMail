@@ -280,13 +280,28 @@
   - **Priority:** Low
 
 ### Bounce & Feedback Handling
-- ❌ **VERP** (Variable Envelope Return Path) - Not implemented
-  - Impact: Cannot track per-recipient bounces automatically
-  - **Priority:** Medium
+- ✅ **VERP** (Variable Envelope Return Path) (FIXED April 26, 2026) - Full per-recipient bounce tracking
+  - **Implementation:** Automatic VERP encoding on outbound delivery; bounce detection via VERP address parsing on inbound
+  - **Features:** 
+    - Encode recipient in bounce address: `sender_local+recipient_local=recipient_domain@sender_domain`
+    - Use VERP address in MAIL FROM for each delivery attempt
+    - Automatic bounce parsing and recording to `verp_bounces` table
+    - Admin page `/admin/verp-bounces` with statistics and filtering
+    - Bounce categorization (permanent/temporary) with SMTP error codes
+  - **Database:** `verp_bounces` table tracks: recipient, sender, bounce address, bounce type, SMTP code, error message
+  - **Configuration:** `enable_verp` option in delivery config (defaults to true)
+  - **Impact:** Can now automatically track which recipients bounced on per-recipient basis
+  - **Priority:** Completed
 
-- ❌ **Inbound bounce parsing** - No special handling of null-sender `<>` DSN messages received from remote servers
-  - Impact: Bounce reports land in inbox like regular mail
-  - **Priority:** Medium
+- ✅ **Inbound bounce parsing** (FIXED April 26, 2026) - Full RFC 3464 multipart DSN detection and parsing
+  - **Implementation:** `parser/dsn.go` parses multipart/report DSN messages; `smtp/inbound.go` detects DSN via subject/headers
+  - **Features:**
+    - Extracts `message/delivery-status` MIME part from multipart DSNs
+    - Parses recipient status fields (Final-Recipient, Status, Action, Diagnostic-Code)
+    - Detects bounce addresses automatically
+    - Handles both multipart and plain-text DSN messages
+  - **Impact:** Inbound bounces from remote servers now properly parsed and tracked
+  - **Priority:** Completed
 
 - ❌ **ARF** (Abuse Reporting Format, RFC 5965) - Not receiving or processing abuse reports
   - Impact: Cannot process complaint reports from ISPs
@@ -373,28 +388,18 @@
 ### **HIGH Priority** (Should implement soon)
 
 ### **MEDIUM Priority** (Nice to have)
-1. **IPv6 outbound** - Change `"tcp4"` to `"tcp"` in `smtp/outbound.go`
-   - Effort: 30 minutes
-
-2. **Stale queue recovery** - Reset entries stuck in `"sending"` for >15 min back to `"pending"` on worker startup
-   - Files: `delivery/worker.go`
-   - Effort: 1 hour
-   - Impact: Prevents message loss on crash
-
-3. **MTA-STS enforcement on outbound** - Fetch/cache remote policies before delivery
-   - Files: `smtp/outbound.go`, `mta_sts/policy.go`, `mta_sts/fetcher.go`
-   - Effort: 1-2 days
-   - **Status:** ✅ COMPLETED April 18, 2026
-
-4. **List-Unsubscribe headers** (RFC 8058)
+1. **List-Unsubscribe headers** (RFC 8058)
    - File: `web/handlers/compose.go`
    - Effort: 2-3 hours
 
-5. **VERP** - Variable Envelope Return Path
+2. **HTML compose** - Rich text editor for email composition
+   - File: `web/handlers/compose.go`, `templates/compose.html`
    - Effort: 1-2 days
 
-5. **TLS-RPT report sending** (RFC 8460)
-   - Effort: 1-2 days
+3. **Session rotation** - Token rotation after login
+   - File: `security/session.go`
+   - Effort: 2-3 hours
+   - Impact: Reduces session token reuse risk if leaked
 
 ### **LOW Priority** (Enhancement)
 1. **BIMI** - Brand logos (visual only)

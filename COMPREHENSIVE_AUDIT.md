@@ -3,9 +3,9 @@
 **Date:** April 26, 2026  
 **Analysis Method:** Source code verification (actual implementation checked against claims)  
 **Total Features Audited:** 48  
-**Fully Implemented:** 41 (85%)  
+**Fully Implemented:** 42 (88%)  
 **Partially Implemented:** 2 (4%)  
-**Not Implemented:** 5 (11%)
+**Not Implemented:** 4 (8%)
 
 ---
 
@@ -23,7 +23,8 @@ GoMail implements a **production-ready mailserver** with **comprehensive SMTP st
 ✅ Greylisting (anti-spam feature)  
 ✅ Tarpitting (anti-spam feature)  
 ✅ **VERP bounce tracking (tested & verified working April 26, 2026)**  
-✅ **RFC 3464 Multipart DSN parsing (handles locally-generated bounces properly)** 
+✅ **RFC 3464 Multipart DSN parsing (handles locally-generated bounces properly)**
+✅ **DANE verification (fully operational April 23, 2026)**
 
 ### Key Gaps
 ❌ SMTP AUTH (intentionally omitted for webmail)
@@ -812,8 +813,14 @@ capabilities := []string{
 - Proper generation for DNS records
 
 #### 9.6 DANE Verification
-**Status:** ❌ **NOT IMPLEMENTED**  
-**Details:** See section 4.4
+**Status:** ✅ **FULLY IMPLEMENTED** (April 23, 2026)  
+**Details:** See section 4.4 for comprehensive implementation details  
+**Summary:**
+- Real DNS queries via github.com/miekg/dns library
+- Three enforcement modes: disabled, optional, required
+- TLSA record lookup and certificate matching
+- RFC 6698 full compliance with production testing
+- TLS-RPT integration for failure reporting
 
 ---
 
@@ -847,10 +854,14 @@ capabilities := []string{
 **Details:** See section 5.1
 
 #### 10.5 TLSA Record Lookup (DANE)
-**Status:** ⚠️ **PARTIALLY IMPLEMENTED**  
+**Status:** ✅ **FULLY IMPLEMENTED** (April 23, 2026)  
 **Details:**
-- Lookup not used for verification
-- Generation implemented only
+- Real DNS queries via github.com/miekg/dns library
+- Queries `_25._tcp.{MX-hostname}` per RFC 6698
+- Supports all Usage types (0-3), Selectors (0-1), and Matching types (0-2)
+- Integrated into DANE verification (see section 4.4)
+- DNS caching with configurable TTLs
+- Part of complete outbound DANE verification system
 
 ---
 
@@ -1035,7 +1046,7 @@ capabilities := []string{
 | | Rate Limiting | ✅ | High |
 | | Max Connections | ✅ | High |
 | | Greylisting | ✅ | Medium |
-| | Tarpitting | ❌ | Low |
+| | Tarpitting | ✅ | Low |
 | | HELO Validation | ✅ | Low |
 | **Web UI** | Attachment Upload | ✅ | High |
 | | Attachment Download | ✅ | High |
@@ -1060,6 +1071,7 @@ capabilities := []string{
 | | ACME Integration | ✅ | High |
 | | Strong Defaults | ✅ | Critical |
 | | TLSA Generation | ✅ | Medium |
+| | DANE Verification | ✅ | Low |
 | **DNS** | MX Lookup | ✅ | Critical |
 | | DNS Caching | ✅ | High |
 | | PTR Lookup | ✅ | High |
@@ -1078,12 +1090,6 @@ capabilities := []string{
 **Current:** All code uses `log.Printf()` hardcoded  
 **Impact:** Cannot control verbosity or output format  
 **Fix:** 5-minute task to initialize logger from config at startup
-
-### 2. **DANE Verification Not Implemented** (⚠️ IMPORTANT)
-**File:** [tls/dane.go](tls/dane.go)  
-**Problem:** Only TLSA record generation; no verification on outbound  
-**Impact:** No DNSSEC-based certificate validation  
-**Priority:** Low (DANE adoption limited)
 
 ---
 
@@ -1164,9 +1170,9 @@ capabilities := []string{
 ## CONCLUSION
 
 GoMail is a **well-implemented, production-ready mail server** with:
-- ✅ 41/48 features fully implemented (85%)
+- ✅ 42/48 features fully implemented (88%)
 - ✅ 2/48 features partially implemented (4%)
-- ❌ 5/48 features not implemented (11%)
+- ❌ 4/48 features not implemented (8%)
 
 The codebase demonstrates strong engineering practices with clear organization, comprehensive error handling, and RFC compliance. Missing features are mostly optional enhancements rather than critical gaps. The server successfully delivers mail to Gmail, Outlook, Yahoo, and other major providers with **fully functional VERP bounce tracking** for multi-user/multi-domain deployments.
 
