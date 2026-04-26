@@ -51,6 +51,53 @@
             </label>
         </div>
 
+        <div class="form-group">
+            <label for="dane_enforcement">DANE Verification (RFC 6698)</label>
+            <select id="dane_enforcement" name="dane_enforcement">
+                <option value="disabled" {{if eq .Domain.DANEEnforcement "disabled"}}selected{{end}}>Disabled (standard TLS only)</option>
+                <option value="optional" {{if eq .Domain.DANEEnforcement "optional"}}selected{{end}}>Optional (log warnings if TLSA records exist but don't match)</option>
+                <option value="required" {{if eq .Domain.DANEEnforcement "required"}}selected{{end}}>Required (fail delivery if TLSA records don't match)</option>
+            </select>
+            <small>DANE provides additional security by validating TLS certificates against DNS TLSA records. See <a href="https://tools.ietf.org/html/rfc6698" target="_blank">RFC 6698</a>.</small>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="greylisting_enabled" name="greylisting_enabled" value="1" {{if .Domain.GreylistingEnabled}}checked{{end}}>
+                Enable Greylisting (spam mitigation)
+            </label>
+            <small>Greylisting temporarily rejects mail from unknown sender/IP combinations, allowing legitimate senders to retry after a delay while blocking most spam bots.</small>
+        </div>
+
+        <div class="form-group" id="greylisting_delay_group" {{if not .Domain.GreylistingEnabled}}style="display:none;"{{end}}>
+            <label for="greylisting_delay_minutes">Greylisting Delay (minutes)</label>
+            <input type="number" id="greylisting_delay_minutes" name="greylisting_delay_minutes" min="5" max="480" value="{{.Domain.GreylistingDelayMins}}" placeholder="15">
+            <small>How long to wait before accepting mail from new sender/IP combinations (5-480 minutes, default 15 minutes).</small>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="tarpitting_enabled" name="tarpitting_enabled" value="1" {{if .Domain.TarpittingEnabled}}checked{{end}}>
+                Enable Tarpitting (spam bot slowdown)
+            </label>
+            <small>Tarpitting introduces artificial delays on repeated invalid SMTP commands, making spam campaigns inefficient while not affecting legitimate mail servers.</small>
+        </div>
+
+        <div class="form-group" id="tarpitting_delay_group" {{if not .Domain.TarpittingEnabled}}style="display:none;"{{end}}>
+            <label for="tarpitting_max_delay_seconds">Tarpitting Max Delay (seconds)</label>
+            <input type="number" id="tarpitting_max_delay_seconds" name="tarpitting_max_delay_seconds" min="1" max="30" value="{{.Domain.TarpittingMaxDelaySecs}}" placeholder="8">
+            <small>Maximum delay to apply (1-30 seconds, default 8 seconds). Progressive delays: 0s → 1s → 2s → 4s → max.</small>
+        </div>
+
+        <script>
+            document.getElementById('greylisting_enabled').addEventListener('change', function() {
+                document.getElementById('greylisting_delay_group').style.display = this.checked ? 'block' : 'none';
+            });
+            document.getElementById('tarpitting_enabled').addEventListener('change', function() {
+                document.getElementById('tarpitting_delay_group').style.display = this.checked ? 'block' : 'none';
+            });
+        </script>
+
         <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Domain{{else}}Save Changes{{end}}</button>
     </form>
 

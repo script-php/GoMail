@@ -135,6 +135,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/admin/dmarc-reports-manual", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.SendDMARCReportsNow)))
 	mux.Handle("/admin/tls-rpt", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.TLSRPTReports)))
 	mux.Handle("/admin/tls-rpt-manual", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.SendTLSRPTReportsNow)))
+	mux.Handle("/admin/greylisting", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.GreylistingEntries)))
+	mux.Handle("/admin/tarpitting", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.TarpittingEntries)))
+	mux.Handle("/admin/verp-bounces", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.VERPBounces)))
 }
 
 // GetHTTPServer returns the underlying http.Server for TLS configuration.

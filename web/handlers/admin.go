@@ -31,6 +31,9 @@ type AdminHandler struct {
 	tmplAccountEdit   *template.Template
 	tmplDMARCFeedback *template.Template
 	tmplTLSRPT        *template.Template
+	tmplGreylisting   *template.Template
+	tmplTarpitting    *template.Template
+	tmplVERPBounces   *template.Template
 	enqueueFunc       reporting.EnqueueFunc
 }
 
@@ -64,6 +67,9 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplAccountEdit := templates.LoadTemplate(funcMap, "base", "admin_account_edit", "welcome")
 	tmplDMARCFeedback := templates.LoadTemplate(funcMap, "base", "admin_dmarc_feedback", "welcome")
 	tmplTLSRPT := templates.LoadTemplate(funcMap, "base", "admin_tls_rpt", "welcome")
+	tmplGreylisting := templates.LoadTemplate(funcMap, "base", "admin_greylisting", "welcome")
+	tmplTarpitting := templates.LoadTemplate(funcMap, "base", "admin_tarpitting", "welcome")
+	tmplVERPBounces := templates.LoadTemplate(funcMap, "base", "admin_verp_bounces", "welcome")
 
 	return &AdminHandler{
 		cfg:               cfg,
@@ -76,6 +82,9 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 		tmplAccountEdit:   tmplAccountEdit,
 		tmplDMARCFeedback: tmplDMARCFeedback,
 		tmplTLSRPT:        tmplTLSRPT,
+		tmplGreylisting:   tmplGreylisting,
+		tmplTarpitting:    tmplTarpitting,
+		tmplVERPBounces:   tmplVERPBounces,
 		enqueueFunc:       enqueueFunc,
 	}
 }
@@ -215,6 +224,34 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 		domain.Domain = strings.ToLower(strings.TrimSpace(r.FormValue("domain")))
 		domain.IsActive = r.FormValue("is_active") == "1"
 		domain.RequireTLS = r.FormValue("require_tls") == "1"
+		domain.DANEEnforcement = r.FormValue("dane_enforcement")
+		if domain.DANEEnforcement == "" {
+			domain.DANEEnforcement = "disabled" // Default if not set
+		}
+		domain.GreylistingEnabled = r.FormValue("greylisting_enabled") == "1"
+		delayStr := r.FormValue("greylisting_delay_minutes")
+		if delayStr == "" {
+			domain.GreylistingDelayMins = 15 // Default delay
+		} else {
+			// Parse delay with error handling
+			if delay, err := strconv.Atoi(delayStr); err == nil && delay > 0 {
+				domain.GreylistingDelayMins = delay
+			} else {
+				domain.GreylistingDelayMins = 15
+			}
+		}
+		domain.TarpittingEnabled = r.FormValue("tarpitting_enabled") == "1"
+		delayStr2 := r.FormValue("tarpitting_max_delay_seconds")
+		if delayStr2 == "" {
+			domain.TarpittingMaxDelaySecs = 8 // Default max delay
+		} else {
+			// Parse delay with error handling
+			if delay, err := strconv.Atoi(delayStr2); err == nil && delay > 0 {
+				domain.TarpittingMaxDelaySecs = delay
+			} else {
+				domain.TarpittingMaxDelaySecs = 8
+			}
+		}
 		domain.DKIMSelector = r.FormValue("dkim_selector")
 		domain.DKIMAlgorithm = r.FormValue("dkim_algorithm")
 
@@ -904,6 +941,242 @@ func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Reque
 
 	// Redirect back to TLS-RPT page with success message
 	http.Redirect(w, r, "/admin/tls-rpt?sent=1", http.StatusSeeOther)
+}
+
+// GreylistingEntries displays greylisting entries for a domain.
+func (h *AdminHandler) GreylistingEntries(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get domain ID from query parameter
+	domainIDStr := r.URL.Query().Get("domain")
+	if domainIDStr == "" {
+		http.Error(w, "domain parameter required", http.StatusBadRequest)
+		return
+	}
+
+	domainID, err := strconv.ParseInt(domainIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid domain ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get domain
+	domain, err := h.db.GetDomain(domainID)
+	if err != nil || domain == nil {
+		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+
+	// Handle deletion if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "delete" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.DeleteGreylistingEntry(entryID); err != nil {
+				log.Printf("[admin] error deleting greylisting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s deleted greylisting entry %d from domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/greylisting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Handle whitelist if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "whitelist" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.WhitelistGreylistingEntry(entryID); err != nil {
+				log.Printf("[admin] error whitelisting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s whitelisted greylisting entry %d in domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/greylisting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Get greylisting entries for the domain
+	entries, err := h.db.GetGreylistingEntriesByDomain(domain.Domain)
+	if err != nil {
+		log.Printf("[admin] error querying greylisting entries: %v", err)
+		entries = []*store.GreylistEntry{}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":      "Greylisting Entries",
+		"Domain":     domain,
+		"Entries":    entries,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "greylisting",
+		"Account":    account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplGreylisting.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// TarpittingEntries displays tarpitting entries for a domain.
+func (h *AdminHandler) TarpittingEntries(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get domain ID from query parameter
+	domainIDStr := r.URL.Query().Get("domain")
+	if domainIDStr == "" {
+		http.Error(w, "domain parameter required", http.StatusBadRequest)
+		return
+	}
+
+	domainID, err := strconv.ParseInt(domainIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid domain ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get domain
+	domain, err := h.db.GetDomain(domainID)
+	if err != nil || domain == nil {
+		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+
+	// Handle deletion if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "delete" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.DeleteTarpittingEntry(entryID); err != nil {
+				log.Printf("[admin] error deleting tarpitting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s deleted tarpitting entry %d from domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/tarpitting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Handle whitelist if requested
+	if r.Method == http.MethodPost && r.FormValue("action") == "whitelist" {
+		entryIDStr := r.FormValue("entry_id")
+		entryID, _ := strconv.ParseInt(entryIDStr, 10, 64)
+		if entryID > 0 {
+			if err := h.db.WhitelistTarpittingEntry(entryID); err != nil {
+				log.Printf("[admin] error whitelisting tarpitting entry %d: %v", entryID, err)
+			} else {
+				log.Printf("[admin] user %s whitelisted tarpitting entry %d in domain %s", account.Email, entryID, domain.Domain)
+			}
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/tarpitting?domain=%d", domainID), http.StatusSeeOther)
+		return
+	}
+
+	// Get tarpitting entries for the domain with max delay setting
+	entries, err := h.db.GetTarpittingEntriesByDomainWithMaxDelay(domain.Domain, domain.TarpittingMaxDelaySecs)
+	if err != nil {
+		log.Printf("[admin] error querying tarpitting entries: %v", err)
+		entries = []*store.TarpittingEntry{}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":      "Tarpitting Entries",
+		"Domain":     domain,
+		"Entries":    entries,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "tarpitting",
+		"Account":    account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplTarpitting.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
+}
+
+// VERPBounces displays VERP bounce tracking statistics.
+func (h *AdminHandler) VERPBounces(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+
+	// Get filter from query parameters
+	senderFilter := r.URL.Query().Get("sender")
+	statusMsg := r.URL.Query().Get("status")
+
+	// Get recent VERP bounces (limit to 200 most recent)
+	var bounces []*store.VERPBounce
+	var err error
+	if senderFilter != "" {
+		bounces, err = h.db.ListVERPBounces(senderFilter, 200)
+	} else {
+		bounces, err = h.db.ListVERPBounces("", 200)
+	}
+	if err != nil {
+		log.Printf("[admin] error querying VERP bounces: %v", err)
+		bounces = []*store.VERPBounce{}
+	}
+
+	// Get bounce statistics for the current sender or all senders
+	var stats map[string]int
+	if senderFilter != "" {
+		stats, _ = h.db.GetVERPBounceStats(senderFilter, 7)
+	}
+
+	// Get unique senders for dropdown filter
+	var senders []string
+	for _, bounce := range bounces {
+		found := false
+		for _, s := range senders {
+			if s == bounce.SenderEmail {
+				found = true
+				break
+			}
+		}
+		if !found {
+			senders = append(senders, bounce.SenderEmail)
+		}
+	}
+
+	unread, _ := h.db.CountUnread(account.ID)
+
+	data := map[string]interface{}{
+		"Title":        "VERP Bounce Tracker",
+		"Bounces":      bounces,
+		"Stats":        stats,
+		"Senders":      senders,
+		"SenderFilter": senderFilter,
+		"StatusMsg":    statusMsg,
+		"Unread":       unread,
+		"CSRFToken":    h.sessionMgr.GenerateCSRFToken(r),
+		"Section":      "admin",
+		"AdminPanel":   "verp",
+		"Account":      account,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplVERPBounces.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] template error: %v", err)
+	}
 }
 
 // extractPubKeyBase64 extracts the base64 public key from PEM format.

@@ -10,6 +10,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"gomail/store"
 )
 
 // SessionState represents the current state of an SMTP conversation.
@@ -50,11 +52,12 @@ type Session struct {
 	maxRcpt         int
 	readTimeout     time.Duration
 	writeTimeout    time.Duration
-	smtputf8Enabled bool // true if client advertised SMTPUTF8 support
+	smtputf8Enabled bool      // true if client advertised SMTPUTF8 support
+	db              *store.DB // database reference for greylisting checks and domain lookups
 }
 
 // NewSession creates a new SMTP session for the given connection.
-func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool) *Session {
+func NewSession(conn net.Conn, hostname string, domains []string, accountExists func(string) bool, tlsCfg *tls.Config, maxSize int64, maxRcpt int, readTimeout, writeTimeout time.Duration, ptrHostname string, ptrValid bool, db *store.DB) *Session {
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
@@ -76,6 +79,7 @@ func NewSession(conn net.Conn, hostname string, domains []string, accountExists 
 		readTimeout:   readTimeout,
 		writeTimeout:  writeTimeout,
 		dsnNotify:     make(map[string]string),
+		db:            db,
 	}
 }
 
@@ -137,11 +141,21 @@ func (s *Session) handleCommand(line string) {
 	case "VRFY":
 		s.send(252, "Cannot VRFY user, but will accept message and attempt delivery")
 	default:
+		// Apply tarpitting if enabled for any domain
+		if len(s.domains) > 0 {
+			s.applyTarpitting(s.domains[0], cmd)
+		}
 		s.send(502, "Command not recognized")
 	}
 }
 
 func (s *Session) handleEHLO(arg string) {
+	// Validate HELO/EHLO argument per RFC 5321 §4.1.1.1
+	if err := s.validateHeloEhlo(arg); err != nil {
+		s.send(501, fmt.Sprintf("Bad EHLO syntax: %v", err))
+		return
+	}
+
 	s.ehlo = arg
 	s.reset()
 	s.state = StateReady
@@ -176,10 +190,77 @@ func (s *Session) handleEHLO(arg string) {
 }
 
 func (s *Session) handleHELO(arg string) {
+	// Validate HELO/EHLO argument per RFC 5321 §4.1.1.1
+	if err := s.validateHeloEhlo(arg); err != nil {
+		s.send(501, fmt.Sprintf("Bad HELO syntax: %v", err))
+		return
+	}
+
 	s.ehlo = arg
 	s.reset()
 	s.state = StateReady
 	s.send(250, fmt.Sprintf("%s Hello %s", s.hostname, arg))
+}
+
+// validateHeloEhlo validates HELO/EHLO argument per RFC 5321 §4.1.1.1
+// Must be either a domain name or an address literal
+func (s *Session) validateHeloEhlo(arg string) error {
+	if arg == "" {
+		return fmt.Errorf("empty HELO/EHLO argument")
+	}
+
+	// Check for address literal format: [IPv4] or [IPv6:...]
+	if len(arg) > 2 && arg[0] == '[' && arg[len(arg)-1] == ']' {
+		inner := arg[1 : len(arg)-1]
+		// IPv6 check
+		if strings.Contains(inner, ":") {
+			// IPv6 address
+			if ip := net.ParseIP(inner); ip != nil && ip.To4() == nil {
+				log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (IPv6 literal)", arg, s.clientAddr)
+				return nil
+			}
+			return fmt.Errorf("invalid IPv6 address literal: %s", inner)
+		}
+		// IPv4 check
+		if ip := net.ParseIP(inner); ip != nil && ip.To4() != nil {
+			log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (IPv4 literal)", arg, s.clientAddr)
+			return nil
+		}
+		return fmt.Errorf("invalid IPv4 address literal: %s", inner)
+	}
+
+	// Domain name check: must contain at least one dot (FQDN) or be "localhost"
+	if arg == "localhost" {
+		log.Printf("[smtp] HELO/EHLO validation passed for 'localhost' from %s", s.clientAddr)
+		return nil
+	}
+
+	if !strings.Contains(arg, ".") {
+		return fmt.Errorf("domain name must be a FQDN (contain at least one dot), got: %s", arg)
+	}
+
+	// Basic sanity check: domain should not start with dot or hyphen
+	if strings.HasPrefix(arg, ".") || strings.HasPrefix(arg, "-") {
+		return fmt.Errorf("invalid domain format: starts with invalid character")
+	}
+
+	// Check each label is valid
+	labels := strings.Split(arg, ".")
+	for _, label := range labels {
+		if label == "" {
+			return fmt.Errorf("domain contains empty label")
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("domain label exceeds 63 chars: %s", label)
+		}
+		// Labels should be alphanumeric + hyphens (but not start/end with hyphen)
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("domain label cannot start or end with hyphen: %s", label)
+		}
+	}
+
+	log.Printf("[smtp] HELO/EHLO validation passed for %s from %s (domain name)", arg, s.clientAddr)
+	return nil
 }
 
 func (s *Session) handleSTARTTLS() {
@@ -262,14 +343,42 @@ func (s *Session) handleRCPT(arg string) {
 		}
 	}
 	if !accepted {
+		s.applyTarpitting(recipientDomain, "RCPT")
 		s.send(550, fmt.Sprintf("User not local; not accepting mail for %s", to))
 		return
 	}
 
 	// Verify the specific account exists
 	if s.accountExists != nil && !s.accountExists(to) {
+		s.applyTarpitting(recipientDomain, "RCPT")
 		s.send(550, fmt.Sprintf("No such user: %s", to))
 		return
+	}
+
+	// Check greylisting if enabled for this domain
+	if s.db != nil && s.mailFrom != "" {
+		domain, err := s.db.GetDomainByName(recipientDomain)
+		if err == nil && domain != nil && domain.GreylistingEnabled {
+			// Check greylisting status
+			status, err := s.db.CheckGreylist(recipientDomain, s.clientIP, s.mailFrom, to, domain.GreylistingDelayMins)
+			if err != nil {
+				log.Printf("[smtp] greylisting check error for %s from %s: %v", to, s.clientIP, err)
+			} else if status != nil {
+				if status.IsNew {
+					log.Printf("[smtp] greylisting: new triplet (IP=%s, FROM=%s, TO=%s), temporary rejection", s.clientIP, s.mailFrom, to)
+					s.send(450, "Mailbox temporarily unavailable")
+					return
+				}
+				if !status.IsWhitelisted && !status.DelayExpired {
+					log.Printf("[smtp] greylisting: triplet still in delay period (IP=%s, FROM=%s, TO=%s), temporary rejection", s.clientIP, s.mailFrom, to)
+					s.send(421, "Service temporarily unavailable")
+					return
+				}
+				if status.DelayExpired && !status.IsWhitelisted {
+					log.Printf("[smtp] greylisting: triplet whitelisted after delay (IP=%s, FROM=%s, TO=%s)", s.clientIP, s.mailFrom, to)
+				}
+			}
+		}
 	}
 
 	if len(s.rcptTo) >= s.maxRcpt {
@@ -412,6 +521,35 @@ func (s *Session) sendMulti(code int, message string) {
 	s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	fmt.Fprintf(s.writer, "%d-%s\r\n", code, message)
 	s.writer.Flush()
+}
+
+// applyTarpitting checks if tarpitting is enabled for a domain and applies delay if warranted
+func (s *Session) applyTarpitting(recipientDomain, commandType string) {
+	if s.db == nil {
+		return
+	}
+
+	domain, err := s.db.GetDomainByName(recipientDomain)
+	if err != nil || domain == nil || !domain.TarpittingEnabled {
+		return
+	}
+
+	// Check current failure count for this IP with domain's max delay setting
+	delay, err := s.db.CheckTarpittingWithMaxDelay(recipientDomain, s.clientIP, domain.TarpittingMaxDelaySecs)
+	if err != nil || delay < 0 { // -1 means whitelisted
+		return
+	}
+
+	// Apply delay if > 0 seconds
+	if delay > 0 {
+		log.Printf("[smtp] tarpitting: applying %ds delay to %s from %s (command: %s)", delay, recipientDomain, s.clientIP, commandType)
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+
+	// Increment failure counter
+	if err := s.db.IncrementTarpittingFailure(recipientDomain, s.clientIP, commandType); err != nil {
+		log.Printf("[smtp] tarpitting: error incrementing failure count for %s: %v", s.clientIP, err)
+	}
 }
 
 // extractAddress parses an address from MAIL FROM:<addr> or RCPT TO:<addr>.

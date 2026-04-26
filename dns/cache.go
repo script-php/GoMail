@@ -52,6 +52,17 @@ func (c *Cache) Set(key string, value interface{}) {
 	}
 }
 
+// SetWithTTL stores a value in the cache with a custom TTL.
+func (c *Cache) SetWithTTL(key string, value interface{}, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[key] = &cacheEntry{
+		value:     value,
+		expiresAt: time.Now().Add(ttl),
+	}
+}
+
 // cleanup periodically removes expired entries.
 func (c *Cache) cleanup() {
 	ticker := time.NewTicker(c.ttl)

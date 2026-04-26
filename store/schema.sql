@@ -10,6 +10,11 @@ CREATE TABLE IF NOT EXISTS domains (
     dkim_private_key TEXT NOT NULL DEFAULT '',  -- PEM-encoded private key
     dkim_public_key  TEXT NOT NULL DEFAULT '',  -- Base64 public key for DNS
     require_tls     INTEGER NOT NULL DEFAULT 0,  -- 1 = fail if TLS unavailable, 0 = opportunistic TLS
+    dane_enforcement TEXT NOT NULL DEFAULT 'disabled',  -- disabled, optional, required
+    greylisting_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = enable greylisting, 0 = disable
+    greylisting_delay_minutes INTEGER NOT NULL DEFAULT 15,  -- Minutes to wait before accepting from new sender triplet
+    tarpitting_enabled INTEGER NOT NULL DEFAULT 0,  -- 1 = enable tarpitting, 0 = disable
+    tarpitting_max_delay_seconds INTEGER NOT NULL DEFAULT 8,  -- Max delay in seconds for repeated failures
     created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -83,22 +88,24 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 
 CREATE TABLE IF NOT EXISTS outbound_queue (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id    INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-    mail_from     TEXT    NOT NULL,
-    rcpt_to       TEXT    NOT NULL,      -- Single recipient per queue entry
-    raw_message   BLOB    NOT NULL,      -- DKIM-signed message to send
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    max_attempts  INTEGER NOT NULL DEFAULT 6,
-    next_retry    DATETIME NOT NULL DEFAULT (datetime('now')),
-    last_error    TEXT    NOT NULL DEFAULT '',
-    status        TEXT    NOT NULL DEFAULT 'pending', -- pending, sending, sent, failed
-    dsn_notify    TEXT    NOT NULL DEFAULT '',        -- DSN NOTIFY flags (SUCCESS,FAILURE,DELAY)
-    dsn_ret       TEXT    NOT NULL DEFAULT 'FULL',    -- FULL or HDRS
-    dsn_envid     TEXT    NOT NULL DEFAULT '',        -- Envelope ID for DSN reports
-    dsn_sent      INTEGER NOT NULL DEFAULT 0,         -- Whether DSN was sent (boolean)
-    created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
-    updated_at    DATETIME NOT NULL DEFAULT (datetime('now'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id          INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    mail_from           TEXT    NOT NULL,
+    rcpt_to             TEXT    NOT NULL,      -- Single recipient per queue entry
+    raw_message         BLOB    NOT NULL,      -- DKIM-signed message to send
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 6,
+    next_retry          DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_error          TEXT    NOT NULL DEFAULT '',
+    status              TEXT    NOT NULL DEFAULT 'pending', -- pending, sending, sent, failed
+    dsn_notify          TEXT    NOT NULL DEFAULT '',        -- DSN NOTIFY flags (SUCCESS,FAILURE,DELAY)
+    dsn_ret             TEXT    NOT NULL DEFAULT 'FULL',    -- FULL or HDRS
+    dsn_envid           TEXT    NOT NULL DEFAULT '',        -- Envelope ID for DSN reports
+    dsn_sent            INTEGER NOT NULL DEFAULT 0,         -- Whether DSN was sent (boolean)
+    verp_bounce_address TEXT    NOT NULL DEFAULT '',        -- VERP-encoded bounce address for MAIL FROM
+    original_recipient  TEXT    NOT NULL DEFAULT '',        -- Original recipient for bounce tracking
+    created_at          DATETIME NOT NULL DEFAULT (datetime('now')),
+    updated_at          DATETIME NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -161,3 +168,56 @@ CREATE TABLE IF NOT EXISTS tls_failures (
 
 CREATE INDEX IF NOT EXISTS idx_tls_failures_domain ON tls_failures(recipient_domain);
 CREATE INDEX IF NOT EXISTS idx_tls_failures_attempted ON tls_failures(attempted_at);
+
+-- Greylisting triplet tracking for spam mitigation
+CREATE TABLE IF NOT EXISTS greylisting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_domain TEXT NOT NULL,         -- Domain this greylisting record is for
+    remote_ip TEXT NOT NULL,                -- Sending server IP
+    sender_email TEXT NOT NULL,             -- MAIL FROM address
+    recipient_email TEXT NOT NULL,          -- RCPT TO address
+    first_seen DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we first saw this triplet
+    whitelisted_at DATETIME,                -- When we first accepted a message from this triplet (NULL if never whitelisted)
+    rejected_count INTEGER NOT NULL DEFAULT 1,  -- Number of times we rejected this triplet
+    UNIQUE(recipient_domain, remote_ip, sender_email, recipient_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_greylisting_domain ON greylisting(recipient_domain);
+CREATE INDEX IF NOT EXISTS idx_greylisting_triplet ON greylisting(remote_ip, sender_email, recipient_email);
+CREATE INDEX IF NOT EXISTS idx_greylisting_first_seen ON greylisting(first_seen);
+
+-- Tarpitting: track failed SMTP commands per IP for spam mitigation
+CREATE TABLE IF NOT EXISTS tarpitting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_domain TEXT NOT NULL,         -- Domain this tarpitting record is for
+    remote_ip TEXT NOT NULL,                -- Sending server IP
+    failure_count INTEGER NOT NULL DEFAULT 1,  -- Number of failures from this IP
+    last_invalid_command TEXT NOT NULL DEFAULT 'unknown',  -- Type of last invalid command
+    first_failure DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we first saw a failure
+    last_failure DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we last saw a failure
+    whitelisted_at DATETIME,                -- When manually whitelisted (NULL = not whitelisted)
+    notes TEXT NOT NULL DEFAULT '',         -- Admin notes
+    UNIQUE(recipient_domain, remote_ip)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tarpitting_domain ON tarpitting(recipient_domain);
+CREATE INDEX IF NOT EXISTS idx_tarpitting_ip ON tarpitting(remote_ip);
+CREATE INDEX IF NOT EXISTS idx_tarpitting_first_failure ON tarpitting(first_failure);
+
+-- VERP bounce tracking for automatic recipient bounce detection
+CREATE TABLE IF NOT EXISTS verp_bounces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_recipient TEXT NOT NULL,       -- Original recipient that bounced (e.g., user@external.com)
+    sender_email TEXT NOT NULL,             -- Sender who sent the message (e.g., newsletter@example.com)
+    bounce_address TEXT NOT NULL,           -- VERP bounce address that received the bounce
+    bounce_type TEXT NOT NULL DEFAULT 'unknown',  -- permanent, temporary, unknown
+    bounce_code INTEGER,                    -- SMTP error code (e.g., 550, 421)
+    bounce_reason TEXT NOT NULL DEFAULT '', -- Human-readable bounce reason
+    queue_entry_id INTEGER,                 -- Reference to original queue entry if available
+    bounce_received_at DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we received the bounce
+    recorded_at DATETIME NOT NULL DEFAULT (datetime('now'))  -- When we recorded this bounce
+);
+
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_recipient ON verp_bounces(original_recipient);
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_sender ON verp_bounces(sender_email);
+CREATE INDEX IF NOT EXISTS idx_verp_bounces_received ON verp_bounces(bounce_received_at);

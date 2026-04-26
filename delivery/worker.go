@@ -124,6 +124,13 @@ func (w *Worker) processQueue() {
 	// Prepare message with ARC headers
 	messageWithARC := w.addARCHeaders(entry.RawMessage, entry.MailFrom, parseRecipientDomain(entry.RcptTo))
 
+	// Use VERP bounce address in MAIL FROM if available, otherwise use original sender
+	mailFromAddr := entry.MailFrom
+	if entry.VERPBounceAddress != "" {
+		mailFromAddr = entry.VERPBounceAddress
+		log.Printf("[delivery] using VERP bounce address: %s (original: %s)", mailFromAddr, entry.MailFrom)
+	}
+
 	if w.isLocalRecipient(entry.RcptTo) {
 		deliveryErr = w.deliverLocal(entry, messageWithARC)
 	} else {
@@ -135,7 +142,7 @@ func (w *Worker) processQueue() {
 		}
 
 		deliveryErr = smtp.SendMail(
-			entry.MailFrom,
+			mailFromAddr,
 			entry.RcptTo,
 			messageWithARC,
 			w.cfg.Server.Hostname,
@@ -491,6 +498,30 @@ func (w *Worker) sendDSNReport(entry *store.QueueEntry, errorMsg string, smtpCod
 	if err := w.deliverDSN(entry.MailFrom, dsnReport); err != nil {
 		log.Printf("[delivery] failed to deliver DSN to %s: %v", entry.MailFrom, err)
 		return err
+	}
+
+// --- Record VERP bounce for this failure (if VERP is enabled) ---
+	if w.cfg.Delivery.IsVERPEnabled() {
+		// Extract bounce type from SMTP code (4xx = temporary, 5xx = permanent)
+		bounceType := "unknown"
+		if smtpCode >= 500 && smtpCode < 600 {
+			bounceType = "permanent"
+		} else if smtpCode >= 400 && smtpCode < 500 {
+			bounceType = "temporary"
+		}
+
+		// Use VERP bounce address if available, otherwise use original sender
+		bounceAddr := entry.VERPBounceAddress
+		if bounceAddr == "" {
+			bounceAddr = entry.MailFrom
+		}
+
+		log.Printf("[delivery] [verp] recording bounce - recipient=%s sender=%s bounce_addr=%s type=%s code=%d",
+			entry.RcptTo, entry.MailFrom, bounceAddr, bounceType, smtpCode)
+
+		if err := w.db.RecordVERPBounce(entry.RcptTo, entry.MailFrom, bounceAddr, bounceType, smtpCode, errorMsg); err != nil {
+			log.Printf("[delivery] [verp] error recording bounce: %v", err)
+		}
 	}
 
 	// Mark DSN as sent

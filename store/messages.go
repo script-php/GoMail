@@ -11,9 +11,9 @@ import (
 // CreateDomain adds a new domain.
 func (db *DB) CreateDomain(d *Domain) (int64, error) {
 	result, err := db.Exec(`
-		INSERT INTO domains (domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm, d.DKIMPrivateKey, d.DKIMPublicKey,
+		INSERT INTO domains (domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm, d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, boolToInt(d.GreylistingEnabled), d.GreylistingDelayMins, boolToInt(d.TarpittingEnabled), d.TarpittingMaxDelaySecs,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("creating domain: %w", err)
@@ -24,11 +24,11 @@ func (db *DB) CreateDomain(d *Domain) (int64, error) {
 // GetDomain returns a domain by ID.
 func (db *DB) GetDomain(id int64) (*Domain, error) {
 	d := &Domain{}
-	var isActive int
+	var isActive, requireTLS, greylistingEnabled, tarpittingEnabled int
 	err := db.QueryRow(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds, created_at
 		FROM domains WHERE id = ?`, id).Scan(
-		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &d.CreatedAt,
+		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &tarpittingEnabled, &d.TarpittingMaxDelaySecs, &d.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -37,17 +37,20 @@ func (db *DB) GetDomain(id int64) (*Domain, error) {
 		return nil, fmt.Errorf("getting domain %d: %w", id, err)
 	}
 	d.IsActive = isActive == 1
+	d.RequireTLS = requireTLS == 1
+	d.GreylistingEnabled = greylistingEnabled == 1
+	d.TarpittingEnabled = tarpittingEnabled == 1
 	return d, nil
 }
 
 // GetDomainByName returns a domain by its domain name.
 func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 	d := &Domain{}
-	var isActive, requireTLS int
+	var isActive, requireTLS, greylistingEnabled, tarpittingEnabled int
 	err := db.QueryRow(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds, created_at
 		FROM domains WHERE domain = ?`, domain).Scan(
-		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.CreatedAt,
+		&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPrivateKey, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &tarpittingEnabled, &d.TarpittingMaxDelaySecs, &d.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -57,13 +60,15 @@ func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 	}
 	d.IsActive = isActive == 1
 	d.RequireTLS = requireTLS == 1
+	d.GreylistingEnabled = greylistingEnabled == 1
+	d.TarpittingEnabled = tarpittingEnabled == 1
 	return d, nil
 }
 
 // ListDomains returns all domains.
 func (db *DB) ListDomains() ([]*Domain, error) {
 	rows, err := db.Query(`
-		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, created_at
+		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds, created_at
 		FROM domains ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("listing domains: %w", err)
@@ -73,12 +78,14 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 	var domains []*Domain
 	for rows.Next() {
 		d := &Domain{}
-		var isActive, requireTLS int
-		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &requireTLS, &d.CreatedAt); err != nil {
+		var isActive, requireTLS, greylistingEnabled, tarpittingEnabled int
+		if err := rows.Scan(&d.ID, &d.Domain, &isActive, &d.DKIMSelector, &d.DKIMAlgorithm, &d.DKIMPublicKey, &requireTLS, &d.DANEEnforcement, &greylistingEnabled, &d.GreylistingDelayMins, &tarpittingEnabled, &d.TarpittingMaxDelaySecs, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scanning domain row: %w", err)
 		}
 		d.IsActive = isActive == 1
 		d.RequireTLS = requireTLS == 1
+		d.GreylistingEnabled = greylistingEnabled == 1
+		d.TarpittingEnabled = tarpittingEnabled == 1
 		domains = append(domains, d)
 
 	}
@@ -89,9 +96,9 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 func (db *DB) UpdateDomain(d *Domain) error {
 	_, err := db.Exec(`
 		UPDATE domains SET domain = ?, is_active = ?, dkim_selector = ?, dkim_algorithm = ?,
-		dkim_private_key = ?, dkim_public_key = ?, require_tls = ? WHERE id = ?`,
+		dkim_private_key = ?, dkim_public_key = ?, require_tls = ?, dane_enforcement = ?, greylisting_enabled = ?, greylisting_delay_minutes = ?, tarpitting_enabled = ?, tarpitting_max_delay_seconds = ? WHERE id = ?`,
 		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm,
-		d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.ID,
+		d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, boolToInt(d.GreylistingEnabled), d.GreylistingDelayMins, boolToInt(d.TarpittingEnabled), d.TarpittingMaxDelaySecs, d.ID,
 	)
 	return err
 }
@@ -504,9 +511,9 @@ func sqliteTime(t time.Time) string {
 // EnqueueMessage adds a message to the outbound delivery queue.
 func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) {
 	result, err := db.Exec(`
-		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID,
+		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid, verp_bounce_address, original_recipient)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("enqueueing message: %w", err)
@@ -518,7 +525,7 @@ func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) {
 func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 	rows, err := db.Query(`
 		SELECT id, message_id, mail_from, rcpt_to, raw_message, attempts, max_attempts,
-			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, created_at, updated_at
+			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, verp_bounce_address, original_recipient, created_at, updated_at
 		FROM outbound_queue
 		WHERE status = 'pending' AND next_retry <= datetime('now')
 		ORDER BY next_retry ASC
@@ -534,7 +541,7 @@ func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 		var dsnSent int
 		if err := rows.Scan(&q.ID, &q.MessageID, &q.MailFrom, &q.RcptTo,
 			&q.RawMessage, &q.Attempts, &q.MaxAttempts, &q.NextRetry,
-			&q.LastError, &q.Status, &q.DSNNotify, &q.DSNRet, &q.DSNEnvID, &dsnSent, &q.CreatedAt, &q.UpdatedAt); err != nil {
+			&q.LastError, &q.Status, &q.DSNNotify, &q.DSNRet, &q.DSNEnvID, &dsnSent, &q.VERPBounceAddress, &q.OriginalRecipient, &q.CreatedAt, &q.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scanning queue row: %w", err)
 		}
 		q.DSNSent = dsnSent != 0
@@ -644,6 +651,376 @@ func (db *DB) DeleteSession(token string) error {
 func (db *DB) CleanExpiredSessions() error {
 	_, err := db.Exec(`DELETE FROM sessions WHERE expires_at <= datetime('now')`)
 	return err
+}
+
+// --- Greylisting ---
+
+// GreylistStatus represents the status of a sender triplet
+type GreylistStatus struct {
+	IsNew         bool      // New triplet (never seen)
+	IsWhitelisted bool      // Already accepted from this triplet
+	FirstSeen     time.Time // When we first saw this triplet
+	DelayExpired  bool      // Whether the delay has passed
+}
+
+// CheckGreylist checks if a sender triplet should be accepted or temporarily rejected.
+// Returns GreylistStatus with details about the triplet.
+// If not whitelisted yet and delay not expired: reject with 421
+// If new: reject with 450
+// Otherwise: accept and mark as whitelisted if not already
+func (db *DB) CheckGreylist(recipientDomain, remoteIP, senderEmail, recipientEmail string, delayMinutes int) (*GreylistStatus, error) {
+	status := &GreylistStatus{}
+	var whitelistedAt sql.NullTime
+
+	err := db.QueryRow(`
+		SELECT first_seen, whitelisted_at FROM greylisting
+		WHERE recipient_domain = ? AND remote_ip = ? AND sender_email = ? AND recipient_email = ?
+		LIMIT 1`,
+		recipientDomain, remoteIP, senderEmail, recipientEmail).Scan(&status.FirstSeen, &whitelistedAt)
+
+	if err == sql.ErrNoRows {
+		// New triplet - insert and reject
+		status.IsNew = true
+		_, err := db.Exec(`
+			INSERT INTO greylisting (recipient_domain, remote_ip, sender_email, recipient_email, first_seen, rejected_count)
+			VALUES (?, ?, ?, ?, datetime('now'), 1)`,
+			recipientDomain, remoteIP, senderEmail, recipientEmail)
+		if err != nil {
+			return nil, fmt.Errorf("recording greylisting entry: %w", err)
+		}
+		return status, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("checking greylisting: %w", err)
+	}
+
+	// Existing triplet
+	if whitelistedAt.Valid {
+		status.IsWhitelisted = true
+		return status, nil
+	}
+
+	// Not yet whitelisted - check if delay has passed
+	elapsed := time.Since(status.FirstSeen)
+	delayDuration := time.Duration(delayMinutes) * time.Minute
+	if elapsed >= delayDuration {
+		status.DelayExpired = true
+		// Mark as whitelisted
+		_, err := db.Exec(`
+			UPDATE greylisting SET whitelisted_at = datetime('now')
+			WHERE recipient_domain = ? AND remote_ip = ? AND sender_email = ? AND recipient_email = ?`,
+			recipientDomain, remoteIP, senderEmail, recipientEmail)
+		if err != nil {
+			return nil, fmt.Errorf("whitelisting greylisting entry: %w", err)
+		}
+	}
+
+	return status, nil
+}
+
+// CleanupGreylisting removes old greylisting entries that were never accepted (>30 days old).
+// Keeps whitelisted senders in the list permanently (they are proven safe).
+func (db *DB) CleanupGreylisting() error {
+	_, err := db.Exec(`
+		DELETE FROM greylisting
+		WHERE first_seen < datetime('now', '-30 days')
+		AND whitelisted_at IS NULL`)
+	if err != nil {
+		return fmt.Errorf("cleaning up greylisting: %w", err)
+	}
+	return nil
+}
+
+// GreylistEntry represents a greylisting entry for display in admin UI
+type GreylistEntry struct {
+	ID              int64
+	RecipientDomain string
+	RemoteIP        string
+	SenderEmail     string
+	RecipientEmail  string
+	FirstSeen       time.Time
+	WhitelistedAt   sql.NullTime
+	RejectedCount   int
+	Status          string // "NEW", "DELAYING", or "WHITELISTED"
+	HoursAgo        int    // How many hours since first_seen
+}
+
+// GetGreylistingEntriesByDomain returns all greylisting entries for a domain
+func (db *DB) GetGreylistingEntriesByDomain(recipientDomain string) ([]*GreylistEntry, error) {
+	rows, err := db.Query(`
+		SELECT id, recipient_domain, remote_ip, sender_email, recipient_email, first_seen, whitelisted_at, rejected_count
+		FROM greylisting
+		WHERE recipient_domain = ?
+		ORDER BY first_seen DESC`, recipientDomain)
+	if err != nil {
+		return nil, fmt.Errorf("querying greylisting entries: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*GreylistEntry
+	for rows.Next() {
+		e := &GreylistEntry{}
+		if err := rows.Scan(&e.ID, &e.RecipientDomain, &e.RemoteIP, &e.SenderEmail,
+			&e.RecipientEmail, &e.FirstSeen, &e.WhitelistedAt, &e.RejectedCount); err != nil {
+			return nil, fmt.Errorf("scanning greylisting entry: %w", err)
+		}
+
+		// Calculate status and hours ago
+		e.HoursAgo = int(time.Since(e.FirstSeen).Hours())
+		if e.WhitelistedAt.Valid {
+			e.Status = "WHITELISTED"
+		} else if e.HoursAgo > 0 {
+			// Assume 15 minute default delay; in real code could fetch from domain config
+			if e.HoursAgo*60 >= 15 { // More than 15 minutes
+				e.Status = "DELAYING"
+			} else {
+				e.Status = "NEW"
+			}
+		} else {
+			e.Status = "NEW"
+		}
+
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// DeleteGreylistingEntry removes a specific greylisting entry
+func (db *DB) DeleteGreylistingEntry(id int64) error {
+	_, err := db.Exec(`DELETE FROM greylisting WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("deleting greylisting entry: %w", err)
+	}
+	return nil
+}
+
+// WhitelistGreylistingEntry manually marks an entry as whitelisted
+func (db *DB) WhitelistGreylistingEntry(id int64) error {
+	_, err := db.Exec(`UPDATE greylisting SET whitelisted_at = datetime('now') WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("whitelisting entry: %w", err)
+	}
+	return nil
+}
+
+// --- Tarpitting ---
+
+// TarpittingEntry represents a tarpitting entry for display in admin UI
+type TarpittingEntry struct {
+	ID                 int64
+	RecipientDomain    string
+	RemoteIP           string
+	FailureCount       int
+	LastInvalidCommand string
+	FirstFailure       time.Time
+	LastFailure        time.Time
+	WhitelistedAt      sql.NullTime
+	Notes              string
+	HoursAgo           int // How many hours since first_failure
+	DelaySeconds       int // Calculated delay based on failure count
+}
+
+// GetTarpittingEntriesByDomain returns all tarpitting entries for a domain
+func (db *DB) GetTarpittingEntriesByDomain(recipientDomain string) ([]*TarpittingEntry, error) {
+	rows, err := db.Query(`
+		SELECT id, recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure, whitelisted_at, notes
+		FROM tarpitting
+		WHERE recipient_domain = ?
+		ORDER BY last_failure DESC`, recipientDomain)
+	if err != nil {
+		return nil, fmt.Errorf("querying tarpitting entries: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*TarpittingEntry
+	for rows.Next() {
+		e := &TarpittingEntry{}
+		if err := rows.Scan(&e.ID, &e.RecipientDomain, &e.RemoteIP, &e.FailureCount,
+			&e.LastInvalidCommand, &e.FirstFailure, &e.LastFailure, &e.WhitelistedAt, &e.Notes); err != nil {
+			return nil, fmt.Errorf("scanning tarpitting row: %w", err)
+		}
+		// Calculate hours since first failure
+		e.HoursAgo = int(time.Since(e.FirstFailure).Hours())
+		// Calculate delay with default max (8 seconds for backward compatibility)
+		e.DelaySeconds = calculateTarpittingDelay(e.FailureCount, 8)
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// GetTarpittingEntriesByDomainWithMaxDelay returns all tarpitting entries for a domain with delays calculated using domain's max delay setting
+func (db *DB) GetTarpittingEntriesByDomainWithMaxDelay(recipientDomain string, maxDelay int) ([]*TarpittingEntry, error) {
+	rows, err := db.Query(`
+		SELECT id, recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure, whitelisted_at, notes
+		FROM tarpitting
+		WHERE recipient_domain = ?
+		ORDER BY last_failure DESC`, recipientDomain)
+	if err != nil {
+		return nil, fmt.Errorf("querying tarpitting entries: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*TarpittingEntry
+	for rows.Next() {
+		e := &TarpittingEntry{}
+		if err := rows.Scan(&e.ID, &e.RecipientDomain, &e.RemoteIP, &e.FailureCount,
+			&e.LastInvalidCommand, &e.FirstFailure, &e.LastFailure, &e.WhitelistedAt, &e.Notes); err != nil {
+			return nil, fmt.Errorf("scanning tarpitting row: %w", err)
+		}
+		// Calculate hours since first failure
+		e.HoursAgo = int(time.Since(e.FirstFailure).Hours())
+		// Calculate delay using domain's max delay setting
+		e.DelaySeconds = calculateTarpittingDelay(e.FailureCount, maxDelay)
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// calculateTarpittingDelay returns the delay in seconds based on failure count and max delay
+// Uses exponential backoff: 0s, 1s, 2s, 4s, 8s, 16s, 32s, ... up to maxDelay
+func calculateTarpittingDelay(failureCount, maxDelay int) int {
+	if maxDelay <= 0 {
+		maxDelay = 8 // Default if not set
+	}
+	if failureCount <= 1 {
+		return 0 // Free pass on first failure
+	}
+
+	// Exponential backoff: 2^(failureCount-2) seconds
+	// failureCount 2 -> 2^0 = 2
+	// failureCount 3 -> 2^1 = 4
+	// failureCount 4 -> 2^2 = 8
+	// failureCount 5 -> 2^3 = 16
+	// failureCount 6+ -> 2^4 = 30 (capped to maxDelay)
+	exp := 2
+	for i := 0; i < failureCount-2; i++ {
+		exp *= 2
+		if exp > maxDelay { // Stop early if we exceed maxDelay
+			return maxDelay
+		}
+	}
+	return minInt(exp, maxDelay)
+}
+
+// minInt returns the minimum of two integers
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// IncrementTarpittingFailure increments the failure count for an IP or creates new entry
+func (db *DB) IncrementTarpittingFailure(recipientDomain, remoteIP, lastInvalidCommand string) error {
+	_, err := db.Exec(`
+		INSERT INTO tarpitting (recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure)
+		VALUES (?, ?, 1, ?, datetime('now'), datetime('now'))
+		ON CONFLICT(recipient_domain, remote_ip) DO UPDATE SET
+			failure_count = failure_count + 1,
+			last_invalid_command = excluded.last_invalid_command,
+			last_failure = datetime('now')`,
+		recipientDomain, remoteIP, lastInvalidCommand)
+	if err != nil {
+		return fmt.Errorf("incrementing tarpitting failure: %w", err)
+	}
+	return nil
+}
+
+// CheckTarpitting returns the delay in seconds for this IP, or -1 if whitelisted
+func (db *DB) CheckTarpitting(recipientDomain, remoteIP string) (int, error) {
+	var failureCount int
+	var whitelistedAt sql.NullTime
+	var lastFailure time.Time
+
+	err := db.QueryRow(`
+		SELECT failure_count, whitelisted_at, last_failure
+		FROM tarpitting
+		WHERE recipient_domain = ? AND remote_ip = ?`,
+		recipientDomain, remoteIP).Scan(&failureCount, &whitelistedAt, &lastFailure)
+
+	if err == sql.ErrNoRows {
+		return 0, nil // No entry, no delay
+	}
+	if err != nil {
+		return 0, fmt.Errorf("checking tarpitting: %w", err)
+	}
+
+	// If whitelisted, no delay
+	if whitelistedAt.Valid {
+		return -1, nil
+	}
+
+	// If it's been >1 hour since last failure, reset counter
+	if time.Since(lastFailure) > 1*time.Hour {
+		return 0, nil
+	}
+
+	// Return calculated delay - if maxDelay not passed, use default
+	// This overload kept for backward compatibility
+	return calculateTarpittingDelay(failureCount, 8), nil
+}
+
+// CheckTarpittingWithMaxDelay returns the delay in seconds for this IP with domain max delay setting
+func (db *DB) CheckTarpittingWithMaxDelay(recipientDomain, remoteIP string, maxDelay int) (int, error) {
+	var failureCount int
+	var whitelistedAt sql.NullTime
+	var lastFailure time.Time
+
+	err := db.QueryRow(`
+		SELECT failure_count, whitelisted_at, last_failure
+		FROM tarpitting
+		WHERE recipient_domain = ? AND remote_ip = ?`,
+		recipientDomain, remoteIP).Scan(&failureCount, &whitelistedAt, &lastFailure)
+
+	if err == sql.ErrNoRows {
+		return 0, nil // No entry, no delay
+	}
+	if err != nil {
+		return 0, fmt.Errorf("checking tarpitting: %w", err)
+	}
+
+	// If whitelisted, no delay
+	if whitelistedAt.Valid {
+		return -1, nil
+	}
+
+	// If it's been >1 hour since last failure, reset counter
+	if time.Since(lastFailure) > 1*time.Hour {
+		return 0, nil
+	}
+
+	// Return calculated delay with domain's max delay setting
+	return calculateTarpittingDelay(failureCount, maxDelay), nil
+}
+
+// WhitelistTarpittingEntry manually marks an entry as whitelisted
+func (db *DB) WhitelistTarpittingEntry(id int64) error {
+	_, err := db.Exec(`UPDATE tarpitting SET whitelisted_at = datetime('now') WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("whitelisting tarpitting entry: %w", err)
+	}
+	return nil
+}
+
+// DeleteTarpittingEntry removes a specific tarpitting entry
+func (db *DB) DeleteTarpittingEntry(id int64) error {
+	_, err := db.Exec(`DELETE FROM tarpitting WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("deleting tarpitting entry: %w", err)
+	}
+	return nil
+}
+
+// CleanupTarpitting removes old tarpitting entries that were never whitelisted (>90 days old)
+func (db *DB) CleanupTarpitting() error {
+	_, err := db.Exec(`
+		DELETE FROM tarpitting
+		WHERE first_failure < datetime('now', '-90 days')
+		AND whitelisted_at IS NULL`)
+	if err != nil {
+		return fmt.Errorf("cleaning up tarpitting: %w", err)
+	}
+	return nil
 }
 
 // --- Helpers ---

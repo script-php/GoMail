@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -88,6 +89,19 @@ func main() {
 	// Start delivery queue workers
 	deliveryPool := delivery.NewPool(cfg, db, certMgr.TLSConfig)
 	deliveryPool.Start()
+
+	// Start greylisting cleanup worker (runs daily)
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := db.CleanupGreylisting(); err != nil {
+				log.Printf("[cleanup] greylisting cleanup error: %v", err)
+			} else {
+				log.Printf("[cleanup] greylisting cleanup completed")
+			}
+		}
+	}()
 
 	// Create delivery queue for the web interface (per-domain DKIM from DB)
 	queue := delivery.NewQueue(db, cfg)
