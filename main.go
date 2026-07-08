@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/dns"
+	"gomail/logging"
 	"gomail/reporting"
 	"gomail/smtp"
 	"gomail/store"
@@ -27,9 +29,34 @@ import (
 func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
 	hashPassword := flag.String("hash-password", "", "Generate bcrypt hash for a password")
+	register := flag.Bool("register", false, "Install as systemd service (requires sudo)")
 	flag.Parse()
 
-	// Password hashing utility
+	// Check for positional arguments (e.g., "./gomail register")
+	args := flag.Args()
+	if len(args) > 0 {
+		command := args[0]
+		switch command {
+		case "register":
+			registerSystemdService(*configPath)
+			return
+		case "hash-password":
+			if len(args) < 2 {
+				log.Fatalf("Usage: gomail hash-password <password>")
+			}
+			hash, err := hashPasswordBcrypt(args[1])
+			if err != nil {
+				log.Fatalf("Error hashing password: %v", err)
+			}
+			fmt.Printf("Password hash: %s\n", hash)
+			fmt.Println("Add this to config.json under web.bootstrap_admin.password_hash")
+			return
+		default:
+			log.Fatalf("Unknown command: %s", command)
+		}
+	}
+
+	// Password hashing utility (flag style)
 	if *hashPassword != "" {
 		hash, err := hashPasswordBcrypt(*hashPassword)
 		if err != nil {
@@ -40,13 +67,21 @@ func main() {
 		return
 	}
 
+	// Systemd service registration (flag style)
+	if *register {
+		registerSystemdService(*configPath)
+		return
+	}
+
 	// Load configuration
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("[main] GoMail %s starting (hostname=%s)", config.Version(), cfg.Server.Hostname)
+	// Initialize logging from config
+	logging.CurrentLevel = logging.ParseLevel(cfg.Logging.Level)
+	logging.Info(fmt.Sprintf("[main] GoMail %s starting (hostname=%s, log_level=%s)", config.Version(), cfg.Server.Hostname, logging.GetLevelName(logging.CurrentLevel)))
 
 	// Initialize DNS cache
 	dns.InitCache(cfg.DNS.CacheTTL)
@@ -57,7 +92,7 @@ func main() {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
-	log.Println("[main] database opened")
+	logging.Info("[main] database opened")
 
 	// Bootstrap admin: create initial domain + account if no accounts exist
 	bootstrapAdmin(cfg, db)
@@ -67,17 +102,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize TLS: %v", err)
 	}
-	log.Println("[main] TLS initialized")
+	logging.Info("[main] TLS initialized")
 
 	// Get TLS config for SMTP (nil when mode=none)
 	var smtpTLS *tls.Config
 	if cfg.TLS.Mode != "none" {
 		smtpTLS, err = certMgr.GetCertificateForSMTP(cfg.Server.Hostname)
 		if err != nil {
-			log.Printf("[main] warning: SMTP TLS config: %v (STARTTLS will be unavailable)", err)
+			logging.Warn(fmt.Sprintf("[main] warning: SMTP TLS config: %v (STARTTLS will be unavailable)", err))
 		}
 	} else {
-		log.Println("[main] SMTP STARTTLS disabled (tls.mode=none)")
+		logging.Info("[main] SMTP STARTTLS disabled (tls.mode=none)")
 	}
 
 	// Start SMTP inbound server
@@ -163,23 +198,23 @@ func main() {
 	// Log active domains
 	domainNames, _ := db.ListAllDomainNames()
 	if len(domainNames) > 0 {
-		log.Printf("[main] accepting mail for domains: %s", strings.Join(domainNames, ", "))
+		logging.Info(fmt.Sprintf("[main] accepting mail for domains: %s", strings.Join(domainNames, ", ")))
 	} else {
-		log.Println("[main] warning: no domains configured. Add domains via the admin panel.")
+		logging.Warn("[main] warning: no domains configured. Add domains via the admin panel.")
 	}
 
-	log.Println("[main] GoMail is running. Press Ctrl+C to stop.")
+	logging.Info("[main] GoMail is running. Press Ctrl+C to stop.")
 
 	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("[main] shutting down...")
+	logging.Info("[main] shutting down...")
 	smtpServer.Stop()
 	deliveryPool.Stop()
 	webServer.Shutdown()
-	log.Println("[main] GoMail stopped.")
+	logging.Info("[main] GoMail stopped.")
 }
 
 // bootstrapAdmin creates the initial domain and admin account on first run
@@ -246,4 +281,176 @@ func hashPasswordBcrypt(password string) (string, error) {
 		return "", err
 	}
 	return string(hash), nil
+}
+
+// registerSystemdService installs GoMail as a systemd service
+func registerSystemdService(configPath string) {
+	// Check if running as root (required for systemd installation)
+	if os.Geteuid() != 0 {
+		log.Fatalf("Error: register command requires sudo\nUsage: sudo ./gomail register")
+	}
+
+	// Get the absolute path of the gomail binary
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Failed to get executable path: %v", err)
+	}
+
+	// Get current working directory once
+	pwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to get working directory: %v", err)
+	}
+
+	// Get the absolute path of the config file
+	absConfigPath := configPath
+	if !strings.HasPrefix(configPath, "/") {
+		absConfigPath = pwd + "/" + configPath
+	}
+
+	// Check if config file exists and is valid
+	if _, err := os.Stat(absConfigPath); os.IsNotExist(err) {
+		log.Fatalf("Config file not found: %s", absConfigPath)
+	}
+
+	// Validate config by attempting to load it
+	if _, err := config.Load(absConfigPath); err != nil {
+		log.Fatalf("Config file is invalid: %v", err)
+	}
+
+	// Get the current user running sudo (the one who should own the service)
+	currentUser := os.Getenv("SUDO_USER")
+	if currentUser == "" {
+		currentUser = "root"
+	}
+
+	// Create systemd service file - simple setup, runs in release folder
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=GoMail Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%s
+WorkingDirectory=%s
+ExecStart=%s -config %s
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+
+LimitNOFILE=65535
+LimitNPROC=65535
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gomail
+
+[Install]
+WantedBy=multi-user.target
+`, currentUser, pwd, exePath, absConfigPath)
+
+	fmt.Println("[register] GoMail Systemd Service Installation")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println()
+	fmt.Printf("Binary: %s\n", exePath)
+	fmt.Printf("Config: %s\n", absConfigPath)
+	fmt.Printf("WorkingDirectory: %s\n", pwd)
+	fmt.Printf("User: %s\n\n", currentUser)
+
+	// Install systemd service file
+	fmt.Println("Installing systemd service...")
+	serviceFile := "/etc/systemd/system/gomail.service"
+
+	// Write to temp file first, then copy with sudo
+	tmpFile := "/tmp/gomail.service"
+	if err := os.WriteFile(tmpFile, []byte(serviceContent), 0644); err != nil {
+		log.Fatalf("Failed to write temp service file: %v", err)
+	}
+	defer os.Remove(tmpFile)
+
+	// Copy service file (already running as root, no sudo needed)
+	cmd := exec.Command("cp", tmpFile, serviceFile)
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Failed to copy service file: %v", err)
+	}
+
+	// Set permissions (already running as root, no sudo needed)
+	cmd = exec.Command("chmod", "644", serviceFile)
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Failed to set service file permissions: %v", err)
+	}
+
+	// Reload systemd daemon (already running as root, no sudo needed)
+	fmt.Println("Reloading systemd daemon...")
+	cmd = exec.Command("systemctl", "daemon-reload")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Failed to reload systemd: %v", err)
+	}
+
+	// Enable service on boot (already running as root, no sudo needed)
+	fmt.Println("Enabling on boot...")
+	cmd = exec.Command("systemctl", "enable", "gomail")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Failed to enable service: %v", err)
+	}
+
+	// Start service (already running as root, no sudo needed)
+	fmt.Println("Starting service...")
+	cmd = exec.Command("systemctl", "start", "gomail")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Failed to start service: %v", err)
+	}
+
+	// Check status (already running as root, no sudo needed)
+	fmt.Println()
+	fmt.Println("Service status:")
+	cmd = exec.Command("systemctl", "status", "gomail", "--no-pager")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run()
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println("✓ GoMail registered as systemd service!")
+	fmt.Println()
+	fmt.Println("Service file: " + serviceFile)
+	fmt.Println()
+	fmt.Println("Useful commands:")
+	fmt.Println("  sudo systemctl status gomail")
+	fmt.Println("  sudo systemctl restart gomail")
+	fmt.Println("  sudo journalctl -u gomail -f")
+	fmt.Println()
+}
+
+// runCommand executes a command and handles errors
+func runCommand(name string, args ...string) {
+	runCommandWithIgnore(name, nil, args...)
+}
+
+// runCommandWithIgnore executes a command and ignores specific exit codes
+func runCommandWithIgnore(name string, ignoreExitCodes []int, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+
+	if err != nil {
+		// Check if exit code should be ignored
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code := exitErr.ExitCode()
+			for _, ignoreCode := range ignoreExitCodes {
+				if code == ignoreCode {
+					return // Exit code is acceptable, ignore the error
+				}
+			}
+		}
+		log.Fatalf("Command failed: %s %v", name, args)
+	}
 }

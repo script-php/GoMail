@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"gomail/auth"
 	"gomail/config"
 	"gomail/dns"
+	"gomail/logging"
 	"gomail/parser"
 	"gomail/store"
 )
@@ -52,7 +52,7 @@ func (s *InboundServer) Start() error {
 		return fmt.Errorf("SMTP listen on %s: %w", s.cfg.SMTP.ListenAddr, err)
 	}
 
-	log.Printf("[smtp] inbound listening on %s", s.cfg.SMTP.ListenAddr)
+	logging.Info(fmt.Sprintf("[smtp] inbound listening on %s", s.cfg.SMTP.ListenAddr))
 
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -66,7 +66,7 @@ func (s *InboundServer) Stop() {
 		s.listener.Close()
 	}
 	s.wg.Wait()
-	log.Println("[smtp] inbound server stopped")
+	logging.Info("[smtp] inbound server stopped")
 }
 
 func (s *InboundServer) acceptLoop() {
@@ -79,7 +79,7 @@ func (s *InboundServer) acceptLoop() {
 			case <-s.quit:
 				return
 			default:
-				log.Printf("[smtp] accept error: %v", err)
+				logging.Error(fmt.Sprintf("[smtp] accept error: %v", err))
 				continue
 			}
 		}
@@ -87,7 +87,7 @@ func (s *InboundServer) acceptLoop() {
 		// Rate limit by IP
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 		if !s.rateLimiter.AllowConnection(ip) {
-			log.Printf("[smtp] rate limit: rejecting connection from %s", ip)
+			logging.Warn(fmt.Sprintf("[smtp] rate limit: rejecting connection from %s", ip))
 			conn.Close()
 			continue
 		}
@@ -104,7 +104,7 @@ func (s *InboundServer) acceptLoop() {
 			}()
 		default:
 			// No slots available, reject connection
-			log.Printf("[smtp] max connections reached: rejecting connection from %s", ip)
+			logging.Warn(fmt.Sprintf("[smtp] max connections reached: rejecting connection from %s", ip))
 			conn.Close()
 		}
 	}
@@ -114,7 +114,7 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 	// Get current list of accepted domains from DB
 	domains, err := s.db.ListAllDomainNames()
 	if err != nil {
-		log.Printf("[smtp] error loading domains: %v", err)
+		logging.Error(fmt.Sprintf("[smtp] error loading domains: %v", err))
 		conn.Close()
 		return
 	}
@@ -123,12 +123,12 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	ptrHostname, ptrValid, err := dns.VerifyPTR(ip)
 	if err != nil {
-		log.Printf("[smtp] PTR lookup failed for %s: %v", ip, err)
+		logging.Warn(fmt.Sprintf("[smtp] PTR lookup failed for %s: %v", ip, err))
 	} else {
 		if ptrValid {
-			log.Printf("[smtp] PTR verified for %s: %s", ip, ptrHostname)
+			logging.Info(fmt.Sprintf("[smtp] PTR verified for %s: %s", ip, ptrHostname))
 		} else {
-			log.Printf("[smtp] PTR hostname %s does not resolve back to %s (forward confirmation failed)", ptrHostname, ip)
+			logging.Info(fmt.Sprintf("[smtp] PTR hostname %s does not resolve back to %s (forward confirmation failed)", ptrHostname, ip))
 		}
 	}
 
@@ -192,7 +192,7 @@ func (s *InboundServer) runSession(sess *Session) {
 			// Process the received message
 			if sess.data.Len() > 0 {
 				if err := s.processMessage(sess); err != nil {
-					log.Printf("[smtp] message processing error from %s: %v", sess.clientAddr, err)
+					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
 					sess.send(451, "Message processing failed, try again later")
 				} else {
 					sess.send(250, "OK message accepted for delivery")
@@ -217,7 +217,7 @@ func (s *InboundServer) runSession(sess *Session) {
 			// If LAST chunk was received (state transitions back to StateReady with data), process message
 			if sess.state == StateReady && sess.data.Len() > 0 {
 				if err := s.processMessage(sess); err != nil {
-					log.Printf("[smtp] message processing error from %s: %v", sess.clientAddr, err)
+					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
 					sess.send(451, "Message processing failed, try again later")
 				} else {
 					sess.send(250, "OK message accepted for delivery")
@@ -237,16 +237,16 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	rcptTo := sess.GetRcptTo()
 	clientIP := sess.GetClientIP()
 
-	log.Printf("[smtp] processing message from=%s to=%v ip=%s size=%d",
-		mailFrom, rcptTo, clientIP, len(rawMessage))
+	logging.Info(fmt.Sprintf("[smtp] processing message from=%s to=%v ip=%s size=%d",
+		mailFrom, rcptTo, clientIP, len(rawMessage)))
 
 	// Log PTR verification result
 	if sess.ptrValid {
-		log.Printf("[smtp] PTR verified: %s", sess.ptrHostname)
+		logging.Info(fmt.Sprintf("[smtp] PTR verified: %s", sess.ptrHostname))
 	} else if sess.ptrHostname != "" {
-		log.Printf("[smtp] PTR unverified: %s (no forward confirmation)", sess.ptrHostname)
+		logging.Info(fmt.Sprintf("[smtp] PTR unverified: %s (no forward confirmation)", sess.ptrHostname))
 	} else {
-		log.Printf("[smtp] PTR: no reverse DNS records found")
+		logging.Info("[smtp] PTR: no reverse DNS records found")
 	}
 
 	// --- Add Received header ---
@@ -271,13 +271,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	// SPF
 	spfResult, spfDetail := auth.CheckSPF(clientIP, mailFrom)
 	authBuilder.AddSPF(spfResult, spfDetail, mailFrom)
-	log.Printf("[smtp] SPF: %s (%s)", spfResult, spfDetail)
+	logging.Info(fmt.Sprintf("[smtp] SPF: %s (%s)", spfResult, spfDetail))
 
 	// DKIM
 	dkimResult, dkimDetail := auth.VerifyDKIM(rawMessage)
 	dkimDomain := auth.GetDKIMDomain(rawMessage)
 	authBuilder.AddDKIM(dkimResult, dkimDetail, "", "")
-	log.Printf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail)
+	logging.Info(fmt.Sprintf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail))
 
 	// DMARC
 	parsed, err := parser.Parse(rawMessage)
@@ -285,15 +285,15 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		return fmt.Errorf("parsing message: %w", err)
 	}
 
-	log.Printf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
-		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments))
+	logging.Info(fmt.Sprintf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
+		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments)))
 
 	fromDomain := extractDomain(parsed.From)
 	spfDomain := extractDomain(mailFrom)
 
 	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, dkimDomain)
 	authBuilder.AddDMARC(dmarcResult.Result, dmarcResult.Details, fromDomain)
-	log.Printf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details)
+	logging.Info(fmt.Sprintf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details))
 
 	// Record DMARC feedback for aggregate reporting (RFC 7489)
 	// Determine disposition based on policy and auth results
@@ -308,7 +308,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		}
 	}
 	if err := s.db.SaveDMARCFeedback(fromDomain, clientIP, spfDomain, dkimResult, string(spfResult), disposition); err != nil {
-		log.Printf("[smtp] warning: failed to save DMARC feedback: %v", err)
+		logging.Warn(fmt.Sprintf("[smtp] warning: failed to save DMARC feedback: %v", err))
 	}
 
 	authResults := authBuilder.Build()
@@ -321,24 +321,24 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	arcValidation := auth.ValidateARCChain(rawMessage)
 	switch arcValidation.Status {
 	case "pass":
-		log.Printf("[smtp] ARC ✓ PASS: valid chain through instance=%d",
-			arcValidation.HighestValid)
+		logging.Info(fmt.Sprintf("[smtp] ARC - PASS: valid chain through instance=%d",
+			arcValidation.HighestValid))
 	case "fail":
-		log.Printf("[smtp] ARC ✗ FAIL: %s", arcValidation.Details)
+		logging.Warn(fmt.Sprintf("[smtp] ARC - FAIL: %s", arcValidation.Details))
 	case "permerror":
-		log.Printf("[smtp] ARC ⚠ PERMERROR: permanent error - %s", arcValidation.Details)
+		logging.Error(fmt.Sprintf("[smtp] ARC - PERMERROR: permanent error - %s", arcValidation.Details))
 	case "temperror":
-		log.Printf("[smtp] ARC ⏱ TEMPERROR: temporary error - %s", arcValidation.Details)
+		logging.Warn(fmt.Sprintf("[smtp] ARC - TEMPERROR: temporary error - %s", arcValidation.Details))
 	case "none":
-		log.Printf("[smtp] ARC - NONE: no ARC headers (original email)")
+		logging.Info("[smtp] ARC - NONE: no ARC headers (original email)")
 	default:
-		log.Printf("[smtp] ARC ? UNKNOWN: status=%s", arcValidation.Status)
+		logging.Info(fmt.Sprintf("[smtp] ARC ? UNKNOWN: status=%s", arcValidation.Status))
 	}
 
 	// Determine if this email should be quarantined due to ARC failure
 	arcFailed := arcValidation.Status == "fail" || arcValidation.Status == "permerror"
 	if arcFailed {
-		log.Printf("[smtp] ARC validation failed - will quarantine to spam: %s", arcValidation.Details)
+		logging.Warn(fmt.Sprintf("[smtp] ARC validation failed - will quarantine to spam: %s", arcValidation.Details))
 	}
 
 	// NOTE: Do NOT add ARC headers for inbound original emails.
@@ -349,7 +349,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	mdnRequested := parsed.MDNRequestedBy != ""
 	mdnAddress := parsed.MDNRequestedBy
 	if mdnRequested {
-		log.Printf("[smtp] MDN requested for %s to %s", parsed.MessageID, mdnAddress)
+		logging.Info(fmt.Sprintf("[smtp] MDN requested for %s to %s", parsed.MessageID, mdnAddress))
 	}
 
 	// --- Store the message for each recipient's account ---
@@ -370,7 +370,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// so it can extract the message/delivery-status part
 		dsnReport, _ = parser.ParseDSN(string(rawMessage))
 		if dsnReport != nil {
-			log.Printf("[smtp] [verp] received DSN: original-id=%s status=%s", dsnReport.OriginalMessageID, dsnReport.Status)
+			logging.Info(fmt.Sprintf("[smtp] [verp] received DSN: original-id=%s status=%s", dsnReport.OriginalMessageID, dsnReport.Status))
 		}
 	}
 
@@ -384,7 +384,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		if s.db.IsVERPBounceAddress(rcpt) {
 			originalRecipient, err := s.db.DecodeVERP(rcpt)
 			if err == nil {
-				log.Printf("[smtp] [verp] detected bounce at VERP address %s for original recipient %s", rcpt, originalRecipient)
+				logging.Info(fmt.Sprintf("[smtp] [verp] detected bounce at VERP address %s for original recipient %s", rcpt, originalRecipient))
 
 				// Extract sender from the parsed From header
 				senderEmail := parsed.From
@@ -420,13 +420,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 				// Record the bounce
 				if err := s.db.RecordVERPBounce(originalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
-					log.Printf("[smtp] [verp] error recording bounce: %v", err)
+					logging.Error(fmt.Sprintf("[smtp] [verp] error recording bounce: %v", err))
 				}
 
 				// Skip account lookup for VERP addresses (they don't have accounts)
 				continue
 			} else {
-				log.Printf("[smtp] [verp] could not decode VERP address %s: %v", rcpt, err)
+				logging.Warn(fmt.Sprintf("[smtp] [verp] could not decode VERP address %s: %v", rcpt, err))
 			}
 		}
 
@@ -435,7 +435,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			// Try to match DSN recipients to our sent messages and record VERP bounces
 			for _, recipStatus := range dsnReport.RecipientsStatus {
 				if recipStatus.FinalRecipient != "" {
-					log.Printf("[smtp] [verp] DSN failure for recipient: %s status: %s", recipStatus.FinalRecipient, recipStatus.Status)
+					logging.Info(fmt.Sprintf("[smtp] [verp] DSN failure for recipient: %s status: %s", recipStatus.FinalRecipient, recipStatus.Status))
 
 					// Extract sender - from Return-Path if available, otherwise From header
 					senderEmail := parsed.From
@@ -452,7 +452,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 					// Record bounce with original recipient from DSN
 					if err := s.db.RecordVERPBounce(recipStatus.FinalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
-						log.Printf("[smtp] [verp] error recording DSN bounce: %v", err)
+						logging.Error(fmt.Sprintf("[smtp] [verp] error recording DSN bounce: %v", err))
 					}
 				}
 			}
@@ -465,22 +465,22 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		if dmarcResult.Result == "fail" {
 			switch dmarcResult.Policy {
 			case "reject":
-				log.Printf("[smtp] DMARC p=reject: accepting but quarantining mail from %s (auth check failed)", fromDomain)
+				logging.Warn(fmt.Sprintf("[smtp] DMARC p=reject: accepting but quarantining mail from %s (auth check failed)", fromDomain))
 			case "quarantine":
-				log.Printf("[smtp] DMARC p=quarantine: accepting but marking suspicious from %s", fromDomain)
+				logging.Warn(fmt.Sprintf("[smtp] DMARC p=quarantine: accepting but marking suspicious from %s", fromDomain))
 			case "none":
-				log.Printf("[smtp] DMARC p=none: accepting in observation mode from %s", fromDomain)
+				logging.Info(fmt.Sprintf("[smtp] DMARC p=none: accepting in observation mode from %s", fromDomain))
 			}
 		}
 
 		// Look up the account for this recipient
 		account, err := s.db.GetAccountByEmail(rcpt)
 		if err != nil {
-			log.Printf("[smtp] account lookup error for %s: %v", rcpt, err)
+			logging.Warn(fmt.Sprintf("[smtp] account lookup error for %s: %v", rcpt, err))
 			continue
 		}
 		if account == nil || !account.IsActive {
-			log.Printf("[smtp] no active account for %s, skipping", rcpt)
+			logging.Info(fmt.Sprintf("[smtp] no active account for %s, skipping", rcpt))
 			continue
 		}
 
@@ -513,31 +513,31 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		if authFailed {
 			// Any auth failure → spam folder
 			if arcFailed {
-				log.Printf("[smtp] ARC failed: quarantining to spam (reason: %s)", arcValidation.Details)
+				logging.Warn(fmt.Sprintf("[smtp] ARC failed: quarantining to spam (reason: %s)", arcValidation.Details))
 			} else {
-				log.Printf("[smtp] auth check failed - SPF: %s, DKIM: %s, DMARC: %s - quarantining to spam",
-					spfResult, dkimResult, dmarcResult.Result)
+				logging.Warn(fmt.Sprintf("[smtp] auth check failed - SPF: %s, DKIM: %s, DMARC: %s - quarantining to spam",
+					spfResult, dkimResult, dmarcResult.Result))
 			}
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
-				log.Printf("[smtp] error getting spam folder: %v", err)
+				logging.Error(fmt.Sprintf("[smtp] error getting spam folder: %v", err))
 			} else if spamFolder != nil {
 				folderID = &spamFolder.ID
-				log.Printf("[smtp] message routed to spam folder=%d", spamFolder.ID)
+				logging.Info(fmt.Sprintf("[smtp] message routed to spam folder=%d", spamFolder.ID))
 			} else {
-				log.Printf("[smtp] warning: spam folder not found for account %d, using NULL", accountID)
+				logging.Warn(fmt.Sprintf("[smtp] warning: spam folder not found for account %d, using NULL", accountID))
 			}
 		} else {
 			// All auth passed - route to inbox
 			inboxFolder, err := s.db.GetFolderByType(accountID, "inbox")
 			if err != nil {
-				log.Printf("[smtp] error getting inbox folder for account %d: %v", accountID, err)
+				logging.Error(fmt.Sprintf("[smtp] error getting inbox folder for account %d: %v", accountID, err))
 			} else if inboxFolder != nil {
 				folderID = &inboxFolder.ID
-				log.Printf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
-					spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID)
+				logging.Info(fmt.Sprintf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
+					spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID))
 			} else {
-				log.Printf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID)
+				logging.Warn(fmt.Sprintf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID))
 			}
 		}
 
@@ -570,14 +570,14 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 		// Log what folder_id will be saved
 		if folderID != nil {
-			log.Printf("[smtp] saving message subject=%q with folder_id=%d (rcpt=%s)", parsed.Subject, *folderID, rcpt)
+			logging.Info(fmt.Sprintf("[smtp] saving message subject=%q with folder_id=%d (rcpt=%s)", parsed.Subject, *folderID, rcpt))
 		} else {
-			log.Printf("[smtp] saving message subject=%q with folder_id=NULL (rcpt=%s)", parsed.Subject, rcpt)
+			logging.Info(fmt.Sprintf("[smtp] saving message subject=%q with folder_id=NULL (rcpt=%s)", parsed.Subject, rcpt))
 		}
 
 		msgID, err := s.db.SaveMessage(msg)
 		if err != nil {
-			log.Printf("[smtp] saving message for %s: %v", rcpt, err)
+			logging.Error(fmt.Sprintf("[smtp] saving message for %s: %v", rcpt, err))
 			continue
 		}
 
@@ -590,18 +590,18 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		if len(parsed.Attachments) > 0 {
 			records, err := parser.SaveAttachments(parsed.Attachments, msgID, s.db.AttachmentsPath())
 			if err != nil {
-				log.Printf("[smtp] attachment save error: %v", err)
+				logging.Error(fmt.Sprintf("[smtp] attachment save error: %v", err))
 			} else {
 				for _, rec := range records {
 					if _, err := s.db.SaveAttachment(rec); err != nil {
-						log.Printf("[smtp] attachment db save error: %v", err)
+						logging.Error(fmt.Sprintf("[smtp] attachment db save error: %v", err))
 					}
 				}
 			}
 		}
 
-		log.Printf("[smtp] message stored id=%d account=%d msgid=%s from=%s to=%s subject=%s",
-			msgID, accountID, messageID, mailFrom, rcpt, parsed.Subject)
+		logging.Info(fmt.Sprintf("[smtp] message stored id=%d account=%d msgid=%s from=%s to=%s subject=%s",
+			msgID, accountID, messageID, mailFrom, rcpt, parsed.Subject))
 	}
 
 	return nil

@@ -150,8 +150,8 @@ func (db *DB) migrateExistingAccounts() error {
 
 // Migration represents a database migration
 type Migration struct {
-	Name string                    // Unique migration name
-	Run  func(*DB) error          // Migration function
+	Name string          // Unique migration name
+	Run  func(*DB) error // Migration function
 }
 
 // ColumnDef represents a column definition for schema comparison
@@ -226,13 +226,13 @@ func (db *DB) getTableSchema(tableName string) (map[string]ColumnDef, error) {
 		var defaultValue interface{}
 		if dflt.Valid {
 			defaultStr := dflt.String
-			
+
 			// Remove surrounding quotes from PRAGMA defaults (they include quotes for string literals)
 			if (strings.HasPrefix(defaultStr, "'") && strings.HasSuffix(defaultStr, "'")) ||
 				(strings.HasPrefix(defaultStr, "\"") && strings.HasSuffix(defaultStr, "\"")) {
 				defaultStr = defaultStr[1 : len(defaultStr)-1]
 			}
-			
+
 			// Try to parse numeric defaults
 			if num, err := strconv.Atoi(defaultStr); err == nil {
 				defaultValue = num
@@ -303,7 +303,7 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 	// Normalize and compare type
 	existingType := strings.TrimSpace(strings.ToUpper(existing.Type))
 	desiredType := strings.TrimSpace(strings.ToUpper(desired.Type))
-	
+
 	if existingType != desiredType {
 		return true
 	}
@@ -316,7 +316,7 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 	// Normalize defaults for comparison
 	// nil and empty string should be treated carefully
 	var existingDefault, desiredDefault interface{}
-	
+
 	// For string defaults, normalize empty string
 	if existing.Default == nil {
 		existingDefault = nil
@@ -327,7 +327,7 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 	} else {
 		existingDefault = existing.Default
 	}
-	
+
 	if desired.Default == nil {
 		desiredDefault = nil
 	} else if desired.Default == "" {
@@ -337,7 +337,7 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 	} else {
 		desiredDefault = desired.Default
 	}
-	
+
 	// Compare defaults
 	if fmt.Sprintf("%v", existingDefault) != fmt.Sprintf("%v", desiredDefault) {
 		return true
@@ -346,7 +346,6 @@ func (db *DB) columnDiffers(existing, desired ColumnDef) bool {
 	return false
 }
 
-
 // addColumn adds a new column to a table (SQLite compatible)
 // For nullable columns, SQLite will automatically fill existing rows with NULL
 // For NOT NULL columns, a DEFAULT value is required for safety
@@ -354,8 +353,8 @@ func (db *DB) addColumn(tableName string, col ColumnChange) error {
 	// Safety check: NOT NULL columns need a DEFAULT value
 	// Nullable columns are safe - SQLite fills with NULL automatically
 	if col.NotNull && col.Default == nil {
-		fmt.Printf("[db] ⚠️  SKIPPED: Adding NOT NULL column %s without default (unsafe)\n", col.Name)
-		fmt.Printf("[db] ⚠️  Add DEFAULT value to schema.sql to enable this change\n")
+		fmt.Printf("[db] - SKIPPED: Adding NOT NULL column %s without default (unsafe)\n", col.Name)
+		fmt.Printf("[db] - Add DEFAULT value to schema.sql to enable this change\n")
 		return nil
 	}
 
@@ -379,8 +378,8 @@ func (db *DB) addColumn(tableName string, col ColumnChange) error {
 
 // modifyColumn modifies an existing column (SQLite limited support)
 func (db *DB) modifyColumn(tableName string, col ColumnChange) error {
-	fmt.Printf("[db]   ⚠  SQLite doesn't support MODIFY COLUMN directly\n")
-	fmt.Printf("[db]   ⚠  Column %s kept unchanged (would require table recreation)\n", col.Name)
+	fmt.Printf("[db]   - SQLite doesn't support MODIFY COLUMN directly\n")
+	fmt.Printf("[db]   - Column %s kept unchanged (would require table recreation)\n", col.Name)
 	return nil
 }
 
@@ -407,8 +406,8 @@ func (db *DB) deleteColumn(tableName string, col ColumnChange) error {
 	}
 
 	// For older SQLite, skip (won't break anything - just keeps unused column)
-	fmt.Printf("[db]   ⚠  SQLite %s doesn't support DROP COLUMN (need 3.35.0+)\n", version)
-	fmt.Printf("[db]   ⚠  Column %s kept in table (won't affect functionality)\n", col.Name)
+	fmt.Printf("[db]   - SQLite %s doesn't support DROP COLUMN (need 3.35.0+)\n", version)
+	fmt.Printf("[db]   - Column %s kept in table (won't affect functionality)\n", col.Name)
 
 	return nil
 }
@@ -420,10 +419,10 @@ func (db *DB) syncSchemaWithDefinition() error {
 
 	// Parse desired schema from embedded schema.sql
 	desiredSchema := db.parseSchemaDefinition(schemaSQL)
-	
+
 	if len(desiredSchema) == 0 {
-		fmt.Println("[db] ⚠️  WARNING: Could not parse any tables from schema.sql")
-		fmt.Println("[db] Skipping schema sync to prevent data loss")
+		fmt.Println("[db] - WARNING: Could not parse any tables from schema.sql")
+		fmt.Println("[db] - Skipping schema sync to prevent data loss")
 		return nil
 	}
 
@@ -437,9 +436,9 @@ func (db *DB) syncSchemaWithDefinition() error {
 	changesDetected := false
 	for _, tableName := range tableNames {
 		desiredCols := desiredSchema[tableName]
-		
+
 		if len(desiredCols) == 0 {
-			fmt.Printf("[db] ⚠️  WARNING: Table %s has no parsed columns (parser issue?)\n", tableName)
+			fmt.Printf("[db] - WARNING: Table %s has no parsed columns (parser issue?)\n", tableName)
 			continue
 		}
 
@@ -455,7 +454,7 @@ func (db *DB) syncSchemaWithDefinition() error {
 
 		if len(changes) > 0 {
 			changesDetected = true
-			fmt.Printf("[db] %s: %d change(s) detected\n", tableName, len(changes))
+			fmt.Printf("[db] - %s: %d change(s) detected\n", tableName, len(changes))
 
 			// Apply changes
 			for _, col := range changes {
@@ -470,7 +469,7 @@ func (db *DB) syncSchemaWithDefinition() error {
 					if err := db.modifyColumn(tableName, col); err != nil {
 						return fmt.Errorf("modifying column %s.%s: %w", tableName, col.Name, err)
 					}
-					fmt.Printf("[db]   ✏ Modified %s (%s)\n", col.Name, col.Type)
+					fmt.Printf("[db]   - Modified %s (%s)\n", col.Name, col.Type)
 
 				case "delete":
 					if err := db.deleteColumn(tableName, col); err != nil {
@@ -548,7 +547,7 @@ func (db *DB) extractTableName(createTableStatement string) string {
 			rest := strings.TrimSpace(parts[1])
 			fields := strings.Fields(rest)
 			if len(fields) > 0 {
-				tableName = strings.Trim(fields[0], "`()") 
+				tableName = strings.Trim(fields[0], "`()")
 			}
 		}
 	} else {
@@ -591,7 +590,7 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 
 		// Remove trailing comma
 		trimmed = strings.TrimSuffix(trimmed, ",")
-		
+
 		// Skip if empty after removing comma
 		if trimmed == "" {
 			continue
@@ -604,12 +603,12 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 		}
 
 		columnName := strings.Trim(parts[0], "`")
-		
+
 		// Find where type ends (look for NOT, DEFAULT, REFERENCES keywords)
 		typeEnd := 1
-		for typeEnd < len(parts) && 
-			!strings.EqualFold(parts[typeEnd], "NOT") && 
-			!strings.EqualFold(parts[typeEnd], "DEFAULT") && 
+		for typeEnd < len(parts) &&
+			!strings.EqualFold(parts[typeEnd], "NOT") &&
+			!strings.EqualFold(parts[typeEnd], "DEFAULT") &&
 			!strings.EqualFold(parts[typeEnd], "REFERENCES") &&
 			!strings.EqualFold(parts[typeEnd], "PRIMARY") &&
 			!strings.EqualFold(parts[typeEnd], "UNIQUE") &&
@@ -617,13 +616,13 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 			!strings.EqualFold(parts[typeEnd], "COLLATE") {
 			typeEnd++
 		}
-		
+
 		// Build type from parts[1:typeEnd], clean up
 		columnType := strings.TrimSpace(strings.Join(parts[1:typeEnd], " "))
 		columnType = strings.ToUpper(columnType)
 		columnType = strings.TrimSuffix(columnType, ",")
 		columnType = strings.TrimSpace(columnType)
-		
+
 		colDef := ColumnDef{
 			Name:    columnName,
 			Type:    columnType,
@@ -642,7 +641,7 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 			} else if upper == "DEFAULT" && i+1 < len(parts) {
 				i++ // move to default value
 				defaultVal := parts[i]
-				
+
 				// Handle function defaults like (datetime('now'))
 				// They span multiple parts, collect them
 				if strings.HasPrefix(defaultVal, "(") && !strings.HasSuffix(defaultVal, ")") {
@@ -652,16 +651,16 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 						defaultVal += " " + parts[i]
 					}
 				}
-				
+
 				defaultVal = strings.Trim(defaultVal, ",")
 				defaultVal = strings.TrimSpace(defaultVal)
-				
+
 				// Handle quoted strings (remove outer quotes)
 				if (strings.HasPrefix(defaultVal, "'") && strings.HasSuffix(defaultVal, "'") && !strings.Contains(defaultVal[1:len(defaultVal)-1], "'")) ||
 					(strings.HasPrefix(defaultVal, "\"") && strings.HasSuffix(defaultVal, "\"") && !strings.Contains(defaultVal[1:len(defaultVal)-1], "\"")) {
 					defaultVal = defaultVal[1 : len(defaultVal)-1]
 				}
-				
+
 				// Try to parse as number
 				if num, err := strconv.Atoi(defaultVal); err == nil {
 					colDef.Default = num
@@ -692,4 +691,3 @@ func (db *DB) parseTableColumns(tableName string, content string, cols map[strin
 		cols[columnName] = colDef
 	}
 }
-

@@ -137,9 +137,63 @@ dig -x YOUR_IP
 
 ## Systemd Service
 
-### Install Service File
+### Automated Installation
 
-Create `/etc/systemd/system/gomail.service`:
+GoMail includes an automated installer that registers the systemd service:
+
+```bash
+# 1. Build the binary
+cd /path/to/gomail
+go build -o gomail .
+
+# 2. Register as systemd service
+sudo ./gomail register
+```
+
+Or with a specific config file:
+```bash
+sudo ./gomail -config config.local.json -register
+```
+
+This command will:
+- ✅ Detect the current user and run the service as that user
+- ✅ Create systemd service file pointing to the current directory
+- ✅ Enable the service to start on boot
+- ✅ Start the service immediately
+- ✅ No copying files, no user creation—everything stays in place
+
+### Verify Installation
+
+```bash
+# Check service status
+sudo systemctl status gomail
+
+# View logs
+sudo journalctl -u gomail -f
+
+# Check listening ports
+sudo netstat -tulpn | grep gomail
+```
+
+### Common Commands
+
+```bash
+# Restart service
+sudo systemctl restart gomail
+
+# Stop service
+sudo systemctl stop gomail
+
+# View last 50 log lines
+sudo journalctl -u gomail -n 50
+
+# View service file
+cat /etc/systemd/system/gomail.service
+```
+
+### Manual Installation (Alternative)
+
+If you prefer to install manually, create `/etc/systemd/system/gomail.service`:
 
 ```ini
 [Unit]
@@ -195,49 +249,38 @@ SyslogFacility=mail
 WantedBy=multi-user.target
 ```
 
-### Bootstrap Installation
+Then run these commands:
 
 ```bash
-# 1. Create service user
+# Create service user
 sudo useradd -r -s /bin/false -m -d /var/lib/gomail gomail
 
-# 2. Create directories
+# Create directories
 sudo mkdir -p /opt/gomail
 sudo mkdir -p /opt/gomail/data/attachments
-sudo mkdir -p /opt/gomail/web/{templates,static}
-sudo mkdir -p /etc/gomail
 
-# 3. Copy binaries and config
+# Copy binaries and config
 sudo cp gomail /opt/gomail/
 sudo cp config.json /opt/gomail/
 sudo chmod 755 /opt/gomail/gomail
 sudo chmod 640 /opt/gomail/config.json
 
-# 4. Copy web assets (if in source directory)
-sudo cp -r web/templates /opt/gomail/web/
-sudo cp -r web/static /opt/gomail/web/
-
-# 5. Set ownership and permissions
+# Set ownership and permissions
 sudo chown -R gomail:gomail /opt/gomail
 sudo chmod 700 /opt/gomail/data
 sudo chmod 700 /opt/gomail/data/attachments
 
-# 6. Copy systemd service file
-sudo cp /path/to/gomail.service /etc/systemd/system/
+# Install systemd service
+sudo cp gomail.service /etc/systemd/system/
 sudo chmod 644 /etc/systemd/system/gomail.service
 
-# 7. Reload systemd
+# Enable and start
 sudo systemctl daemon-reload
-
-# 8. Enable on boot
 sudo systemctl enable gomail
-
-# 9. Start service
 sudo systemctl start gomail
 
-# 10. Check status
+# Check status
 sudo systemctl status gomail
-sudo journalctl -u gomail -f -n 50
 ```
 
 ## Firewall Rules
