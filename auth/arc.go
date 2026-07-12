@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ed25519"
+
+	"gomail/logging"
 )
 
 // ARCAuthenticationResults builds the ARC-Authentication-Results header
@@ -24,12 +26,12 @@ func ARCAuthenticationResults(hostname string, spfResult, dkimResult, dmarcResul
 
 // ARCMessageSignatureInput represents data for ARC-Message-Signature generation
 type ARCMessageSignatureInput struct {
-	Instance      int           // i= value (typically 1 for first hop)
-	Selector      string        // s= (selector)
-	Domain        string        // d= (domain)
-	PrivateKey    crypto.Signer // RSA or Ed25519 private key
-	Message       []byte        // Full message (headers + body) for header extraction
-	BodyHash      string        // base64-encoded SHA256 hash of body
+	Instance   int           // i= value (typically 1 for first hop)
+	Selector   string        // s= (selector)
+	Domain     string        // d= (domain)
+	PrivateKey crypto.Signer // RSA or Ed25519 private key
+	Message    []byte        // Full message (headers + body) for header extraction
+	BodyHash   string        // base64-encoded SHA256 hash of body
 }
 
 // getAlgorithm returns the algorithm name based on key type
@@ -203,6 +205,7 @@ func BodyHash(body string) string {
 // Returns: [authResults, messageSignature, seal] or error
 func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, dmarc, hostname string, bodyContent string, instance int) ([]string, error) {
 	if privKey == nil {
+		logging.Error(fmt.Sprintf("[auth] ARC signing failed: no private key for %s/%s instance=%d", domain, selector, instance))
 		return nil, fmt.Errorf("private key required for ARC signing")
 	}
 
@@ -215,10 +218,11 @@ func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, d
 		headerEnd = bytes.Index(msgBytes, []byte("\n\n"))
 		separatorLen = 2
 		if headerEnd == -1 {
+			logging.Error(fmt.Sprintf("[auth] ARC: malformed message - no header/body boundary"))
 			return nil, fmt.Errorf("no header/body boundary found in message")
 		}
 	}
-	
+
 	bodyOnly := msgBytes[headerEnd+separatorLen:]
 
 	// 1. Generate Authentication Results (full header line)
@@ -260,9 +264,11 @@ func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, d
 	}
 	seal, err := ARCSeal(sealInput)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[auth] ARC seal generation failed for %s/%s instance=%d: %v", domain, selector, instance, err))
 		return nil, fmt.Errorf("generating ARC-Seal: %w", err)
 	}
 
+	logging.Debug(fmt.Sprintf("[auth] ARC chain signed successfully for %s/%s instance=%d", domain, selector, instance))
 	return []string{authResultsHeader, msgSig, seal}, nil
 }
 
@@ -271,7 +277,7 @@ func ARCChainSigner(domain, selector string, privKey crypto.Signer, spf, dkim, d
 func ExtractArcHeaders(rawMessage []byte) map[int]map[string]string {
 	headers := make(map[int]map[string]string)
 	lines := strings.Split(string(rawMessage), "\r\n")
-	
+
 	currentInstance := 0
 	var currentType string
 	var currentValue strings.Builder
@@ -291,12 +297,12 @@ func ExtractArcHeaders(rawMessage []byte) map[int]map[string]string {
 
 		// Check for ARC header (case-insensitive)
 		upperLine := strings.ToUpper(line)
-		
+
 		// Check if this is a new ARC header line (not a continuation)
 		isNewArcHeader := strings.HasPrefix(upperLine, "ARC-AUTHENTICATION-RESULTS:") ||
 			strings.HasPrefix(upperLine, "ARC-MESSAGE-SIGNATURE:") ||
 			strings.HasPrefix(upperLine, "ARC-SEAL:")
-		
+
 		if isNewArcHeader {
 			// Save previous header if one was being accumulated
 			if currentType != "" && currentInstance > 0 {
@@ -305,7 +311,7 @@ func ExtractArcHeaders(rawMessage []byte) map[int]map[string]string {
 				}
 				headers[currentInstance][currentType] = currentValue.String()
 			}
-			
+
 			// Determine which ARC header type this is
 			if strings.HasPrefix(upperLine, "ARC-AUTHENTICATION-RESULTS:") {
 				currentType = "auth-results"
@@ -314,12 +320,12 @@ func ExtractArcHeaders(rawMessage []byte) map[int]map[string]string {
 			} else if strings.HasPrefix(upperLine, "ARC-SEAL:") {
 				currentType = "seal"
 			}
-			
+
 			// Extract instance number from i= tag
 			if idx := strings.Index(line, "i="); idx >= 0 {
 				fmt.Sscanf(line[idx:], "i=%d", &currentInstance)
 			}
-			
+
 			// Start accumulating this header's value
 			currentValue.Reset()
 			currentValue.WriteString(line)
@@ -337,14 +343,14 @@ func ExtractArcHeaders(rawMessage []byte) map[int]map[string]string {
 // Returns 0 if no ARC headers found, used to determine next instance number
 func GetHighestArcInstance(rawMessage []byte) int {
 	arcHeaders := ExtractArcHeaders(rawMessage)
-	
+
 	maxInstance := 0
 	for instance := range arcHeaders {
 		if instance > maxInstance {
 			maxInstance = instance
 		}
 	}
-	
+
 	return maxInstance
 }
 
@@ -366,7 +372,7 @@ func verifyARCMessageSignature(rawMessage []byte, arcMsgSig string, pubKeyRecord
 
 	// Parse ARC-Message-Signature tags
 	tags := parseDKIMTags(arcMsgSig)
-	
+
 	algo := tags["a"]
 	headersToVerify := tags["h"]
 	bodyHashB64 := tags["bh"]
@@ -395,7 +401,7 @@ func verifyARCMessageSignature(rawMessage []byte, arcMsgSig string, pubKeyRecord
 	if err != nil {
 		return false, fmt.Sprintf("failed to parse message: %v", err)
 	}
-	
+
 	body := rawMessage[bodyOffset:]
 	bodyHash := bodyHashFunc(bodySimple, body)
 	expectedBH := base64.StdEncoding.EncodeToString(bodyHash)
@@ -500,7 +506,7 @@ func verifyARCSeal(arcAuthResults, arcMsgSig, arcSeal string, pubKeyRecord *DKIM
 
 	// Parse ARC-Seal tags
 	tags := parseDKIMTags(arcSeal)
-	
+
 	algo := tags["a"]
 	sigB64 := tags["b"]
 	canonMethod := tags["c"]
@@ -602,7 +608,7 @@ func verifyARCSeal(arcAuthResults, arcMsgSig, arcSeal string, pubKeyRecord *DKIM
 // Returns: (isValid, status, error)
 func ValidateArcChainAtInstance(rawMessage []byte, instance int) (bool, string, error) {
 	arcHeaders := ExtractArcHeaders(rawMessage)
-	
+
 	// Check if this instance exists
 	if arcHeaders[instance] == nil {
 		return false, "permerror", fmt.Errorf("no ARC headers for instance %d", instance)
@@ -733,7 +739,7 @@ func ValidateARCChain(rawMessage []byte) *ARCValidationResult {
 		algo := extractTagValue(h["message-signature"], "a=")
 
 		details.WriteString(fmt.Sprintf("  ✓ i=%d: %s (cv=%s, domain=%s, selector=%s, algo=%s)\n",
-			i, 
+			i,
 			func() string {
 				if hasAuthResults && hasMsgSig && hasSeal {
 					return "complete"
@@ -749,7 +755,7 @@ func ValidateARCChain(rawMessage []byte) *ARCValidationResult {
 	result.IsValid = true
 	result.Status = "pass"
 	result.HighestValid = validUpTo
-	result.Details = fmt.Sprintf("ARC chain structurally valid through instance %d\n%s", 
+	result.Details = fmt.Sprintf("ARC chain structurally valid through instance %d\n%s",
 		highest, details.String())
 
 	return result

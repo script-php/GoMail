@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/ed25519"
+
+	"gomail/logging"
 )
 
 // DKIMRecord represents a parsed DKIM record from DNS
@@ -34,18 +36,22 @@ func LookupDKIMPublicKey(selector, domain string) (*DKIMRecord, error) {
 	if err != nil {
 		dnsErr, ok := err.(*net.DNSError)
 		if ok && dnsErr.IsNotFound {
+			logging.Warn(fmt.Sprintf("[auth] DKIM record not found: %s", lookupHost))
 			return nil, fmt.Errorf("DKIM record not found at %s", lookupHost)
 		}
+		logging.Error(fmt.Sprintf("[auth] DNS lookup failed for DKIM %s: %v", lookupHost, err))
 		return nil, fmt.Errorf("DNS lookup failed for %s: %w", lookupHost, err)
 	}
 
 	if len(txts) == 0 {
+		logging.Warn(fmt.Sprintf("[auth] no TXT records found for DKIM %s", lookupHost))
 		return nil, fmt.Errorf("no TXT records found at %s", lookupHost)
 	}
 
 	// Parse the TXT record (multiple records concatenated, use first)
 	record := parseDKIMRecord(txts[0])
 	if record == nil {
+		logging.Warn(fmt.Sprintf("[auth] invalid DKIM record at %s", lookupHost))
 		return nil, fmt.Errorf("invalid DKIM record at %s", lookupHost)
 	}
 
@@ -55,9 +61,9 @@ func LookupDKIMPublicKey(selector, domain string) (*DKIMRecord, error) {
 // parseDKIMRecord parses a DKIM record string from DNS
 func parseDKIMRecord(recordStr string) *DKIMRecord {
 	record := &DKIMRecord{
-		Version:  "DKIM1", // Default
+		Version:   "DKIM1",      // Default
 		Algorithm: "rsa-sha256", // Default
-		HashAlgo: "sha256",      // Default
+		HashAlgo:  "sha256",     // Default
 	}
 
 	// Parse semi-colon separated key=value pairs

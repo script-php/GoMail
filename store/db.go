@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	_ "modernc.org/sqlite"
+
+	"gomail/logging"
 )
 
 //go:embed schema.sql
@@ -114,7 +116,7 @@ func (db *DB) migrateExistingAccounts() error {
 		if count == 0 {
 			if err := db.DefaultFolders(accountID); err != nil {
 				// Log but don't fail - continue with other accounts
-				fmt.Printf("warning: failed to create folders for account %d: %v\n", accountID, err)
+				logging.Warn(fmt.Sprintf("failed to create folders for account %d: %v", accountID, err))
 				continue
 			}
 		}
@@ -128,7 +130,7 @@ func (db *DB) migrateExistingAccounts() error {
 				WHERE account_id = ? AND direction = 'inbound' AND folder_id IS NULL
 			`, inboxFolder.ID, accountID)
 			if err != nil {
-				fmt.Printf("warning: failed to assign inbound messages for account %d: %v\n", accountID, err)
+				logging.Warn(fmt.Sprintf("failed to assign inbound messages for account %d: %v", accountID, err))
 			}
 		}
 
@@ -140,7 +142,7 @@ func (db *DB) migrateExistingAccounts() error {
 				WHERE account_id = ? AND direction = 'outbound' AND folder_id IS NULL
 			`, sentFolder.ID, accountID)
 			if err != nil {
-				fmt.Printf("warning: failed to assign outbound messages for account %d: %v\n", accountID, err)
+				logging.Warn(fmt.Sprintf("failed to assign outbound messages for account %d: %v", accountID, err))
 			}
 		}
 	}
@@ -193,7 +195,7 @@ func (db *DB) runMigrations() error {
 	migrations := db.RegisteredMigrations()
 
 	for _, migration := range migrations {
-		fmt.Printf("[db] Running data migration: %s\n", migration.Name)
+		logging.Info(fmt.Sprintf("[db] Running data migration: %s", migration.Name))
 		if err := migration.Run(db); err != nil {
 			return fmt.Errorf("migration %s failed: %w", migration.Name, err)
 		}
@@ -353,8 +355,8 @@ func (db *DB) addColumn(tableName string, col ColumnChange) error {
 	// Safety check: NOT NULL columns need a DEFAULT value
 	// Nullable columns are safe - SQLite fills with NULL automatically
 	if col.NotNull && col.Default == nil {
-		fmt.Printf("[db] - SKIPPED: Adding NOT NULL column %s without default (unsafe)\n", col.Name)
-		fmt.Printf("[db] - Add DEFAULT value to schema.sql to enable this change\n")
+		logging.Warn(fmt.Sprintf("[db] - SKIPPED: Adding NOT NULL column %s without default (unsafe)", col.Name))
+		logging.Warn("[db] - Add DEFAULT value to schema.sql to enable this change")
 		return nil
 	}
 
@@ -378,8 +380,8 @@ func (db *DB) addColumn(tableName string, col ColumnChange) error {
 
 // modifyColumn modifies an existing column (SQLite limited support)
 func (db *DB) modifyColumn(tableName string, col ColumnChange) error {
-	fmt.Printf("[db]   - SQLite doesn't support MODIFY COLUMN directly\n")
-	fmt.Printf("[db]   - Column %s kept unchanged (would require table recreation)\n", col.Name)
+	logging.Info("[db]   - SQLite doesn't support MODIFY COLUMN directly")
+	logging.Info(fmt.Sprintf("[db]   - Column %s kept unchanged (would require table recreation)", col.Name))
 	return nil
 }
 
@@ -406,8 +408,8 @@ func (db *DB) deleteColumn(tableName string, col ColumnChange) error {
 	}
 
 	// For older SQLite, skip (won't break anything - just keeps unused column)
-	fmt.Printf("[db]   - SQLite %s doesn't support DROP COLUMN (need 3.35.0+)\n", version)
-	fmt.Printf("[db]   - Column %s kept in table (won't affect functionality)\n", col.Name)
+	logging.Info(fmt.Sprintf("[db]   - SQLite %s doesn't support DROP COLUMN (need 3.35.0+)", version))
+	logging.Info(fmt.Sprintf("[db]   - Column %s kept in table (won't affect functionality)", col.Name))
 
 	return nil
 }
@@ -415,14 +417,14 @@ func (db *DB) deleteColumn(tableName string, col ColumnChange) error {
 // syncSchemaWithDefinition compares schema.sql with actual database and applies differences
 // This allows you to just edit schema.sql and the system automatically updates the database
 func (db *DB) syncSchemaWithDefinition() error {
-	fmt.Println("[db] Syncing database schema with definition...")
+	logging.Info("[db] Syncing database schema with definition...")
 
 	// Parse desired schema from embedded schema.sql
 	desiredSchema := db.parseSchemaDefinition(schemaSQL)
 
 	if len(desiredSchema) == 0 {
-		fmt.Println("[db] - WARNING: Could not parse any tables from schema.sql")
-		fmt.Println("[db] - Skipping schema sync to prevent data loss")
+		logging.Warn("[db] - WARNING: Could not parse any tables from schema.sql")
+		logging.Warn("[db] - Skipping schema sync to prevent data loss")
 		return nil
 	}
 
@@ -438,7 +440,7 @@ func (db *DB) syncSchemaWithDefinition() error {
 		desiredCols := desiredSchema[tableName]
 
 		if len(desiredCols) == 0 {
-			fmt.Printf("[db] - WARNING: Table %s has no parsed columns (parser issue?)\n", tableName)
+			logging.Warn(fmt.Sprintf("[db] - WARNING: Table %s has no parsed columns (parser issue?)", tableName))
 			continue
 		}
 
@@ -454,7 +456,7 @@ func (db *DB) syncSchemaWithDefinition() error {
 
 		if len(changes) > 0 {
 			changesDetected = true
-			fmt.Printf("[db] - %s: %d change(s) detected\n", tableName, len(changes))
+			logging.Info(fmt.Sprintf("[db] - %s: %d change(s) detected", tableName, len(changes)))
 
 			// Apply changes
 			for _, col := range changes {
@@ -463,26 +465,26 @@ func (db *DB) syncSchemaWithDefinition() error {
 					if err := db.addColumn(tableName, col); err != nil {
 						return fmt.Errorf("adding column %s.%s: %w", tableName, col.Name, err)
 					}
-					fmt.Printf("[db]   + Added %s (%s default: %v)\n", col.Name, col.Type, col.Default)
+					logging.Info(fmt.Sprintf("[db]   + Added %s (%s default: %v)", col.Name, col.Type, col.Default))
 
 				case "modify":
 					if err := db.modifyColumn(tableName, col); err != nil {
 						return fmt.Errorf("modifying column %s.%s: %w", tableName, col.Name, err)
 					}
-					fmt.Printf("[db]   - Modified %s (%s)\n", col.Name, col.Type)
+					logging.Info(fmt.Sprintf("[db]   - Modified %s (%s)", col.Name, col.Type))
 
 				case "delete":
 					if err := db.deleteColumn(tableName, col); err != nil {
 						return fmt.Errorf("deleting column %s.%s: %w", tableName, col.Name, err)
 					}
-					fmt.Printf("[db]   - Deleted %s\n", col.Name)
+					logging.Info(fmt.Sprintf("[db]   - Deleted %s", col.Name))
 				}
 			}
 		}
 	}
 
 	if !changesDetected {
-		fmt.Println("[db] All tables are up-to-date")
+		logging.Info("[db] All tables are up-to-date")
 	}
 
 	return nil
@@ -526,7 +528,7 @@ func (db *DB) parseSchemaDefinition(schemaSql string) map[string]map[string]Colu
 
 		if len(cols) > 0 {
 			schema[tableName] = cols
-			fmt.Printf("[db] Parsed table '%s' with %d columns\n", tableName, len(cols))
+			logging.Debug(fmt.Sprintf("[db] Parsed table '%s' with %d columns", tableName, len(cols)))
 		}
 
 		createTableIdx = endIdx

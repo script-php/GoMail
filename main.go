@@ -131,9 +131,9 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			if err := db.CleanupGreylisting(); err != nil {
-				log.Printf("[cleanup] greylisting cleanup error: %v", err)
+				logging.Error(fmt.Sprintf("[cleanup] greylisting cleanup error: %v", err))
 			} else {
-				log.Printf("[cleanup] greylisting cleanup completed")
+				logging.Info("[cleanup] greylisting cleanup completed")
 			}
 		}
 	}()
@@ -164,9 +164,9 @@ func main() {
 			if httpAddr == "" {
 				httpAddr = ":80"
 			}
-			log.Printf("[main] HTTP redirect server on %s", httpAddr)
+			logging.Info(fmt.Sprintf("[main] HTTP redirect server on %s", httpAddr))
 			if err := http.ListenAndServe(httpAddr, httpHandler); err != nil {
-				log.Printf("[main] HTTP server error: %v", err)
+				logging.Error(fmt.Sprintf("[main] HTTP server error: %v", err))
 			}
 		}()
 
@@ -180,12 +180,12 @@ func main() {
 	} else {
 		// No TLS: plain HTTP web interface (e.g. behind nginx / reverse proxy)
 		// If autocert is enabled, integrate it into the web server for ACME challenges
-		log.Printf("[main] web.enable_tls=false, checking autocert: mode=%s, hasMgr=%v", cfg.TLS.Mode, certMgr.AutocertMgr != nil)
+		logging.Info(fmt.Sprintf("[main] web.enable_tls=false, checking autocert: mode=%s, hasMgr=%v", cfg.TLS.Mode, certMgr.AutocertMgr != nil))
 		if cfg.TLS.Mode == "autocert" && certMgr.AutocertMgr != nil {
 			webServer.IntegrateAutocert(certMgr.AutocertMgr)
-			log.Printf("[main] autocert integrated for /.well-known/acme-challenge/ (proxy port 80 through nginx)")
+			logging.Info("[main] autocert integrated for /.well-known/acme-challenge/ (proxy port 80 through nginx)")
 		} else if cfg.TLS.Mode == "autocert" {
-			log.Printf("[main] WARNING: autocert mode but no AutocertMgr (check acme_dir and acme_email config)")
+			logging.Warn("[main] WARNING: autocert mode but no AutocertMgr (check acme_dir and acme_email config)")
 		}
 
 		go func() {
@@ -226,21 +226,21 @@ func bootstrapAdmin(cfg *config.Config, db *store.DB) {
 	}
 
 	if cfg.Web.BootstrapAdmin.Email == "" || cfg.Web.BootstrapAdmin.PasswordHash == "" {
-		log.Println("[main] no accounts exist and no bootstrap_admin configured.")
-		log.Println("[main] set web.bootstrap_admin.email and web.bootstrap_admin.password_hash in config.json")
-		log.Println("[main] generate a password hash with: gomail -hash-password 'your-password'")
+		logging.Info("[main] no accounts exist and no bootstrap_admin configured.")
+		logging.Info("[main] set web.bootstrap_admin.email and web.bootstrap_admin.password_hash in config.json")
+		logging.Info("[main] generate a password hash with: gomail -hash-password 'your-password'")
 		return
 	}
 
 	email := cfg.Web.BootstrapAdmin.Email
 	parts := strings.SplitN(email, "@", 2)
 	if len(parts) != 2 {
-		log.Printf("[main] bootstrap_admin.email '%s' is not a valid email address", email)
+		logging.Warn(fmt.Sprintf("[main] bootstrap_admin.email '%s' is not a valid email address", email))
 		return
 	}
 	domainName := parts[1]
 
-	log.Printf("[main] bootstrapping: creating domain '%s' and admin account '%s'", domainName, email)
+	logging.Info(fmt.Sprintf("[main] bootstrapping: creating domain '%s' and admin account '%s'", domainName, email))
 
 	// Create the domain
 	domain := &store.Domain{
@@ -251,7 +251,7 @@ func bootstrapAdmin(cfg *config.Config, db *store.DB) {
 	}
 	domainID, err := db.CreateDomain(domain)
 	if err != nil {
-		log.Printf("[main] bootstrap: failed to create domain: %v", err)
+		logging.Error(fmt.Sprintf("[main] bootstrap: failed to create domain: %v", err))
 		return
 	}
 
@@ -267,12 +267,12 @@ func bootstrapAdmin(cfg *config.Config, db *store.DB) {
 	}
 	_, err = db.CreateAccount(account)
 	if err != nil {
-		log.Printf("[main] bootstrap: failed to create admin account: %v", err)
+		logging.Error(fmt.Sprintf("[main] bootstrap: failed to create admin account: %v", err))
 		return
 	}
 
-	log.Printf("[main] bootstrap complete. Login with: %s", email)
-	log.Println("[main] generate DKIM keys via the admin panel: /admin/domains")
+	logging.Info(fmt.Sprintf("[main] bootstrap complete. Login with: %s", email))
+	logging.Info("[main] generate DKIM keys via the admin panel: /admin/domains")
 }
 
 func hashPasswordBcrypt(password string) (string, error) {

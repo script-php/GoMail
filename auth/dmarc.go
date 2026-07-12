@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
+
+	"gomail/logging"
 )
 
 // DMARCResult represents the outcome of a DMARC check.
@@ -234,6 +236,7 @@ func queryDMARC(domain string) (string, error) {
 	dmarcDomain := "_dmarc." + domain
 	txtRecords, err := net.LookupTXT(dmarcDomain)
 	if err != nil {
+		logging.Debug(fmt.Sprintf("[auth] DMARC record not found for %s: %v", domain, err))
 		return "", err
 	}
 

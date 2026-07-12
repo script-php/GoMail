@@ -5,11 +5,11 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net"
 	"time"
 
 	"gomail/config"
+	"gomail/logging"
 	"gomail/store"
 )
 
@@ -20,10 +20,10 @@ type EnqueueFunc func(from string, to string, message string) error
 // Reports are only sent if config.dmarc.send_reports is true.
 func ScheduleWeeklyReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
 	if !cfg.DMARC.SendReports {
-		log.Printf("[dmarc] report scheduler disabled (set dmarc.send_reports=true in config.json to enable)")
+		logging.Info("[dmarc] report scheduler disabled (set dmarc.send_reports=true in config.json to enable)")
 		return
 	}
-	log.Printf("[dmarc] report scheduler enabled (weekly reports at Sunday 00:00 UTC)")
+	logging.Info("[dmarc] report scheduler enabled (weekly reports at Sunday 00:00 UTC)")
 	go runWeeklyReportScheduler(cfg, db, enqueueFunc)
 }
 
@@ -31,7 +31,7 @@ func ScheduleWeeklyReports(cfg *config.Config, db *store.DB, enqueueFunc Enqueue
 // This is useful for testing without waiting for the weekly scheduler.
 // Returns (total_domains, successfully_reported, error).
 func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (int, int, error) {
-	log.Printf("[dmarc] manual report generation triggered...")
+	logging.Info("[dmarc] manual report generation triggered...")
 
 	// Get all unique domains with DMARC feedback
 	domains, err := db.GetDomainsWithFeedback()
@@ -40,7 +40,7 @@ func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (
 	}
 
 	if len(domains) == 0 {
-		log.Printf("[dmarc] no domains with feedback to report")
+		logging.Info("[dmarc] no domains with feedback to report")
 		return 0, 0, nil
 	}
 
@@ -51,7 +51,7 @@ func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (
 		}
 	}
 
-	log.Printf("[dmarc] manual report generation complete (%d/%d domains reported)", successCount, len(domains))
+	logging.Info(fmt.Sprintf("[dmarc] manual report generation complete (%d/%d domains reported)", successCount, len(domains)))
 	return len(domains), successCount, nil
 }
 
@@ -66,7 +66,7 @@ func runWeeklyReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 		nextSunday = time.Date(nextSunday.Year(), nextSunday.Month(), nextSunday.Day(), 0, 0, 0, 0, time.UTC)
 
 		waitTime := nextSunday.Sub(now)
-		log.Printf("[dmarc] next weekly report generation: %s (in %v)", nextSunday, waitTime)
+		logging.Info(fmt.Sprintf("[dmarc] next weekly report generation: %s (in %v)", nextSunday, waitTime))
 		time.Sleep(waitTime)
 
 		// Generate and send reports
@@ -75,12 +75,12 @@ func runWeeklyReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 }
 
 func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
-	log.Printf("[reporting] starting weekly report generation...")
+	logging.Info("[reporting] starting weekly report generation...")
 
 	// Generate DMARC reports
 	dmarcDomains, err := db.GetDomainsWithFeedback()
 	if err != nil {
-		log.Printf("[dmarc] error getting domains with feedback: %v", err)
+		logging.Error(fmt.Sprintf("[dmarc] error getting domains with feedback: %v", err))
 	} else if len(dmarcDomains) > 0 {
 		dmarcReportCount := 0
 		for _, domain := range dmarcDomains {
@@ -88,15 +88,15 @@ func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc Enqueu
 				dmarcReportCount++
 			}
 		}
-		log.Printf("[dmarc] weekly report generation complete (%d/%d domains reported)", dmarcReportCount, len(dmarcDomains))
+		logging.Info(fmt.Sprintf("[dmarc] weekly report generation complete (%d/%d domains reported)", dmarcReportCount, len(dmarcDomains)))
 	} else {
-		log.Printf("[dmarc]   no domains with DMARC feedback to report")
+		logging.Info("[dmarc]   no domains with DMARC feedback to report")
 	}
 
 	// Generate TLS-RPT reports
 	tlsRptDomains, err := db.GetDomainsWithTLSFailures()
 	if err != nil {
-		log.Printf("[tls-rpt] error getting domains with TLS failures: %v", err)
+		logging.Error(fmt.Sprintf("[tls-rpt] error getting domains with TLS failures: %v", err))
 	} else if len(tlsRptDomains) > 0 {
 		tlsReportCount := 0
 		for _, domain := range tlsRptDomains {
@@ -104,12 +104,12 @@ func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc Enqueu
 				tlsReportCount++
 			}
 		}
-		log.Printf("[tls-rpt] weekly report generation complete (%d/%d domains reported)", tlsReportCount, len(tlsRptDomains))
+		logging.Info(fmt.Sprintf("[tls-rpt] weekly report generation complete (%d/%d domains reported)", tlsReportCount, len(tlsRptDomains)))
 	} else {
-		log.Printf("[tls-rpt]  no domains with TLS failures to report")
+		logging.Info("[tls-rpt]  no domains with TLS failures to report")
 	}
 
-	log.Printf("[reporting] all weekly reports generated")
+	logging.Info("[reporting] all weekly reports generated")
 }
 
 func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain) bool {
@@ -117,7 +117,7 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	// If never reported, this returns epoch time (Jan 1, 1970)
 	lastReportTime, err := db.GetLastDMARCReportTime(domain.Domain)
 	if err != nil {
-		log.Printf("[dmarc] %s: error getting last report time: %v", domain.Domain, err)
+		logging.Error(fmt.Sprintf("[dmarc] %s: error getting last report time: %v", domain.Domain, err))
 		return false
 	}
 
@@ -126,25 +126,25 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	// Get DMARC policy to extract report addresses
 	dmarcRecord, err := lookupDMARCForReporting(domain.Domain)
 	if err != nil {
-		log.Printf("[dmarc] %s: error looking up DMARC policy: %v", domain.Domain, err)
+		logging.Error(fmt.Sprintf("[dmarc] %s: error looking up DMARC policy: %v", domain.Domain, err))
 		return false
 	}
 
 	if dmarcRecord == nil || (len(dmarcRecord.ReportMailto) == 0 && len(dmarcRecord.ForensicMail) == 0) {
-		log.Printf("[dmarc]  %s: no rua=/ruf= addresses configured", domain.Domain)
+		logging.Info(fmt.Sprintf("[dmarc]  %s: no rua=/ruf= addresses configured", domain.Domain))
 		return false
 	}
 
 	// Get feedback since last report until now
 	records, err := getDMARCFeedbackRecords(db, domain.Domain, lastReportTime, now)
 	if err != nil {
-		log.Printf("[dmarc] %s: error querying feedback: %v", domain.Domain, err)
+		logging.Error(fmt.Sprintf("[dmarc] %s: error querying feedback: %v", domain.Domain, err))
 		return false
 	}
 
 	if len(records) == 0 {
-		log.Printf("[dmarc]  %s: no feedback since last report (%s)",
-			domain.Domain, lastReportTime.Format("2006-01-02 15:04:05 UTC"))
+		logging.Info(fmt.Sprintf("[dmarc]  %s: no feedback since last report (%s)",
+			domain.Domain, lastReportTime.Format("2006-01-02 15:04:05 UTC")))
 		return false
 	}
 
@@ -161,7 +161,7 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 		now,
 	)
 	if err != nil {
-		log.Printf("[dmarc] %s: error generating report: %v", domain.Domain, err)
+		logging.Error(fmt.Sprintf("[dmarc] %s: error generating report: %v", domain.Domain, err))
 		return false
 	}
 
@@ -169,23 +169,23 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	sentCount := 0
 	for _, reportAddr := range dmarcRecord.ReportMailto {
 		if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Domain, reportAddr, reportXML); err != nil {
-			log.Printf("[dmarc] %s→%s: error sending report: %v", domain.Domain, reportAddr, err)
+			logging.Error(fmt.Sprintf("[dmarc] %s→%s: error sending report: %v", domain.Domain, reportAddr, err))
 		} else {
 			sentCount++
-			log.Printf("[dmarc] %s→%s: report sent (period %s to %s, %d records)",
+			logging.Info(fmt.Sprintf("[dmarc] %s→%s: report sent (period %s to %s, %d records)",
 				domain.Domain, reportAddr,
 				lastReportTime.Format("2006-01-02"), now.Format("2006-01-02"),
-				len(records))
+				len(records)))
 		}
 	}
 
 	// Update last report time and mark feedback as sent if at least one report was sent
 	if sentCount > 0 {
 		if err := db.UpdateLastDMARCReportTime(domain.Domain); err != nil {
-			log.Printf("[dmarc] %s: error updating last report time: %v", domain.Domain, err)
+			logging.Error(fmt.Sprintf("[dmarc] %s: error updating last report time: %v", domain.Domain, err))
 		}
 		if err := db.MarkDMARCFeedbackAsSent(domain.Domain, lastReportTime, now); err != nil {
-			log.Printf("[dmarc] %s: error marking feedback as sent: %v", domain.Domain, err)
+			logging.Error(fmt.Sprintf("[dmarc] %s: error marking feedback as sent: %v", domain.Domain, err))
 		}
 	}
 
@@ -358,7 +358,7 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 		var disposition, envelopeDomain string
 
 		if err := rows.Scan(&sourceIP, &count, &dkimPass, &spfPass, &disposition, &envelopeDomain); err != nil {
-			log.Printf("[dmarc] error scanning feedback: %v", err)
+			logging.Error(fmt.Sprintf("[dmarc] error scanning feedback: %v", err))
 			continue
 		}
 
@@ -459,14 +459,14 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 	// Generate the report
 	report, err := GenerateTLSReport(db, cfg.Server.Domain, domain, startTime, endTime)
 	if err != nil {
-		log.Printf("[tls-rpt] failed to generate report for %s: %v", domain, err)
+		logging.Error(fmt.Sprintf("[tls-rpt] failed to generate report for %s: %v", domain, err))
 		return false
 	}
 
 	// Extract TLS-RPT report addresses from DNS (may be multiple)
 	recipientEmails, err := ExtractTLSRPTAddresses(domain)
 	if err != nil {
-		log.Printf("[tls-rpt] failed to extract TLS-RPT addresses for %s: %v", domain, err)
+		logging.Error(fmt.Sprintf("[tls-rpt] failed to extract TLS-RPT addresses for %s: %v", domain, err))
 		// Even if we can't send, mark as attempted so we don't retry forever
 		_ = db.MarkTLSFailuresAsReported(domain, startTime, endTime)
 		return false
@@ -480,25 +480,25 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 	sentCount := 0
 	for _, recipientEmail := range recipientEmails {
 		if err := enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
-			log.Printf("[tls-rpt] failed to enqueue report for %s -> %s: %v", domain, recipientEmail, err)
+			logging.Error(fmt.Sprintf("[tls-rpt] failed to enqueue report for %s -> %s: %v", domain, recipientEmail, err))
 		} else {
 			sentCount++
-			log.Printf("[tls-rpt] queued TLS-RPT report for %s -> %s", domain, recipientEmail)
+			logging.Info(fmt.Sprintf("[tls-rpt] queued TLS-RPT report for %s -> %s", domain, recipientEmail))
 		}
 	}
 
 	if sentCount == 0 {
-		log.Printf("[tls-rpt] failed to queue TLS-RPT report for %s to any recipient", domain)
+		logging.Warn(fmt.Sprintf("[tls-rpt] failed to queue TLS-RPT report for %s to any recipient", domain))
 		return false
 	}
 
 	// Mark failures as reported
 	if err := db.MarkTLSFailuresAsReported(domain, startTime, endTime); err != nil {
-		log.Printf("[tls-rpt] warning: failed to mark TLS failures as reported for %s: %v", domain, err)
+		logging.Warn(fmt.Sprintf("[tls-rpt] warning: failed to mark TLS failures as reported for %s: %v", domain, err))
 		// Non-fatal error, report was sent successfully
 	}
 
-	log.Printf("[tls-rpt] generated and queued TLS-RPT report for %s (%d recipients, %d failures)",
-		domain, len(recipientEmails), report.Policies[0].Summary.TotalFailureSessionCount)
+	logging.Info(fmt.Sprintf("[tls-rpt] generated and queued TLS-RPT report for %s (%d recipients, %d failures)",
+		domain, len(recipientEmails), report.Policies[0].Summary.TotalFailureSessionCount))
 	return true
 }

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gomail/logging"
 )
 
 // SPFResult represents the outcome of an SPF check.
@@ -52,6 +54,7 @@ func CheckSPF(ip, mailFrom string) (SPFResult, string) {
 
 	clientIP := net.ParseIP(ip)
 	if clientIP == nil {
+		logging.Warn(fmt.Sprintf("[auth] SPF: invalid client IP %s", ip))
 		return SPFPermError, "invalid client IP"
 	}
 

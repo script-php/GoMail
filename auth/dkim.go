@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"gomail/logging"
 )
 
 // DKIMSigner handles outbound DKIM signing.
@@ -30,6 +32,7 @@ type DKIMSigner struct {
 func NewDKIMSigner(domain, selector, keyPath, algorithm string) (*DKIMSigner, error) {
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[auth] DKIM key file not found for %s/%s: %v", domain, selector, err))
 		return nil, fmt.Errorf("reading DKIM key: %w", err)
 	}
 	return NewDKIMSignerFromPEM(domain, selector, keyData, algorithm)
@@ -40,6 +43,7 @@ func NewDKIMSigner(domain, selector, keyPath, algorithm string) (*DKIMSigner, er
 func NewDKIMSignerFromPEM(domain, selector string, pemData []byte, algorithm string) (*DKIMSigner, error) {
 	block, _ := pem.Decode(pemData)
 	if block == nil {
+		logging.Error(fmt.Sprintf("[auth] DKIM key parse failed for %s/%s: no PEM block", domain, selector))
 		return nil, fmt.Errorf("no PEM block found in DKIM key")
 	}
 
@@ -49,10 +53,12 @@ func NewDKIMSignerFromPEM(domain, selector string, pemData []byte, algorithm str
 	case "ed25519":
 		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
+			logging.Error(fmt.Sprintf("[auth] ed25519 key parse failed for %s/%s: %v", domain, selector, err))
 			return nil, fmt.Errorf("parsing ed25519 private key: %w", err)
 		}
 		edKey, ok := key.(ed25519.PrivateKey)
 		if !ok {
+			logging.Error(fmt.Sprintf("[auth] key type mismatch for %s/%s: not ed25519", domain, selector))
 			return nil, fmt.Errorf("key is not ed25519")
 		}
 		signer = edKey
@@ -62,6 +68,7 @@ func NewDKIMSignerFromPEM(domain, selector string, pemData []byte, algorithm str
 			// Try PKCS1 as fallback
 			key2, err2 := x509.ParsePKCS1PrivateKey(block.Bytes)
 			if err2 != nil {
+				logging.Error(fmt.Sprintf("[auth] RSA key parse failed for %s/%s: %v (PKCS8: %v)", domain, selector, err2, err))
 				return nil, fmt.Errorf("parsing RSA key: %w (PKCS8: %v)", err2, err)
 			}
 			signer = key2
@@ -365,10 +372,12 @@ func VerifyDKIM(message []byte) (string, string) {
 	pubKeyRecord := fmt.Sprintf("%s._domainkey.%s", selector, domain)
 	txtRecords, err := net.LookupTXT(pubKeyRecord)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[auth] DKIM DNS lookup failed for %s: %v", pubKeyRecord, err))
 		return "fail", fmt.Sprintf("DNS lookup failed: %v", err)
 	}
 
 	if len(txtRecords) == 0 {
+		logging.Warn(fmt.Sprintf("[auth] DKIM public key not found in DNS: %s", pubKeyRecord))
 		return "fail", "no DKIM public key in DNS"
 	}
 
