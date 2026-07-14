@@ -1,7 +1,10 @@
 package store
 
 import (
+	"fmt"
 	"time"
+
+	"gomail/logging"
 )
 
 // SaveDMARCFeedback records a DMARC authentication result for aggregate reporting
@@ -10,6 +13,9 @@ func (db *DB) SaveDMARCFeedback(domain, sourceIP, envelopeFromDomain, dkimResult
 		INSERT INTO dmarc_feedback (domain, source_ip, envelope_from_domain, dkim_result, spf_result, disposition, received_at)
 		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
 	`, domain, sourceIP, envelopeFromDomain, dkimResult, spfResult, disposition)
+	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to save DMARC feedback for %s: %v", domain, err))
+	}
 	return err
 }
 
@@ -24,6 +30,7 @@ func (db *DB) GetDMARCFeedbackForReport(domain string, startTime, endTime time.T
 		ORDER BY count DESC
 	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to query DMARC feedback for %s: %v", domain, err))
 		return nil, err
 	}
 	defer rows.Close()
@@ -46,6 +53,9 @@ func (db *DB) CleanOldDMARCFeedback(retentionDays int) error {
 	_, err := db.Exec(`
 		DELETE FROM dmarc_feedback WHERE received_at < datetime(?)
 	`, cutoff.Format(time.RFC3339))
+	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to clean old DMARC feedback: %v", err))
+	}
 	return err
 }
 

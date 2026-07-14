@@ -3,12 +3,12 @@ package delivery
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"gomail/auth"
 	"gomail/config"
+	"gomail/logging"
 	"gomail/parser"
 	"gomail/store"
 )
@@ -44,7 +44,7 @@ func (q *Queue) getDKIMSigner(from string) *auth.DKIMSigner {
 
 	signer, err := auth.NewDKIMSignerFromPEM(d.Domain, d.DKIMSelector, []byte(d.DKIMPrivateKey), d.DKIMAlgorithm)
 	if err != nil {
-		log.Printf("[delivery] DKIM signer init failed for %s: %v", domain, err)
+		logging.Info(fmt.Sprintf("[delivery] DKIM signer init failed for %s: %v", domain, err))
 		return nil
 	}
 	return signer
@@ -60,10 +60,10 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 		var err error
 		signedMessage, err = signer.Sign(rawMessage)
 		if err != nil {
-			log.Printf("[delivery] DKIM signing failed: %v (sending unsigned)", err)
+			logging.Info(fmt.Sprintf("[delivery] DKIM signing failed: %v (sending unsigned)", err))
 			signedMessage = rawMessage
 		} else {
-			log.Printf("[delivery] DKIM signed with selector=%s domain=%s", signer.Selector, signer.Domain)
+			logging.Info(fmt.Sprintf("[delivery] DKIM signed with selector=%s domain=%s", signer.Selector, signer.Domain))
 		}
 	} else {
 		signedMessage = rawMessage
@@ -123,11 +123,11 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	if parsed != nil && len(parsed.Attachments) > 0 {
 		records, err := parser.SaveAttachments(parsed.Attachments, msgID, q.cfg.Store.AttachmentsPath)
 		if err != nil {
-			log.Printf("[delivery] attachment save error: %v", err)
+			logging.Info(fmt.Sprintf("[delivery] attachment save error: %v", err))
 		} else {
 			for _, rec := range records {
 				if _, err := q.db.SaveAttachment(rec); err != nil {
-					log.Printf("[delivery] failed to save attachment record: %v", err)
+					logging.Info(fmt.Sprintf("[delivery] failed to save attachment record: %v", err))
 				}
 			}
 		}
@@ -146,7 +146,7 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 			var err error
 			verpAddr, err = q.db.EncodeVERP(from, rcpt)
 			if err != nil {
-				log.Printf("[delivery] VERP encoding failed for %s -> %s: %v (using regular address)", from, rcpt, err)
+				logging.Info(fmt.Sprintf("[delivery] VERP encoding failed for %s -> %s: %v (using regular address)", from, rcpt, err))
 				verpAddr = from // Fallback to normal address if VERP fails
 			}
 		}
@@ -166,11 +166,11 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 		}
 
 		if _, err := q.db.EnqueueMessage(entry); err != nil {
-			log.Printf("[delivery] enqueue error for %s: %v", rcpt, err)
+			logging.Info(fmt.Sprintf("[delivery] enqueue error for %s: %v", rcpt, err))
 		}
 	}
 
-	log.Printf("[delivery] enqueued message from=%s to=%v id=%d", from, to, msgID)
+	logging.Info(fmt.Sprintf("[delivery] enqueued message from=%s to=%v id=%d", from, to, msgID))
 	return nil
 }
 

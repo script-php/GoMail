@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"gomail/logging"
 )
 
 // --- Domain CRUD ---
@@ -16,6 +18,7 @@ func (db *DB) CreateDomain(d *Domain) (int64, error) {
 		d.Domain, boolToInt(d.IsActive), d.DKIMSelector, d.DKIMAlgorithm, d.DKIMPrivateKey, d.DKIMPublicKey, boolToInt(d.RequireTLS), d.DANEEnforcement, boolToInt(d.GreylistingEnabled), d.GreylistingDelayMins, boolToInt(d.TarpittingEnabled), d.TarpittingMaxDelaySecs,
 	)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to create domain %s: %v", d.Domain, err))
 		return 0, fmt.Errorf("creating domain: %w", err)
 	}
 	return result.LastInsertId()
@@ -34,6 +37,7 @@ func (db *DB) GetDomain(id int64) (*Domain, error) {
 		return nil, nil
 	}
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to get domain %d: %v", id, err))
 		return nil, fmt.Errorf("getting domain %d: %w", id, err)
 	}
 	d.IsActive = isActive == 1
@@ -56,6 +60,7 @@ func (db *DB) GetDomainByName(domain string) (*Domain, error) {
 		return nil, nil
 	}
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to get domain %s: %v", domain, err))
 		return nil, fmt.Errorf("getting domain %s: %w", domain, err)
 	}
 	d.IsActive = isActive == 1
@@ -71,6 +76,7 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 		SELECT id, domain, is_active, dkim_selector, dkim_algorithm, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds, created_at
 		FROM domains ORDER BY domain`)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to list domains: %v", err))
 		return nil, fmt.Errorf("listing domains: %w", err)
 	}
 	defer rows.Close()

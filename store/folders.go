@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"fmt"
+
+	"gomail/logging"
 )
 
 // Folder represents a mailbox/folder for organizing messages.
@@ -35,6 +37,7 @@ func (db *DB) DefaultFolders(accountID int64) error {
 			VALUES (?, ?, ?, 1)
 		`, accountID, f.name, f.fType)
 		if err != nil {
+			logging.Error(fmt.Sprintf("[store] failed to create default folder %s for account %d: %v", f.name, accountID, err))
 			return fmt.Errorf("creating default folder %s: %w", f.name, err)
 		}
 	}
@@ -55,6 +58,7 @@ func (db *DB) GetFolderByName(accountID int64, name string) (*Folder, error) {
 		return nil, nil
 	}
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to get folder %s for account %d: %v", name, accountID, err))
 		return nil, fmt.Errorf("getting folder: %w", err)
 	}
 	return &f, nil
@@ -74,6 +78,7 @@ func (db *DB) GetFolderByType(accountID int64, folderType string) (*Folder, erro
 		return nil, nil
 	}
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to get %s folder for account %d: %v", folderType, accountID, err))
 		return nil, fmt.Errorf("getting folder: %w", err)
 	}
 	return &f, nil

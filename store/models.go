@@ -2,6 +2,8 @@ package store
 
 import "time"
 
+// No logging needed - models.go contains only data structures
+
 // Domain represents a mail domain managed by this server.
 type Domain struct {
 	ID                     int64     `json:"id"`

@@ -3,6 +3,8 @@ package store
 import (
 	"fmt"
 	"time"
+
+	"gomail/logging"
 )
 
 // RecordTLSFailure records a TLS connection failure for TLS-RPT report generation
@@ -11,6 +13,9 @@ func (db *DB) RecordTLSFailure(recipientDomain, failureReason, sendingMTAIP, rec
 		INSERT INTO tls_failures (recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname, receiving_ip, attempted_at)
 		VALUES (?, ?, ?, ?, ?, datetime('now'))
 	`, recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP)
+	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to record TLS failure for %s: %v", recipientDomain, err))
+	}
 	return err
 }
 
@@ -34,6 +39,7 @@ func (db *DB) GetTLSFailuresForReport(domain string, startTime, endTime time.Tim
 		ORDER BY attempted_at DESC
 	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to query TLS failures for %s: %v", domain, err))
 		return nil, fmt.Errorf("querying TLS failures: %w", err)
 	}
 	defer rows.Close()

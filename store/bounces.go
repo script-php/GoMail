@@ -2,8 +2,9 @@ package store
 
 import (
 	"fmt"
-	"log"
 	"time"
+
+	"gomail/logging"
 )
 
 // VERPBounce represents a tracked bounce from a VERP address.
@@ -22,7 +23,7 @@ type VERPBounce struct {
 
 // RecordVERPBounce logs a bounce tracked via VERP.
 func (db *DB) RecordVERPBounce(originalRecipient, senderEmail, bounceAddress string, bounceType string, bounceCode int, bounceReason string) error {
-	log.Printf("[verp] recording bounce for %s (sender: %s, type: %s, code: %d)", originalRecipient, senderEmail, bounceType, bounceCode)
+	logging.Debug(fmt.Sprintf("[store] recording VERP bounce for %s (sender: %s, type: %s, code: %d)", originalRecipient, senderEmail, bounceType, bounceCode))
 
 	result, err := db.Exec(`
 		INSERT INTO verp_bounces (original_recipient, sender_email, bounce_address, bounce_type, bounce_code, bounce_reason)
@@ -30,11 +31,12 @@ func (db *DB) RecordVERPBounce(originalRecipient, senderEmail, bounceAddress str
 		originalRecipient, senderEmail, bounceAddress, bounceType, bounceCode, bounceReason,
 	)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to record VERP bounce for %s: %v", originalRecipient, err))
 		return fmt.Errorf("recording VERP bounce: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
-	log.Printf("[verp] bounce recorded with ID %d", id)
+	logging.Debug(fmt.Sprintf("[store] VERP bounce recorded with ID %d", id))
 	return nil
 }
 
@@ -51,6 +53,7 @@ func (db *DB) GetVERPBounceStats(senderEmail string, daysBack int) (map[string]i
 		senderEmail, sqliteTime(cutoff),
 	)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to query VERP bounce stats for %s: %v", senderEmail, err))
 		return nil, fmt.Errorf("querying VERP bounce stats: %w", err)
 	}
 	defer rows.Close()
@@ -84,6 +87,7 @@ func (db *DB) ListVERPBounces(senderEmail string, limit int) ([]*VERPBounce, err
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to query VERP bounces for %s: %v", senderEmail, err))
 		return nil, fmt.Errorf("querying VERP bounces: %w", err)
 	}
 	defer rows.Close()
@@ -114,7 +118,7 @@ func (db *DB) CleanupOldVERPBounces(daysOld int) (int64, error) {
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		log.Printf("[verp] cleaned up %d old bounce records", rows)
+		logging.Debug(fmt.Sprintf("[store] cleaned up %d old VERP bounce records", rows))
 	}
 	return rows, nil
 }

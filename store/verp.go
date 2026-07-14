@@ -3,6 +3,8 @@ package store
 import (
 	"fmt"
 	"strings"
+
+	"gomail/logging"
 )
 
 // EncodeVERP generates a VERP (Variable Envelope Return Path) bounce address.
@@ -21,6 +23,7 @@ import (
 func (db *DB) EncodeVERP(sender string, originalRecipient string) (string, error) {
 	senderParts := strings.SplitN(sender, "@", 2)
 	if len(senderParts) != 2 {
+		logging.Warn(fmt.Sprintf("[store] invalid sender address for VERP encoding: %s", sender))
 		return "", fmt.Errorf("invalid sender address: %s", sender)
 	}
 	senderLocal := senderParts[0]
@@ -28,6 +31,7 @@ func (db *DB) EncodeVERP(sender string, originalRecipient string) (string, error
 
 	recipientParts := strings.SplitN(originalRecipient, "@", 2)
 	if len(recipientParts) != 2 {
+		logging.Warn(fmt.Sprintf("[store] invalid recipient address for VERP encoding: %s", originalRecipient))
 		return "", fmt.Errorf("invalid recipient address: %s", originalRecipient)
 	}
 	recipientLocal := recipientParts[0]
@@ -53,6 +57,7 @@ func (db *DB) DecodeVERP(verpAddress string) (string, error) {
 	// Parse VERP address: sender_local+recipient_local=recipient_domain@sender_domain
 	parts := strings.SplitN(verpAddress, "@", 2)
 	if len(parts) != 2 {
+		logging.Debug(fmt.Sprintf("[store] invalid VERP address format: %s", verpAddress))
 		return "", fmt.Errorf("invalid VERP address: %s", verpAddress)
 	}
 
@@ -62,6 +67,7 @@ func (db *DB) DecodeVERP(verpAddress string) (string, error) {
 	// Split by + to separate sender_local and encoded recipient
 	plusParts := strings.SplitN(localPart, "+", 2)
 	if len(plusParts) != 2 {
+		logging.Debug(fmt.Sprintf("[store] malformed VERP local part (missing +): %s", localPart))
 		return "", fmt.Errorf("invalid VERP local part (missing +): %s", localPart)
 	}
 
@@ -71,6 +77,7 @@ func (db *DB) DecodeVERP(verpAddress string) (string, error) {
 	// Split by = to get recipient local and domain
 	equalParts := strings.SplitN(encodedRecipient, "=", 2)
 	if len(equalParts) != 2 {
+		logging.Debug(fmt.Sprintf("[store] malformed VERP encoded recipient (missing =): %s", encodedRecipient))
 		return "", fmt.Errorf("invalid VERP encoded recipient (missing =): %s", encodedRecipient)
 	}
 

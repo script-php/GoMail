@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"gomail/logging"
 )
 
 // Config holds all server configuration parsed from config.json.
@@ -106,7 +108,7 @@ type DeliveryConfig struct {
 	QueueWorkers   int    `json:"queue_workers"`
 	RetryIntervals []int  `json:"retry_intervals"`
 	MaxRetries     int    `json:"max_retries"`
-	Network        string `json:"network"` // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
+	Network        string `json:"network"`     // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
 	EnableVERP     *bool  `json:"enable_verp"` // Enable per-recipient bounce tracking (default true)
 }
 
@@ -168,7 +170,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Debug logging for MDN config
-	fmt.Printf("[config] Loaded MDN config: Enabled=%s, Mode=%s\n", cfg.MDN.Enabled, cfg.MDN.Mode)
+	logging.Info(fmt.Sprintf("[config] Loaded MDN config: Enabled=%s, Mode=%s", cfg.MDN.Enabled, cfg.MDN.Mode))
 
 	return &cfg, nil
 }
@@ -256,10 +258,10 @@ func (c *Config) Validate() error {
 		c.MDN.Enabled = "no"
 	}
 	if c.MDN.Mode == "" {
-		fmt.Printf("[config] MDN.Mode was empty, setting to default 'manual'\n")
+		logging.Info("[config] MDN.Mode was empty, setting to default 'manual'")
 		c.MDN.Mode = "manual"
 	} else {
-		fmt.Printf("[config] MDN.Mode was already set to: %s\n", c.MDN.Mode)
+		logging.Info(fmt.Sprintf("[config] MDN.Mode was already set to: %s", c.MDN.Mode))
 	}
 	if c.MDN.Enabled != "yes" && c.MDN.Enabled != "no" {
 		return fmt.Errorf("mdn.enabled must be 'yes' or 'no'")

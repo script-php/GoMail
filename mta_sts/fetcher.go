@@ -3,12 +3,13 @@ package mta_sts
 import (
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"gomail/logging"
 )
 
 // cachedPolicy holds a policy and when it expires
@@ -34,7 +35,7 @@ func fetchDNSTXTRecord(domain string) string {
 	txtDomain := "_mta-sts." + domain
 	records, err := net.LookupTXT(txtDomain)
 	if err != nil {
-		log.Printf("[mta-sts] DNS TXT lookup for %s failed: %v", txtDomain, err)
+		logging.Info(fmt.Sprintf("[mta-sts] DNS TXT lookup for %s failed: %v", txtDomain, err))
 		return ""
 	}
 
@@ -48,14 +49,14 @@ func fetchDNSTXTRecord(domain string) string {
 				part = strings.TrimSpace(part)
 				if strings.HasPrefix(part, "id=") {
 					id := strings.TrimPrefix(part, "id=")
-					log.Printf("[mta-sts] DNS TXT record found for %s: id=%s", domain, id)
+					logging.Info(fmt.Sprintf("[mta-sts] DNS TXT record found for %s: id=%s", domain, id))
 					return id
 				}
 			}
 		}
 	}
 
-	log.Printf("[mta-sts] no valid MTA-STS DNS TXT record for %s", domain)
+	logging.Info(fmt.Sprintf("[mta-sts] no valid MTA-STS DNS TXT record for %s", domain))
 	return ""
 }
 
@@ -77,11 +78,11 @@ func FetchPolicy(domain string) *Policy {
 			if dnsID == "" || dnsID == cached.policyID {
 				// Policy unchanged, return cached
 				cacheMutex.RUnlock()
-				log.Printf("[mta-sts] using cached policy for %s (id=%s)", domain, cached.policyID)
+				logging.Info(fmt.Sprintf("[mta-sts] using cached policy for %s (id=%s)", domain, cached.policyID))
 				return cached.policy
 			}
 			// Policy ID changed, need to refetch
-			log.Printf("[mta-sts] policy ID changed for %s (old=%s, new=%s), refetching", domain, cached.policyID, dnsID)
+			logging.Info(fmt.Sprintf("[mta-sts] policy ID changed for %s (old=%s, new=%s), refetching", domain, cached.policyID, dnsID))
 		}
 	}
 	cacheMutex.RUnlock()
@@ -90,7 +91,7 @@ func FetchPolicy(domain string) *Policy {
 	url := fmt.Sprintf("https://mta-sts.%s/.well-known/mta-sts.txt", domain)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Printf("[mta-sts] failed to create request for %s: %v", domain, err)
+		logging.Info(fmt.Sprintf("[mta-sts] failed to create request for %s: %v", domain, err))
 		return nil
 	}
 
@@ -99,27 +100,27 @@ func FetchPolicy(domain string) *Policy {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("[mta-sts] failed to fetch policy for %s: %v", domain, err)
+		logging.Info(fmt.Sprintf("[mta-sts] failed to fetch policy for %s: %v", domain, err))
 		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Printf("[mta-sts] non-200 response for %s: %d (URL: %s)", domain, resp.StatusCode, url)
+		logging.Info(fmt.Sprintf("[mta-sts] non-200 response for %s: %d (URL: %s)", domain, resp.StatusCode, url))
 		return nil
 	}
 
 	// Read response body (limit to 64KB to prevent abuse)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		log.Printf("[mta-sts] failed to read policy body for %s: %v", domain, err)
+		logging.Info(fmt.Sprintf("[mta-sts] failed to read policy body for %s: %v", domain, err))
 		return nil
 	}
 
 	// Parse policy
 	policy, err := ParsePolicy(string(body))
 	if err != nil {
-		log.Printf("[mta-sts] failed to parse policy for %s: %v", domain, err)
+		logging.Info(fmt.Sprintf("[mta-sts] failed to parse policy for %s: %v", domain, err))
 		return nil
 	}
 
@@ -132,7 +133,7 @@ func FetchPolicy(domain string) *Policy {
 	}
 	cacheMutex.Unlock()
 
-	log.Printf("[mta-sts] fetched policy for %s (mode=%s, id=%s, max_age=%d)", domain, policy.Mode, dnsID, policy.MaxAge)
+	logging.Info(fmt.Sprintf("[mta-sts] fetched policy for %s (mode=%s, id=%s, max_age=%d)", domain, policy.Mode, dnsID, policy.MaxAge))
 	return policy
 }
 
