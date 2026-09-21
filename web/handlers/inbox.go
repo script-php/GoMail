@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"gomail/security"
 	"gomail/store"
@@ -143,12 +144,26 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 // UnreadCount returns the unread count as JSON (for AJAX polling).
 func (h *InboxHandler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 	account := getSessionAccount(h.db, h.sessionMgr, r)
-	var count int
-	if account != nil {
-		count, _ = h.db.CountUnread(account.ID)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	count, err := h.db.CountUnread(account.ID)
+	if err != nil {
+		http.Error(w, "Unable to count messages", http.StatusInternalServerError)
+		return
+	}
+	folders, err := h.db.ListFolders(account.ID)
+	if err != nil {
+		http.Error(w, "Unable to count folders", http.StatusInternalServerError)
+		return
+	}
+	counts := make(map[int64]int)
+	for _, folder := range folders {
+		counts[folder.ID] = folder.UnreadCount
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]int{"unread": count})
+	json.NewEncoder(w).Encode(map[string]interface{}{"unread": count, "folders": counts})
 }
 
 // FolderView shows messages in a specific folder by folder ID.
@@ -235,5 +250,40 @@ func (h *InboxHandler) Welcome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[web] template error: %v", err)
+	}
+}
+
+// Search shows matching messages from this account, excluding Trash.
+func (h *InboxHandler) Search(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(query) > 500 {
+		http.Error(w, "Search is too long", http.StatusBadRequest)
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 || page > 1000000 {
+		page = 1
+	}
+	messages, total, err := h.db.SearchMessages(account.ID, query, 50, (page-1)*50)
+	if err != nil {
+		http.Error(w, "Unable to search mail", http.StatusInternalServerError)
+		return
+	}
+	folders, _ := h.db.ListFolders(account.ID)
+	unread, _ := h.db.CountUnread(account.ID)
+	data := map[string]interface{}{
+		"Title": "Search", "Section": "search", "Query": query, "Messages": messages,
+		"Total": total, "Page": page, "TotalPages": (total + 49) / 50,
+		"Account": account, "Folders": folders, "Unread": unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[web] search template: %v", err)
 	}
 }

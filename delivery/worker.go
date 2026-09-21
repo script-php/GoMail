@@ -115,7 +115,11 @@ func (w *Worker) processQueue() {
 		return
 	}
 	entry := entries[0]
-	w.db.UpdateQueueEntry(entry.ID, "sending", entry.Attempts, entry.NextRetry, "")
+	if err := w.db.UpdateQueueEntry(entry.ID, "sending", entry.Attempts, entry.NextRetry, ""); err != nil {
+		w.claimMu.Unlock()
+		log.Printf("[delivery] claim failed: %v", err)
+		return
+	}
 	w.claimMu.Unlock()
 
 	// Deliver outside the lock
@@ -422,46 +426,13 @@ func extractSMTPCode(errMsg string) int {
 			}
 		}
 	}
-	// Default to generic server error if no code found
-	return 550
+	// Network and DNS errors have no SMTP code and should remain retryable.
+	return 0
 }
 
-// isPermanentFailure determines if an SMTP error is permanent (should not retry) or temporary.
-// RFC 5321: The first digit indicates:
-//   - 4xx = Permanent negative reply
-//   - 5xx = Transient negative reply (but some 5xx codes like 554, 550 are actually permanent in practice)
-//
-// Permanent failures (fail immediately, no retry):
-//   - 550: Unrouteable address (user/domain unknown)
-//   - 551: User not local; please try <forward-path>
-//   - 552: Storage limit exceeded
-//   - 553: Invalid address
-//   - 554: Message rejected
-//   - 500, 501, 502, 504, 505: Command/syntax errors
-//
-// Temporary failures (should retry):
-//   - 421, 450, 451, 452, 455: Service temporarily unavailable
-//   - 503: Service unavailable (also temporary despite 5xx)
+// isPermanentFailure follows SMTP reply classes. Unknown/network errors retry.
 func isPermanentFailure(smtpCode int) bool {
-	// Permanent failures - fail immediately
-	if smtpCode == 550 || smtpCode == 551 || smtpCode == 552 || smtpCode == 553 || smtpCode == 554 ||
-		smtpCode == 500 || smtpCode == 501 || smtpCode == 502 || smtpCode == 504 || smtpCode == 505 {
-		return true
-	}
-
-	// Temporary failures - should retry
-	if smtpCode == 421 || smtpCode == 450 || smtpCode == 451 || smtpCode == 452 || smtpCode == 455 ||
-		smtpCode == 503 {
-		return false
-	}
-
-	// Default heuristic:
-	// - 4xx codes are usually permanent
-	// - 5xx codes are usually temporary (except the ones we already handled above)
-	if smtpCode >= 400 && smtpCode < 500 {
-		return true
-	}
-	return false
+	return smtpCode >= 500 && smtpCode < 600
 }
 
 // sendDSNReport sends a Delivery Status Notification (DSN) for a delivery failure.
@@ -500,7 +471,7 @@ func (w *Worker) sendDSNReport(entry *store.QueueEntry, errorMsg string, smtpCod
 		return err
 	}
 
-// --- Record VERP bounce for this failure (if VERP is enabled) ---
+	// --- Record VERP bounce for this failure (if VERP is enabled) ---
 	if w.cfg.Delivery.IsVERPEnabled() {
 		// Extract bounce type from SMTP code (4xx = temporary, 5xx = permanent)
 		bounceType := "unknown"

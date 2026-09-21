@@ -309,8 +309,14 @@ func (db *DB) CountAccounts() (int, error) {
 // --- Message CRUD ---
 
 // SaveMessage inserts a new message into the database.
-func (db *DB) SaveMessage(m *Message) (int64, error) {
-	result, err := db.Exec(`
+type sqlExecutor interface {
+	Exec(string, ...interface{}) (sql.Result, error)
+}
+
+func (db *DB) SaveMessage(m *Message) (int64, error) { return saveMessage(db, m) }
+
+func saveMessage(exec sqlExecutor, m *Message) (int64, error) {
+	result, err := exec.Exec(`
 		INSERT INTO messages (
 			account_id, folder_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
 			cc_addr, reply_to, subject, text_body, html_body, raw_headers,
@@ -515,8 +521,10 @@ func sqliteTime(t time.Time) string {
 }
 
 // EnqueueMessage adds a message to the outbound delivery queue.
-func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) {
-	result, err := db.Exec(`
+func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) { return enqueueMessage(db, q) }
+
+func enqueueMessage(exec sqlExecutor, q *QueueEntry) (int64, error) {
+	result, err := exec.Exec(`
 		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid, verp_bounce_address, original_recipient)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
@@ -1036,4 +1044,30 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// SaveQueuedMessage commits the sent copy and all recipients together.
+func (db *DB) SaveQueuedMessage(m *Message, entries []*QueueEntry) (int64, error) {
+	if len(entries) == 0 {
+		return 0, fmt.Errorf("no recipients")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	id, err := saveMessage(tx, m)
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		entry.MessageID = &id
+		if _, err := enqueueMessage(tx, entry); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }

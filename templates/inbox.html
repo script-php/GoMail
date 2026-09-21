@@ -2,20 +2,31 @@
 <div class="toolbar">
     <div class="toolbar-left">
         <label class="email-checkbox" style="padding:0 8px">
-            <input type="checkbox" aria-label="Select all">
+            <input type="checkbox" aria-label="Select all" id="select-all">
         </label>
+        <span id="selection-count" aria-live="polite"></span>
+        <button class="toolbar-btn" data-bulk-action="read" disabled>Mark read</button>
+        <button class="toolbar-btn" data-bulk-action="unread" disabled>Mark unread</button>
+        <button class="toolbar-btn" data-bulk-action="trash" disabled>Trash</button>
+        <button class="toolbar-btn" data-bulk-action="restore" disabled>Restore</button>
+        <select id="move-folder" aria-label="Move selected messages to folder" disabled>
+            <option value="">Move to…</option>
+            {{range .Folders}}{{if ne .FolderType "drafts"}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}
+        </select>
         <button class="toolbar-btn" title="Refresh" data-reload>&#8635;</button>
     </div>
     <div class="toolbar-right">
         {{if .Total}}<span>{{.Total}} messages</span>{{end}}
         {{if gt .TotalPages 1}}
         <span>Page {{.Page}} of {{.TotalPages}}</span>
-        {{if gt .Page 1}}<a href="?page={{subtract .Page 1}}" class="toolbar-btn" title="Newer">&lsaquo;</a>{{end}}
-        {{if lt .Page .TotalPages}}<a href="?page={{add .Page 1}}" class="toolbar-btn" title="Older">&rsaquo;</a>{{end}}
+        {{if gt .Page 1}}<a href="?q={{.Query}}&amp;page={{subtract .Page 1}}" class="toolbar-btn" title="Newer">&lsaquo;</a>{{end}}
+        {{if lt .Page .TotalPages}}<a href="?q={{.Query}}&amp;page={{add .Page 1}}" class="toolbar-btn" title="Older">&rsaquo;</a>{{end}}
         {{end}}
     </div>
 </div>
 
+<p id="mail-action-error" role="alert" hidden></p>
+{{if eq .Section "search"}}<p>Search results for “{{.Query}}” ({{.Total}})</p>{{end}}
 <div class="email-list">
     {{if .Messages}}
     {{range .Messages}}
@@ -49,16 +60,16 @@
     {{else}}
     <div class="empty-state">
         <div class="empty-icon">&#9993;</div>
-        <p>No messages yet.</p>
+        <p>{{if eq .Section "search"}}No matching messages.{{else}}No messages yet.{{end}}</p>
     </div>
     {{end}}
 </div>
 
 {{if and .Messages (gt .TotalPages 1)}}
 <div class="pagination">
-    {{if gt .Page 1}}<a href="?page={{subtract .Page 1}}">&laquo; Newer</a>{{end}}
+    {{if gt .Page 1}}<a href="?q={{.Query}}&amp;page={{subtract .Page 1}}">&laquo; Newer</a>{{end}}
     <span>Page {{.Page}} of {{.TotalPages}}</span>
-    {{if lt .Page .TotalPages}}<a href="?page={{add .Page 1}}">Older &raquo;</a>{{end}}
+    {{if lt .Page .TotalPages}}<a href="?q={{.Query}}&amp;page={{add .Page 1}}">Older &raquo;</a>{{end}}
 </div>
 {{end}}
 {{end}}

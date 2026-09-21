@@ -3,6 +3,7 @@ package web
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"gomail/config"
 	"gomail/delivery"
@@ -64,8 +65,10 @@ func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueF
 	}
 
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:              addr,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		Handler:           handler,
 	}
 
 	return s
@@ -105,6 +108,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Welcome)))
 	mux.Handle("/inbox", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
+	mux.Handle("/search", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Search)))
+	mux.Handle("/api/messages/action", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.BulkAction)))
 	mux.Handle("/sent", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Sent)))
 	mux.Handle("/folder/{folderID}", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.FolderView)))
 	mux.Handle("/message/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.View)))

@@ -727,3 +727,13 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
     padding: 12px 16px; background: var(--danger-light); border: 1px solid var(--danger);
     border-radius: var(--radius); margin-bottom: 16px; color: var(--danger); font-size: 13px;
 }
+
+/* Mailbox selection controls wrap on narrow screens. */
+.toolbar { flex-wrap: wrap; gap: 8px; }
+.toolbar-left { flex-wrap: wrap; }
+.toolbar-btn:disabled, #move-folder:disabled { opacity: .45; cursor: default; }
+#move-folder { max-width: 160px; padding: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text-primary); }
+#selection-count { font-size: 12px; white-space: nowrap; }
+#mail-action-error { padding: 12px; color: #b3261e; background: #fce8e6; }
+
+.toolbar-btn[data-bulk-action] { width: auto; padding: 0 10px; border-radius: 6px; font-size: 13px; white-space: nowrap; }

@@ -47,7 +47,7 @@
                     <a href="/admin/greylisting?domain={{.Domain.ID}}" class="btn btn-sm">Greylisting</a>
                     <a href="/admin/tarpitting?domain={{.Domain.ID}}" class="btn btn-sm">Tarpitting</a>
                     <form method="POST" action="/admin/domain/delete/{{.Domain.ID}}" class="inline-form"
-                          onsubmit="return confirm('Delete domain {{.Domain.Domain}} and all its accounts?')">
+                          data-confirm-delete="Delete domain {{.Domain.Domain}} and all its accounts?">
                         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                         <button type="submit" class="btn btn-sm btn-danger">Delete</button>
                     </form>

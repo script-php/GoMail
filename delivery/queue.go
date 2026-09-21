@@ -114,11 +114,40 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 		msg.FolderID = &sentFolder.ID
 	}
 
-	msgID, err := q.db.SaveMessage(msg)
-	if err != nil {
-		return fmt.Errorf("saving outbound message: %w", err)
-	}
+	var entries []*store.QueueEntry
+	// Create a queue entry for each recipient
+	for _, rcpt := range to {
+		// Generate VERP bounce address for automatic bounce tracking (if enabled)
+		var verpAddr string
+		if q.cfg.Delivery.IsVERPEnabled() {
+			var err error
+			verpAddr, err = q.db.EncodeVERP(from, rcpt)
+			if err != nil {
+				logging.Info(fmt.Sprintf("[delivery] VERP encoding failed for %s -> %s: %v (using regular address)", from, rcpt, err))
+				verpAddr = from // Fallback to normal address if VERP fails
+			}
+		}
 
+		entry := &store.QueueEntry{
+
+			MailFrom:          from,
+			RcptTo:            rcpt,
+			RawMessage:        signedMessage,
+			MaxAttempts:       q.cfg.Delivery.MaxRetries,
+			NextRetry:         time.Now().UTC(),
+			DSNNotify:         "FAILURE", // Request failure notifications from remote server
+			DSNRet:            "FULL",    // Request full message in failure report
+			DSNEnvID:          msg.MessageID,
+			VERPBounceAddress: verpAddr, // VERP-encoded bounce address (empty if disabled)
+			OriginalRecipient: rcpt,     // Store original recipient for tracking
+		}
+
+		entries = append(entries, entry)
+	}
+	msgID, err := q.db.SaveQueuedMessage(msg, entries)
+	if err != nil {
+		return fmt.Errorf("queueing outbound message: %w", err)
+	}
 	// Save attachments from the parsed message
 	if parsed != nil && len(parsed.Attachments) > 0 {
 		records, err := parser.SaveAttachments(parsed.Attachments, msgID, q.cfg.Store.AttachmentsPath)
@@ -136,38 +165,6 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	// Update sent folder counts
 	if msg.FolderID != nil {
 		q.db.UpdateFolderCounts(*msg.FolderID)
-	}
-
-	// Create a queue entry for each recipient
-	for _, rcpt := range to {
-		// Generate VERP bounce address for automatic bounce tracking (if enabled)
-		var verpAddr string
-		if q.cfg.Delivery.IsVERPEnabled() {
-			var err error
-			verpAddr, err = q.db.EncodeVERP(from, rcpt)
-			if err != nil {
-				logging.Info(fmt.Sprintf("[delivery] VERP encoding failed for %s -> %s: %v (using regular address)", from, rcpt, err))
-				verpAddr = from // Fallback to normal address if VERP fails
-			}
-		}
-
-		entry := &store.QueueEntry{
-			MessageID:         &msgID,
-			MailFrom:          from,
-			RcptTo:            rcpt,
-			RawMessage:        signedMessage,
-			MaxAttempts:       q.cfg.Delivery.MaxRetries,
-			NextRetry:         time.Now().UTC(),
-			DSNNotify:         "FAILURE", // Request failure notifications from remote server
-			DSNRet:            "FULL",    // Request full message in failure report
-			DSNEnvID:          fmt.Sprintf("%d@%s", msgID, q.cfg.Server.Hostname),
-			VERPBounceAddress: verpAddr, // VERP-encoded bounce address (empty if disabled)
-			OriginalRecipient: rcpt,     // Store original recipient for tracking
-		}
-
-		if _, err := q.db.EnqueueMessage(entry); err != nil {
-			logging.Info(fmt.Sprintf("[delivery] enqueue error for %s: %v", rcpt, err))
-		}
 	}
 
 	logging.Info(fmt.Sprintf("[delivery] enqueued message from=%s to=%v id=%d", from, to, msgID))

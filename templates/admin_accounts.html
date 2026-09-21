@@ -61,7 +61,7 @@
                 <td class="actions">
                     <a href="/admin/account/edit/{{.ID}}" class="btn btn-sm">Edit</a>
                     <form method="POST" action="/admin/account/delete/{{.ID}}" class="inline-form"
-                          onsubmit="return confirm('Delete account {{.Email}}?')">
+                          data-confirm-delete="Delete account {{.Email}}?">
                         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                         <button type="submit" class="btn btn-sm btn-danger">Delete</button>
                     </form>

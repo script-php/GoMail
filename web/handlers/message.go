@@ -164,7 +164,15 @@ func (h *MessageHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.DeleteMessage(id)
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := h.db.ApplyMessageAction(account.ID, []int64{id}, "trash", 0); err != nil {
+		http.Error(w, "Unable to delete message", http.StatusNotFound)
+		return
+	}
 	http.Redirect(w, r, "/inbox", http.StatusSeeOther)
 }
 
@@ -175,6 +183,10 @@ func (h *MessageHandler) ToggleStar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
 	account := getSessionAccount(h.db, h.sessionMgr, r)
 	if account == nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -194,7 +206,10 @@ func (h *MessageHandler) ToggleStar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.MarkStarred(id, !msg.IsStarred)
+	if err := h.db.MarkStarred(id, !msg.IsStarred); err != nil {
+		http.Error(w, "Unable to update star", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"starred": !msg.IsStarred})
@@ -214,7 +229,19 @@ func (h *MessageHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.MarkRead(id)
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := h.db.ApplyMessageAction(account.ID, []int64{id}, "read", 0); err != nil {
+		http.Error(w, "Unable to mark message read", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
@@ -373,4 +400,37 @@ func sanitizeHTML(html string) string {
 	// This is a basic whitelist - emails should mostly work
 
 	return strings.TrimSpace(html)
+}
+
+// BulkAction applies an account-scoped, atomic action to selected messages.
+func (h *MessageHandler) BulkAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var request struct {
+		IDs      []int64 `json:"ids"`
+		Action   string  `json:"action"`
+		FolderID int64   `json:"folder_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := h.db.ApplyMessageAction(account.ID, request.IDs, request.Action, request.FolderID); err != nil {
+		http.Error(w, "Unable to update selection: check messages and destination", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }

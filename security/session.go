@@ -3,6 +3,7 @@ package security
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -20,9 +21,9 @@ const (
 
 // SessionManager handles web sessions backed by the database.
 type SessionManager struct {
-	db        *store.DB
-	maxAge    int
-	csrfKey   string
+	db           *store.DB
+	maxAge       int
+	csrfKey      string
 	secureCookie bool
 }
 
@@ -76,6 +77,10 @@ func (sm *SessionManager) GetSession(r *http.Request) string {
 		return ""
 	}
 
+	account, err := sm.db.GetAccountByEmail(email)
+	if err != nil || account == nil || !account.IsActive {
+		return ""
+	}
 	return email
 }
 
@@ -121,7 +126,7 @@ func (sm *SessionManager) ValidateCSRF(r *http.Request) bool {
 		token = r.Header.Get(csrfHeaderName)
 	}
 
-	return token == expected
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
 // RequireAuth middleware redirects unauthenticated users to login.

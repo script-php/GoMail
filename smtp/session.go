@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -395,6 +396,22 @@ func (s *Session) handleRCPT(arg string) {
 	s.send(250, "OK")
 }
 
+// readDataLine bounds accumulation even when a sender never sends a newline.
+func (s *Session) readDataLine(limit int64) ([]byte, error) {
+	var line []byte
+	for {
+		fragment, err := s.reader.ReadSlice('\n')
+		if int64(len(line))+int64(len(fragment)) > limit {
+			return nil, fmt.Errorf("message exceeds maximum size")
+		}
+		line = append(line, fragment...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
+}
+
 func (s *Session) handleDATA() {
 	if s.state != StateRcpt || len(s.rcptTo) == 0 {
 		s.send(503, "Bad sequence of commands")
@@ -409,9 +426,11 @@ func (s *Session) handleDATA() {
 	for {
 		s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
-		line, err := s.reader.ReadBytes('\n')
+		line, err := s.readDataLine(s.maxSize - totalSize + 3)
 		if err != nil {
 			log.Printf("[smtp] data read error from %s: %v", s.clientAddr, err)
+			s.data.Reset()
+			s.state = StateQuit
 			return
 		}
 
@@ -430,6 +449,7 @@ func (s *Session) handleDATA() {
 		if totalSize > s.maxSize {
 			s.send(552, "Message exceeds maximum size")
 			s.reset()
+			s.state = StateQuit
 			return
 		}
 
@@ -448,19 +468,26 @@ func (s *Session) handleBDAT(arg string) {
 
 	// Parse "BDAT <length> [LAST]"
 	parts := strings.Fields(arg)
-	if len(parts) < 1 {
+	if len(parts) < 1 || len(parts) > 2 || (len(parts) == 2 && !strings.EqualFold(parts[1], "LAST")) {
 		s.send(501, "Syntax error in BDAT command")
 		return
 	}
 
-	var length int64
-	_, err := fmt.Sscanf(parts[0], "%d", &length)
+	length, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || length < 0 {
 		s.send(501, "Invalid chunk size")
 		return
 	}
 
 	isLast := len(parts) > 1 && strings.ToUpper(parts[1]) == "LAST"
+
+	// Reject before allocating; close to avoid interpreting chunk bytes as commands.
+	if length > s.maxSize-int64(s.data.Len()) {
+		s.send(552, "Message exceeds maximum size")
+		s.data.Reset()
+		s.state = StateQuit
+		return
+	}
 
 	// Read exactly 'length' bytes from connection
 	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
@@ -470,6 +497,8 @@ func (s *Session) handleBDAT(arg string) {
 	if err != nil {
 		log.Printf("[smtp] BDAT read error from %s: %v", s.clientAddr, err)
 		s.send(452, "Failed to read chunk")
+		s.data.Reset()
+		s.state = StateQuit
 		return
 	}
 

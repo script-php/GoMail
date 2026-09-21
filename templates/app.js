@@ -1,10 +1,39 @@
 // ===== UTILITY FUNCTIONS =====
 function copyToClipboard(text) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(function(err) {
-            console.error('Failed to copy:', err);
-        });
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        return Promise.reject(new Error('Clipboard requires a secure connection. Select and copy the value manually.'));
     }
+    return navigator.clipboard.writeText(text);
+}
+function csrfHeaders() {
+    var token = document.querySelector('meta[name="csrf-token"]');
+    return { 'Content-Type': 'application/json', 'X-CSRF-Token': token ? token.content : '' };
+}
+function checkedResponse(response) {
+    if (!response.ok || response.redirected) throw new Error('Action failed. Please refresh the page and try again.');
+    return response.json();
+}
+function showMailError(error) {
+    var box = document.getElementById('mail-action-error');
+    if (box) { box.hidden = false; box.textContent = error.message; }
+    else { window.alert(error.message); }
+}
+function updateSelection() {
+    var boxes = Array.from(document.querySelectorAll('.email-row input[type="checkbox"]'));
+    var count = boxes.filter(function(cb) { return cb.checked; }).length;
+    var master = document.getElementById('select-all');
+    if (master) { master.checked = count > 0 && count === boxes.length; master.indeterminate = count > 0 && count < boxes.length; }
+    var label = document.getElementById('selection-count');
+    if (label) label.textContent = count ? count + ' selected' : '';
+    document.querySelectorAll('[data-bulk-action], #move-folder').forEach(function(el) { el.disabled = !count; });
+}
+function bulkAction(action, folderID) {
+    var ids = Array.from(document.querySelectorAll('.email-row input:checked')).map(function(cb) { return Number(cb.closest('.email-row').dataset.id); });
+    if (!ids.length) return;
+    document.querySelectorAll('[data-bulk-action], #move-folder').forEach(function(el) { el.disabled = true; });
+    fetch('/api/messages/action', { method: 'POST', headers: csrfHeaders(), body: JSON.stringify({ ids: ids, action: action, folder_id: Number(folderID || 0) }) })
+        .then(checkedResponse).then(function() { location.reload(); })
+        .catch(function(error) { showMailError(error); updateSelection(); });
 }
 function toggleSidebar() {
     var sidebar = document.getElementById('sidebar');
@@ -34,9 +63,9 @@ function toggleStar(messageId, event) {
 
     fetch('/message/star/' + messageId, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: csrfHeaders()
     })
-    .then(function(r) { return r.json(); })
+    .then(checkedResponse)
     .then(function(data) {
         var btn = event.target.closest('.star-btn') || event.target;
         if (data.starred) {
@@ -47,18 +76,19 @@ function toggleStar(messageId, event) {
             btn.innerHTML = '&#9734;';
         }
     })
-    .catch(function(err) { console.error('Star toggle failed:', err); });
+    .catch(showMailError);
 }
 
 // ===== CHECKBOX: SELECT ALL =====
 function toggleAllCheckboxes(masterCb) {
     var checkboxes = document.querySelectorAll('.email-row .email-checkbox input[type="checkbox"]');
     checkboxes.forEach(function(cb) { cb.checked = masterCb.checked; });
+    updateSelection();
 }
 
 // ===== MARK READ =====
 function markRead(messageId) {
-    fetch('/api/mark-read/' + messageId, { method: 'POST' })
+    fetch('/api/mark-read/' + messageId, { method: 'POST', headers: csrfHeaders() }).then(checkedResponse)
         .catch(function(err) { console.error('Mark read failed:', err); });
 }
 
@@ -71,9 +101,13 @@ function dismissMDNNotice(messageId) {
 // ===== POLL UNREAD COUNT =====
 function pollUnread() {
     fetch('/api/unread-count')
-        .then(function(r) { return r.json(); })
+        .then(checkedResponse)
         .then(function(data) {
-            var badges = document.querySelectorAll('.nav-links .badge');
+            document.querySelectorAll('[data-folder-count]').forEach(function(badge) {
+                var count = data.folders && data.folders[badge.dataset.folderCount];
+                if (typeof count === 'number') { badge.textContent = count; badge.hidden = count === 0; }
+            });
+            var badges = document.querySelectorAll('.nav-links .badge:not([data-folder-count])');
             badges.forEach(function(badge) {
                 var li = badge.closest('li');
                 if (li && li.querySelector('a[href="/inbox"], a[href*="inbox"]')) {
@@ -104,20 +138,20 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     // Master checkbox for select all
-    var masterCheckbox = document.querySelector('.email-list .toolbar-left input[type="checkbox"]');
+    var masterCheckbox = document.getElementById('select-all');
     if (masterCheckbox) {
         masterCheckbox.addEventListener('change', function() {
             toggleAllCheckboxes(this);
         });
     }
 
-    // Refresh button
-    var refreshBtn = document.querySelector('.toolbar-btn[title="Refresh"]');
-    if (refreshBtn) {
-        refreshBtn.addEventListener('click', function() {
-            location.reload();
-        });
-    }
+    document.querySelectorAll('[data-bulk-action]').forEach(function(btn) {
+        btn.addEventListener('click', function() { bulkAction(btn.dataset.bulkAction); });
+    });
+    var moveFolder = document.getElementById('move-folder');
+    if (moveFolder) moveFolder.addEventListener('change', function() {
+        if (this.value) bulkAction('move', this.value);
+    });
 
     // Star buttons
     document.querySelectorAll('.star-btn').forEach(function(btn) {
@@ -131,6 +165,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Checkboxes (stop propagation)
     document.querySelectorAll('.email-row .email-checkbox input[type="checkbox"]').forEach(function(cb) {
+        cb.addEventListener('change', updateSelection);
         cb.addEventListener('click', function(e) {
             e.stopPropagation();
         });
@@ -190,13 +225,11 @@ document.addEventListener('DOMContentLoaded', function() {
         btn.addEventListener('click', function(e) {
             e.preventDefault();
             var text = btn.dataset.copyValue;
-            copyToClipboard(text);
-            // Optional: show feedback
             var originalText = btn.textContent;
-            btn.textContent = 'Copied!';
-            setTimeout(function() {
-                btn.textContent = originalText;
-            }, 2000);
+            copyToClipboard(text).then(function() {
+                btn.textContent = 'Copied!';
+                setTimeout(function() { btn.textContent = originalText; }, 2000);
+            }).catch(showMailError);
         });
     });
 

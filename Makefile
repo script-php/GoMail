@@ -4,6 +4,8 @@
 BINARY_NAME=gomail
 RELEASE_DIR=release
 BUILD_DIR=build
+# Keep runtime data and release artifacts out of source-package discovery.
+GO_PACKAGES=. ./auth ./config ./delivery ./dns ./logging ./mdn ./mta_sts ./parser ./reporting ./security ./smtp ./store ./templates ./tls ./web ./web/handlers
 
 # Default target
 help:
@@ -61,3 +63,7 @@ deps:
 	@go get -u ./...
 	@go mod tidy
 	@echo "✓ Dependencies updated"
+
+# Run regression tests
+test:
+	go test $(GO_PACKAGES)
