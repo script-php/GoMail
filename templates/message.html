@@ -5,9 +5,9 @@
     <a href="/compose?reply=1&to={{.Message.FromAddr}}&subject=Re: {{.Message.Subject}}" class="btn-icon" title="Reply">&#8617;</a>
     {{end}}
     <a href="/forward/{{.Message.ID}}" class="btn-icon" title="Forward">&#10148;</a>
-    <form method="POST" action="/message/delete/{{.Message.ID}}" class="inline-form">
+    <form method="POST" action="/message/delete/{{.Message.ID}}" class="inline-form" data-confirm-delete="Delete this message?">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <button type="submit" class="btn-icon" title="Delete" onclick="return confirm('Delete this message?')">&#128465;</button>
+        <button type="submit" class="btn-icon" title="Delete">&#128465;</button>
     </form>
 </div>
 
@@ -45,7 +45,7 @@
                 <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                 <button type="submit" class="btn btn-sm btn-primary">Send Receipt</button>
             </form>
-            <button class="btn btn-sm btn-ghost" onclick="dismissMDNNotice({{.Message.ID}})">Deny</button>
+            <button class="btn btn-sm btn-ghost" data-dismiss-mdn>Deny</button>
             {{else}}
             <span style="color:var(--success)">&#10003; Sent</span>
             {{end}}

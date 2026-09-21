@@ -1,6 +1,11 @@
-// GoMail — Client-side JavaScript
-
-// ===== SIDEBAR TOGGLE (mobile) =====
+// ===== UTILITY FUNCTIONS =====
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function(err) {
+            console.error('Failed to copy:', err);
+        });
+    }
+}
 function toggleSidebar() {
     var sidebar = document.getElementById('sidebar');
     var overlay = document.querySelector('.sidebar-overlay');
@@ -84,8 +89,53 @@ function pollUnread() {
         .catch(function() {}); // Silently fail
 }
 
-// ===== EMAIL ROW CLICK =====
+// ===== EVENT LISTENERS (DOMContentLoaded) =====
 document.addEventListener('DOMContentLoaded', function() {
+    // Menu toggle button
+    var menuToggle = document.querySelector('.menu-toggle');
+    if (menuToggle) {
+        menuToggle.addEventListener('click', toggleSidebar);
+    }
+
+    // Sidebar overlay click to close
+    var sidebarOverlay = document.querySelector('.sidebar-overlay');
+    if (sidebarOverlay) {
+        sidebarOverlay.addEventListener('click', closeSidebar);
+    }
+
+    // Master checkbox for select all
+    var masterCheckbox = document.querySelector('.email-list .toolbar-left input[type="checkbox"]');
+    if (masterCheckbox) {
+        masterCheckbox.addEventListener('change', function() {
+            toggleAllCheckboxes(this);
+        });
+    }
+
+    // Refresh button
+    var refreshBtn = document.querySelector('.toolbar-btn[title="Refresh"]');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', function() {
+            location.reload();
+        });
+    }
+
+    // Star buttons
+    document.querySelectorAll('.star-btn').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var messageId = btn.closest('.email-row').dataset.id;
+            if (messageId) toggleStar(messageId, e);
+        });
+    });
+
+    // Checkboxes (stop propagation)
+    document.querySelectorAll('.email-row .email-checkbox input[type="checkbox"]').forEach(function(cb) {
+        cb.addEventListener('click', function(e) {
+            e.stopPropagation();
+        });
+    });
+
     // Make email rows clickable
     document.querySelectorAll('.email-row').forEach(function(row) {
         row.addEventListener('click', function(e) {
@@ -97,6 +147,56 @@ document.addEventListener('DOMContentLoaded', function() {
 
             var id = this.dataset.id;
             if (id) window.location.href = '/message/' + id;
+        });
+    });
+
+    // MDN deny buttons
+    document.querySelectorAll('button[data-dismiss-mdn]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var messageId = btn.dataset.dismissMdn;
+            dismissMDNNotice(messageId);
+        });
+    });
+
+    // Form submissions with confirmation
+    document.querySelectorAll('form[data-confirm-delete]').forEach(function(form) {
+        form.addEventListener('submit', function(e) {
+            var msg = form.dataset.confirmDelete;
+            if (!confirm(msg)) {
+                e.preventDefault();
+            }
+        });
+    });
+
+    // Delete confirmation buttons
+    document.querySelectorAll('button[data-confirm-delete]').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            var msg = btn.dataset.confirmDelete;
+            if (!confirm(msg)) {
+                e.preventDefault();
+            }
+        });
+    });
+
+    // Refresh page buttons
+    document.querySelectorAll('button[data-reload]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            location.reload();
+        });
+    });
+
+    // Copy buttons
+    document.querySelectorAll('button[data-copy-value]').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            var text = btn.dataset.copyValue;
+            copyToClipboard(text);
+            // Optional: show feedback
+            var originalText = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(function() {
+                btn.textContent = originalText;
+            }, 2000);
         });
     });
 

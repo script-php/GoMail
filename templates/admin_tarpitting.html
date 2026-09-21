@@ -78,8 +78,8 @@
                                 <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                             </form>
                         {{end}}
-                        <form method="post" style="display: inline;">
-                            <button type="submit" name="action" value="delete" class="btn btn-danger" onclick="return confirm('Delete this entry?')">Delete</button>
+                        <form method="post" style="display: inline;" data-confirm-delete="Delete this entry?">
+                            <button type="submit" name="action" value="delete" class="btn btn-danger">Delete</button>
                             <input type="hidden" name="entry_id" value="{{.ID}}">
                             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                         </form>

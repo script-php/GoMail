@@ -2,9 +2,9 @@
 <div class="toolbar">
     <div class="toolbar-left">
         <label class="email-checkbox" style="padding:0 8px">
-            <input type="checkbox" onclick="toggleAllCheckboxes(this)" aria-label="Select all">
+            <input type="checkbox" aria-label="Select all">
         </label>
-        <button class="toolbar-btn" title="Refresh" onclick="location.reload()">&#8635;</button>
+        <button class="toolbar-btn" title="Refresh" data-reload>&#8635;</button>
     </div>
     <div class="toolbar-right">
         {{if .Total}}<span>{{.Total}} messages</span>{{end}}
@@ -21,11 +21,10 @@
     {{range .Messages}}
     <div class="email-row {{if not .IsRead}}unread{{else}}read{{end}}" data-id="{{.ID}}">
         <div class="email-checkbox">
-            <input type="checkbox" aria-label="Select" onclick="event.stopPropagation()">
+            <input type="checkbox" aria-label="Select">
         </div>
         <div class="email-star">
             <button class="star-btn {{if .IsStarred}}starred{{end}}"
-                    onclick="toggleStar({{.ID}}, event)"
                     aria-label="Star">
                 {{if .IsStarred}}&#9733;{{else}}&#9734;{{end}}
             </button>

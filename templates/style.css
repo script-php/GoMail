@@ -57,7 +57,7 @@ a:hover { text-decoration: underline; }
 }
 .menu-toggle {
     width: 48px; height: 48px; border: none; background: transparent;
-    border-radius: 50%; cursor: pointer; display: flex;
+    border-radius: 50%; cursor: pointer; display: none;
     align-items: center; justify-content: center; flex-shrink: 0;
     transition: background var(--transition);
 }
@@ -66,11 +66,6 @@ a:hover { text-decoration: underline; }
 .header-logo {
     display: flex; align-items: center; gap: 4px;
     min-width: 200px; padding-left: 4px;
-}
-.header-logo .logo-icon {
-    width: 32px; height: 32px; background: var(--primary);
-    border-radius: 50%; display: flex; align-items: center;
-    justify-content: center; color: #fff; font-weight: 700; font-size: 16px;
 }
 .header-logo span { font-size: 22px; color: var(--text-secondary); font-weight: 400; letter-spacing: -.5px; }
 .header-search { flex: 1; max-width: 720px; margin: 0 auto; }
@@ -287,7 +282,7 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
 }
 
 /* ===== COMPOSE ===== */
-.compose-container { max-width: 900px; }
+.compose-container { max-width: 900px; margin: 0 auto; padding: 16px; }
 .compose-card {
     background: var(--card-bg); border-radius: var(--radius-lg);
     box-shadow: var(--shadow-md); overflow: hidden;
@@ -406,11 +401,6 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
     width: 100%; max-width: 450px; border: 1px solid var(--border-light);
 }
 .login-logo { text-align: center; margin-bottom: 8px; }
-.login-logo .logo-icon {
-    width: 56px; height: 56px; background: var(--primary); border-radius: 50%;
-    display: inline-flex; align-items: center; justify-content: center;
-    color: #fff; font-weight: 700; font-size: 24px; margin-bottom: 16px;
-}
 .login-card h2 { text-align: center; font-size: 24px; font-weight: 400; color: var(--text); margin-bottom: 8px; }
 .login-subtitle { text-align: center; color: var(--text-secondary); font-size: 16px; margin-bottom: 32px; }
 .login-card .form-group { margin-bottom: 24px; }
@@ -439,7 +429,10 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
 .empty-state p { font-size: 14px; }
 
 /* ===== ADMIN ===== */
-.admin-panel { max-width: 1100px; padding: 16px 0; }
+.admin-panel { max-width: 1400px;
+    width: 100%;
+    margin: 20px auto;
+    padding: 20px; }
 .admin-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .admin-header h2 { font-size: 22px; font-weight: 400; color: var(--text); }
 .admin-table {
@@ -495,27 +488,18 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
 .sidebar-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.4); z-index: 99; }
 .sidebar-overlay.active { display: block; }
 
-/* ===== RESPONSIVE: TABLET ===== */
-@media (max-width: 1024px) {
-    :root { --sidebar-width: 72px; }
-    .sidebar { padding: 12px 4px; }
-    .compose-btn span { display: none; }
-    .compose-btn { width: 48px; height: 48px; padding: 0; justify-content: center; margin: 0 auto 8px; }
-    .nav-links li a { justify-content: center; padding: 0; height: 40px; width: 48px; margin: 2px auto; border-radius: var(--radius-pill); gap: 0; }
-    .nav-links .nav-text { display: none; }
-    .badge { display: none; }
-    .header-logo { min-width: auto; }
-    .header-logo span { display: none; }
-    .header-email { display: none; }
+@media (max-width: 768px) {
+    .sidebar-overlay { top: var(--header-height); }
 }
 
 /* ===== RESPONSIVE: MOBILE ===== */
 @media (max-width: 768px) {
     :root { --header-height: 56px; --sidebar-width: 280px; }
+    .menu-toggle { display: flex; }
     .sidebar {
         transform: translateX(-100%); padding: 12px;
         background: var(--card-bg); box-shadow: var(--shadow-lg);
-        top: 0; z-index: 300;
+        top: var(--header-height); height: calc(100% - var(--header-height)); z-index: 300;
     }
     .sidebar.open { transform: translateX(0); }
     .compose-btn span { display: inline; }
@@ -540,8 +524,14 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
     .message-subject { font-size: 18px; }
     .message-body { padding: 16px; }
     .attachments { padding: 12px 16px; }
+    .compose-container { padding: 8px; }
     .compose-card { border-radius: var(--radius); }
     .compose-header { border-radius: var(--radius) var(--radius) 0 0; }
+    .compose-field { flex-direction: column; align-items: flex-start; padding: 12px 16px; }
+    .compose-field label { min-width: auto; margin-bottom: 8px; }
+    .compose-field input, .compose-field select { padding: 8px 0; }
+    .compose-field-extra { flex-direction: column; gap: 8px; align-items: flex-start; }
+    .compose-textarea { min-height: 250px; padding: 12px; }
     .admin-table { font-size: 12px; }
     .admin-table th, .admin-table td { padding: 8px 12px; }
     .admin-form .form-row { flex-direction: column; gap: 0; }

@@ -74,11 +74,11 @@
                             </button>
                         </form>
                         {{end}}
-                        <form method="POST" style="display: inline;">
+                        <form method="POST" style="display: inline;" data-confirm-delete="Delete this entry?">
                             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                             <input type="hidden" name="action" value="delete">
                             <input type="hidden" name="entry_id" value="{{.ID}}">
-                            <button type="submit" class="btn-mini" onclick="return confirm('Delete this entry?')" title="Remove this greylisting entry" style="background: #f44336; color: white; padding: 4px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">
+                            <button type="submit" class="btn-mini" title="Remove this greylisting entry" style="background: #f44336; color: white; padding: 4px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">
                                 🗑 Delete
                             </button>
                         </form>
@@ -113,7 +113,8 @@
 
 <style>
 .admin-panel {
-    max-width: 1000px;
+    max-width: 1400px;
+    width: 100%;
     margin: 20px auto;
     padding: 20px;
 }
