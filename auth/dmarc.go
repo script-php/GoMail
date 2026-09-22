@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
@@ -15,9 +17,11 @@ import (
 type DMARCResult string
 
 const (
-	DMARCPass DMARCResult = "pass"
-	DMARCFail DMARCResult = "fail"
-	DMARCNone DMARCResult = "none"
+	DMARCPass      DMARCResult = "pass"
+	DMARCFail      DMARCResult = "fail"
+	DMARCNone      DMARCResult = "none"
+	DMARCTempError DMARCResult = "temperror"
+	DMARCPermError DMARCResult = "permerror"
 )
 
 // DMARCPolicy represents the action a domain requests for failed messages.
@@ -57,10 +61,19 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 	// Look up DMARC record
 	dmarcRecord, err := lookupDMARC(fromDomain)
 	if err != nil || dmarcRecord == "" {
+		result := DMARCNone
+		details := "no DMARC record found"
+		if err != nil && !errors.Is(err, errNoDMARC) {
+			result = DMARCPermError
+			details = err.Error()
+			if dnsErr, ok := err.(*net.DNSError); ok && (dnsErr.IsTimeout || dnsErr.IsTemporary) {
+				result = DMARCTempError
+			}
+		}
 		return DMARCCheckResult{
-			Result:       DMARCNone,
+			Result:       result,
 			Policy:       PolicyNone,
-			Details:      "no DMARC record found",
+			Details:      details,
 			ReportMailto: nil,
 			ForensicMail: nil,
 			PercentApply: 100,
@@ -69,6 +82,9 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 
 	// Parse DMARC tags
 	tags := parseDMARCTags(dmarcRecord)
+	if tags["v"] != "DMARC1" || tags["p"] == "" || (tags["p"] != "none" && tags["p"] != "quarantine" && tags["p"] != "reject") {
+		return DMARCCheckResult{Result: DMARCPermError, Policy: PolicyNone, Details: "invalid DMARC policy record", PercentApply: 100}
+	}
 
 	// Determine policy: use sp= for subdomains, p= for organizational domain
 	policy := PolicyNone
@@ -131,10 +147,10 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 	if tags["pct"] != "" {
 		pct = parsePct(tags["pct"])
 		if !shouldApplyPolicy(pct) {
-			// Randomly sampled out - report as pass to avoid applying policy
+			// Sampling changes requested disposition, never authentication.
 			return DMARCCheckResult{
-				Result:       DMARCPass,
-				Policy:       policy,
+				Result:       DMARCFail,
+				Policy:       PolicyNone,
 				Details:      fmt.Sprintf("failed auth but excluded by pct=%s sampling", tags["pct"]),
 				ReportMailto: parseReportAddresses(tags["rua"]),
 				ForensicMail: parseReportAddresses(tags["ruf"]),
@@ -156,8 +172,7 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 
 // isSubdomainOfOrg returns true if domain is a subdomain of its organizational domain.
 func isSubdomainOfOrg(domain string) bool {
-	parts := strings.Split(domain, ".")
-	return len(parts) > 2 // More than 2 labels means it's a subdomain
+	return !strings.EqualFold(strings.TrimSuffix(domain, "."), getOrgDomain(domain))
 }
 
 // parsePct parses the pct= tag value (percentage, 0-100).
@@ -166,8 +181,10 @@ func parsePct(pctStr string) int {
 	if pctStr == "" {
 		return 100
 	}
-	var pct int
-	fmt.Sscanf(pctStr, "%d", &pct)
+	pct, err := strconv.Atoi(pctStr)
+	if err != nil {
+		return 100
+	}
 	if pct < 0 {
 		pct = 0
 	}
@@ -218,34 +235,47 @@ func lookupDMARC(domain string) (string, error) {
 	if err == nil && record != "" {
 		return record, nil
 	}
+	if err != nil && !errors.Is(err, errNoDMARC) {
+		if dnsErr, ok := err.(*net.DNSError); !ok || !dnsErr.IsNotFound {
+			return "", err
+		}
+	}
 
-	// Try organizational domain (one level up)
-	parts := strings.SplitN(domain, ".", 2)
-	if len(parts) == 2 {
-		orgDomain := parts[1]
+	// Try the Public Suffix List organizational domain.
+	orgDomain := getOrgDomain(domain)
+	if !strings.EqualFold(orgDomain, domain) {
 		record, err := queryDMARC(orgDomain)
 		if err == nil && record != "" {
 			return record, nil
 		}
 	}
 
-	return "", fmt.Errorf("no DMARC record for %s", domain)
+	return "", fmt.Errorf("%w for %s", errNoDMARC, domain)
 }
+
+var errNoDMARC = errors.New("no DMARC record")
 
 func queryDMARC(domain string) (string, error) {
 	dmarcDomain := "_dmarc." + domain
-	txtRecords, err := net.LookupTXT(dmarcDomain)
+	txtRecords, err := lookupTXT(dmarcDomain)
 	if err != nil {
 		logging.Debug(fmt.Sprintf("[auth] DMARC record not found for %s: %v", domain, err))
 		return "", err
 	}
 
+	var found []string
 	for _, txt := range txtRecords {
 		if strings.HasPrefix(txt, "v=DMARC1") {
-			return txt, nil
+			found = append(found, txt)
 		}
 	}
-	return "", nil
+	if len(found) == 0 {
+		return "", errNoDMARC
+	}
+	if len(found) > 1 {
+		return "", fmt.Errorf("multiple DMARC records at %s", dmarcDomain)
+	}
+	return found[0], nil
 }
 
 func parseDMARCTags(record string) map[string]string {

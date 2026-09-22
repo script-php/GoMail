@@ -32,7 +32,7 @@ func LookupDKIMPublicKey(selector, domain string) (*DKIMRecord, error) {
 	// Query DNS TXT record at selector._domainkey.domain
 	lookupHost := fmt.Sprintf("%s._domainkey.%s", selector, domain)
 
-	txts, err := net.LookupTXT(lookupHost)
+	txts, err := lookupTXT(lookupHost)
 	if err != nil {
 		dnsErr, ok := err.(*net.DNSError)
 		if ok && dnsErr.IsNotFound {
@@ -85,7 +85,7 @@ func parseDKIMRecord(recordStr string) *DKIMRecord {
 		switch key {
 		case "v":
 			record.Version = value
-		case "a":
+		case "k":
 			record.Algorithm = value
 		case "h":
 			record.HashAlgo = value
@@ -116,7 +116,7 @@ func parseDKIMRecord(recordStr string) *DKIMRecord {
 
 	// Parse public key based on algorithm
 	switch record.Algorithm {
-	case "rsa-sha256":
+	case "rsa", "rsa-sha256":
 		pub, err := x509.ParsePKIXPublicKey(keyBytes)
 		if err != nil {
 			return nil
@@ -127,7 +127,7 @@ func parseDKIMRecord(recordStr string) *DKIMRecord {
 		}
 		record.PublicKey = rsaPub
 
-	case "ed25519-sha256":
+	case "ed25519", "ed25519-sha256":
 		if len(keyBytes) != ed25519.PublicKeySize {
 			return nil
 		}

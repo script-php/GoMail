@@ -191,7 +191,9 @@ func (s *InboundServer) runSession(sess *Session) {
 
 			// Process the received message
 			if sess.data.Len() > 0 {
-				if err := s.processMessage(sess); err != nil {
+				if err := sess.validateMessageEncoding(); err != nil {
+					sess.send(550, err.Error())
+				} else if err := s.processMessage(sess); err != nil {
 					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
 					sess.send(451, "Message processing failed, try again later")
 				} else {
@@ -216,7 +218,9 @@ func (s *InboundServer) runSession(sess *Session) {
 
 			// If LAST chunk was received (state transitions back to StateReady with data), process message
 			if sess.state == StateReady && sess.data.Len() > 0 {
-				if err := s.processMessage(sess); err != nil {
+				if err := sess.validateMessageEncoding(); err != nil {
+					sess.send(550, err.Error())
+				} else if err := s.processMessage(sess); err != nil {
 					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
 					sess.send(451, "Message processing failed, try again later")
 				} else {
@@ -269,14 +273,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	authBuilder := auth.NewAuthResultsBuilder(s.cfg.Server.Hostname)
 
 	// SPF
-	spfResult, spfDetail := auth.CheckSPF(clientIP, mailFrom)
+	spfResult, spfDetail := auth.CheckSPFWithHELO(clientIP, mailFrom, sess.ehlo)
 	authBuilder.AddSPF(spfResult, spfDetail, mailFrom)
 	logging.Info(fmt.Sprintf("[smtp] SPF: %s (%s)", spfResult, spfDetail))
 
 	// DKIM
-	dkimResult, dkimDetail := auth.VerifyDKIM(rawMessage)
-	dkimDomain := auth.GetDKIMDomain(rawMessage)
-	authBuilder.AddDKIM(dkimResult, dkimDetail, "", "")
+	dkimResult, dkimDetail, dkimDomain, dkimSelector := auth.VerifyDKIMDetailed(rawMessage)
+	authBuilder.AddDKIM(dkimResult, dkimDetail, dkimDomain, dkimSelector)
 	logging.Info(fmt.Sprintf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail))
 
 	// DMARC
@@ -298,9 +301,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	// Record DMARC feedback for aggregate reporting (RFC 7489)
 	// Determine disposition based on policy and auth results
 	disposition := "none"
-	dkimPass := dkimResult == "pass"
-	spfPass := spfResult == "pass"
-	if !dkimPass && !spfPass {
+	if dmarcResult.Result == auth.DMARCFail {
 		if dmarcResult.Policy == "reject" {
 			disposition = "reject"
 		} else if dmarcResult.Policy == "quarantine" {
@@ -314,7 +315,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	authResults := authBuilder.Build()
 
 	// Prepend Authentication-Results header to raw message so clients can see it
-	authResultsHeader := authResults + "\r\n"
+	authResultsHeader := "Authentication-Results: " + authResults + "\r\n"
 	rawMessage = append([]byte(authResultsHeader), rawMessage...)
 
 	// --- Validate ARC Chain (if present) ---
@@ -498,26 +499,16 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			strings.Contains(strings.ToLower(parsed.Subject), "delivery report") ||
 			parsed.MDNRequestedBy != "" // MDN messages have this set
 
-		// Route to inbox ONLY if all three authentications pass
-		// For automated messages, allow SPF="none" if DKIM and DMARC pass
-		var allAuthPass bool
-		if isAutomatedMessage {
-			// For automated messages: SPF can be "none", but DKIM and DMARC must pass
-			allAuthPass = dkimResult == "pass" && dmarcResult.Result == "pass"
-		} else {
-			// For regular messages: require all three
-			allAuthPass = spfResult == "pass" && dkimResult == "pass" && dmarcResult.Result == "pass"
-		}
-		authFailed := arcFailed || !allAuthPass
+		// DMARC passes when either aligned SPF or aligned DKIM passes. ARC is
+		// advisory evidence for forwarded mail and must not independently
+		// quarantine an otherwise valid message.
+		_ = isAutomatedMessage
+		authFailed := dmarcResult.Result == auth.DMARCFail && dmarcResult.Policy != auth.PolicyNone
 
 		if authFailed {
 			// Any auth failure → spam folder
-			if arcFailed {
-				logging.Warn(fmt.Sprintf("[smtp] ARC failed: quarantining to spam (reason: %s)", arcValidation.Details))
-			} else {
-				logging.Warn(fmt.Sprintf("[smtp] auth check failed - SPF: %s, DKIM: %s, DMARC: %s - quarantining to spam",
-					spfResult, dkimResult, dmarcResult.Result))
-			}
+			logging.Warn(fmt.Sprintf("[smtp] DMARC policy requested %s - SPF: %s, DKIM: %s, DMARC: %s",
+				dmarcResult.Policy, spfResult, dkimResult, dmarcResult.Result))
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
 				logging.Error(fmt.Sprintf("[smtp] error getting spam folder: %v", err))

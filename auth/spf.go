@@ -27,8 +27,17 @@ const (
 // CheckSPF verifies the SPF record for the sender's domain against the connecting IP.
 // RFC 7208 compliant with DNS lookup counter (max 10), exists mechanism, exp= modifier, and macro expansion.
 func CheckSPF(ip, mailFrom string) (SPFResult, string) {
+	return CheckSPFWithHELO(ip, mailFrom, "")
+}
+
+// CheckSPFWithHELO evaluates the RFC5321.MailFrom identity, or the HELO
+// identity for a null reverse-path as required for bounce messages.
+func CheckSPFWithHELO(ip, mailFrom, helo string) (SPFResult, string) {
 	if mailFrom == "" {
-		return SPFNone, "no envelope sender"
+		if helo == "" {
+			return SPFNone, "no envelope sender or HELO identity"
+		}
+		mailFrom = "postmaster@" + strings.TrimSuffix(helo, ".")
 	}
 
 	parts := strings.SplitN(mailFrom, "@", 2)
@@ -45,11 +54,14 @@ func CheckSPF(ip, mailFrom string) (SPFResult, string) {
 		senderIP:       ip,
 		localPart:      localPart,
 		domain:         domain,
-		helo:           domain, // Default to domain if HELO not provided
+		helo:           helo,
 		receiverDomain: domain, // Default to domain; caller can override
 		lookups:        0,
 		voidLookups:    0,
 		timestamp:      time.Now().Unix(),
+	}
+	if ctx.helo == "" {
+		ctx.helo = domain
 	}
 
 	clientIP := net.ParseIP(ip)
@@ -78,39 +90,45 @@ type spfContext struct {
 // checkSPFDomainWithContext recursively checks SPF for included/redirected domains with full RFC 7208 support.
 func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *spfContext, explanation *string) (SPFResult, string) {
 	// Check lookup counter (RFC 7208 §4.6.4)
-	if ctx.lookups >= 10 {
+	if ctx.lookups > 10 {
 		return SPFPermError, "too many DNS lookups (max 10 allowed)"
 	}
 
-	// Look up SPF record (counts as one DNS lookup for mechanisms that need it)
-	ctx.lookups++
-	txtRecords, err := net.LookupTXT(domain)
+	txtRecords, err := lookupTXT(domain)
 	if err != nil {
 		// RFC 7208 §4.3: NXDOMAIN or NODATA at top level → SPFNone
 		// At nested level (include/redirect) → SPFPermError
 		// Other DNS errors → SPFTempError
-		if depth == 0 {
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound && depth == 0 {
 			// Top-level domain: treat NXDOMAIN same as "no SPF record"
 			// (both cases mean "no policy to check")
 			return SPFNone, "no SPF record found"
 		}
-		// At included/redirected level: NXDOMAIN is a permerror
-		return SPFPermError, fmt.Sprintf("DNS lookup failed for included domain: %v", err)
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+			return SPFPermError, fmt.Sprintf("included domain does not exist: %v", err)
+		}
+		return SPFTempError, fmt.Sprintf("temporary DNS lookup failure: %v", err)
 	}
 
-	var spfRecord string
+	var spfRecords []string
 	for _, txt := range txtRecords {
 		if strings.HasPrefix(txt, "v=spf1 ") || txt == "v=spf1" {
-			spfRecord = txt
-			break
+			spfRecords = append(spfRecords, txt)
 		}
+	}
+	if len(spfRecords) > 1 {
+		return SPFPermError, "multiple SPF records found"
+	}
+	spfRecord := ""
+	if len(spfRecords) == 1 {
+		spfRecord = spfRecords[0]
 	}
 
 	if spfRecord == "" {
 		if depth == 0 {
 			return SPFNone, "no SPF record found"
 		}
-		return SPFNeutral, fmt.Sprintf("no SPF record for %s", domain)
+		return SPFPermError, fmt.Sprintf("no SPF record for included domain %s", domain)
 	}
 
 	// Parse terms - separate mechanisms from modifiers
@@ -150,11 +168,20 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 			mechanism = mechanism[1:]
 		}
 
+		if err := validateSPFMechanism(mechanism); err != nil {
+			return SPFPermError, err.Error()
+		}
 		matched, mechResult := evaluateMechanism(clientIP, domain, mechanism, ctx, explanation)
 
 		// Handle mechanism-specific error propagation
 		if mechResult != "" {
 			return SPFResult(mechResult), fmt.Sprintf("mechanism %s: %s", term, mechResult)
+		}
+		if ctx.lookups > 10 {
+			return SPFPermError, "too many DNS lookups (max 10 allowed)"
+		}
+		if ctx.voidLookups > 2 {
+			return SPFPermError, "too many void DNS lookups (max 2 allowed)"
 		}
 
 		if matched {
@@ -168,6 +195,10 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 
 	// RFC 7208 §6.1: redirect MUST only be evaluated after all mechanisms fail to match
 	if redirectDomain != "" {
+		if ctx.lookups >= 10 {
+			return SPFPermError, "too many DNS lookups (max 10 allowed)"
+		}
+		ctx.lookups++
 		redirectDomain = expandMacros(redirectDomain, ctx, false)
 		return checkSPFDomainWithContext(clientIP, redirectDomain, depth+1, ctx, explanation)
 	}
@@ -206,6 +237,10 @@ func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContex
 		return matchExists(queryDomain, ctx), ""
 
 	case strings.HasPrefix(mechanism, "include:"):
+		if ctx.lookups >= 10 {
+			return false, "permerror"
+		}
+		ctx.lookups++
 		includeDomain := expandMacros(mechanism[8:], ctx, false)
 		result, _ := checkSPFDomainWithContext(clientIP, includeDomain, 1, ctx, explanation)
 		// RFC 7208 §5.2: include error semantics
@@ -230,7 +265,36 @@ func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContex
 		return matchPTR(clientIP, checkDomain, ctx), ""
 	}
 
-	return false, ""
+	return false, "permerror"
+}
+
+func validateSPFMechanism(mechanism string) error {
+	base := mechanism
+	if i := strings.IndexAny(base, ":/"); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "all", "a", "mx", "ip4", "ip6", "exists", "include", "ptr":
+	default:
+		return fmt.Errorf("unknown SPF mechanism %q", mechanism)
+	}
+	if base == "ip4" || base == "ip6" {
+		value := strings.TrimPrefix(mechanism, base+":")
+		if value == "" {
+			return fmt.Errorf("empty %s mechanism", base)
+		}
+		if strings.Contains(value, "/") {
+			if _, _, err := net.ParseCIDR(value); err != nil {
+				return fmt.Errorf("invalid %s mechanism", base)
+			}
+		} else {
+			ip := net.ParseIP(value)
+			if ip == nil || (base == "ip4" && ip.To4() == nil) || (base == "ip6" && ip.To4() != nil) {
+				return fmt.Errorf("invalid %s mechanism", base)
+			}
+		}
+	}
+	return nil
 }
 
 // parseAMXMechanism parses a or mx mechanism with optional domain and CIDR.
@@ -281,9 +345,8 @@ func fetchExplanation(expDomain string, ctx *spfContext, explanation *string) {
 	if ctx.lookups >= 10 {
 		return
 	}
-	ctx.lookups++
 	expDomain = expandMacros(expDomain, ctx, false)
-	if txtRecords, err := net.LookupTXT(expDomain); err == nil && len(txtRecords) > 0 {
+	if txtRecords, err := lookupTXT(expDomain); err == nil && len(txtRecords) > 0 {
 		// Concatenate all TXT record strings and expand macros
 		*explanation = expandMacros(strings.Join(txtRecords, ""), ctx, false)
 	}

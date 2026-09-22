@@ -29,19 +29,19 @@ func DefaultPolicy(hostname string) *Policy {
 func ParsePolicy(text string) (*Policy, error) {
 	policy := &Policy{
 		MXHosts: []string{},
-		MaxAge:  3600, // Default 1 hour if not specified
 	}
+	seen := map[string]bool{}
 
 	lines := strings.Split(text, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue // Skip empty lines and comments
+		if line == "" {
+			continue
 		}
 
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
-			continue
+			return nil, fmt.Errorf("invalid policy line %q", line)
 		}
 
 		key := strings.TrimSpace(parts[0])
@@ -49,15 +49,29 @@ func ParsePolicy(text string) (*Policy, error) {
 
 		switch key {
 		case "version":
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate version field")
+			}
+			seen[key] = true
 			policy.Version = value
 		case "mode":
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate mode field")
+			}
+			seen[key] = true
 			policy.Mode = value
 		case "mx":
 			policy.MXHosts = append(policy.MXHosts, value)
 		case "max_age":
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate max_age field")
+			}
+			seen[key] = true
 			// Parse as int
-			if age, err := strconv.Atoi(value); err == nil {
+			if age, err := strconv.Atoi(value); err == nil && age >= 0 {
 				policy.MaxAge = age
+			} else {
+				return nil, fmt.Errorf("invalid max_age: %s", value)
 			}
 		}
 	}
@@ -69,7 +83,10 @@ func ParsePolicy(text string) (*Policy, error) {
 	if policy.Mode != "enforce" && policy.Mode != "testing" && policy.Mode != "none" {
 		return nil, fmt.Errorf("invalid mode: %s", policy.Mode)
 	}
-	if len(policy.MXHosts) == 0 {
+	if !seen["max_age"] {
+		return nil, fmt.Errorf("policy has no max_age")
+	}
+	if policy.Mode != "none" && len(policy.MXHosts) == 0 {
 		return nil, fmt.Errorf("policy has no MX hosts")
 	}
 

@@ -19,22 +19,43 @@ func NewAuthResultsBuilder(hostname string) *AuthResultsBuilder {
 // AddSPF adds an SPF result to the authentication results.
 func (b *AuthResultsBuilder) AddSPF(result SPFResult, detail, domain string) {
 	b.results = append(b.results, fmt.Sprintf(
-		"spf=%s (%s) smtp.mailfrom=%s", result, detail, domain,
+		"spf=%s (%s) smtp.mailfrom=%s", result, authResultComment(detail), authResultValue(domain),
 	))
 }
 
 // AddDKIM adds a DKIM result to the authentication results.
 func (b *AuthResultsBuilder) AddDKIM(result, detail, domain, selector string) {
 	b.results = append(b.results, fmt.Sprintf(
-		"dkim=%s (%s) header.d=%s header.s=%s", result, detail, domain, selector,
+		"dkim=%s (%s) header.d=%s header.s=%s", result, authResultComment(detail), authResultValue(domain), authResultValue(selector),
 	))
 }
 
 // AddDMARC adds a DMARC result to the authentication results.
 func (b *AuthResultsBuilder) AddDMARC(result DMARCResult, detail, domain string) {
 	b.results = append(b.results, fmt.Sprintf(
-		"dmarc=%s (%s) header.from=%s", result, detail, domain,
+		"dmarc=%s (%s) header.from=%s", result, authResultComment(detail), authResultValue(domain),
 	))
+}
+
+func authResultComment(value string) string {
+	value = strings.ReplaceAll(value, "\\", "\\\\")
+	value = strings.ReplaceAll(value, "(", "\\(")
+	value = strings.ReplaceAll(value, ")", "\\)")
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return value
+}
+func authResultValue(value string) string {
+	var out strings.Builder
+	for _, r := range value {
+		if r > 32 && r < 127 && !strings.ContainsRune("();=\\\"", r) {
+			out.WriteRune(r)
+		}
+	}
+	if out.Len() == 0 {
+		return "unknown"
+	}
+	return out.String()
 }
 
 // Build constructs the full Authentication-Results header value.

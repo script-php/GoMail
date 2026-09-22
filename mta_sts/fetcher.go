@@ -86,6 +86,10 @@ func FetchPolicy(domain string) *Policy {
 		}
 	}
 	cacheMutex.RUnlock()
+	// A policy is discoverable only through a valid _mta-sts TXT record.
+	if dnsID == "" {
+		return nil
+	}
 
 	// Step 3: Fetch HTTPS policy (cache miss or ID changed)
 	url := fmt.Sprintf("https://mta-sts.%s/.well-known/mta-sts.txt", domain)

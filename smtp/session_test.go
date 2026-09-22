@@ -40,3 +40,26 @@ func TestDataLineBoundedAcrossReaderBuffers(t *testing.T) {
 		t.Fatal("unbounded line accepted")
 	}
 }
+
+func TestESMTPParameterParsing(t *testing.T) {
+	params, err := parseESMTPParameters("FROM:<a@example> SMTPUTF8 BODY=8BITMIME SIZE=123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := params["SMTPUTF8"]; !ok || params["BODY"] != "8BITMIME" || params["SIZE"] != "123" {
+		t.Fatalf("bad params: %#v", params)
+	}
+	if _, err = parseESMTPParameters("FROM:<a@example> SIZE=1 SIZE=2"); err == nil {
+		t.Fatal("duplicate parameter accepted")
+	}
+	for _, value := range []string{"NEVER", "SUCCESS,FAILURE", "FAILURE,DELAY"} {
+		if !validNotify(value) {
+			t.Errorf("rejected %s", value)
+		}
+	}
+	for _, value := range []string{"", "NEVER,FAILURE", "FAILURE,FAILURE", "BOGUS"} {
+		if validNotify(value) {
+			t.Errorf("accepted %s", value)
+		}
+	}
+}

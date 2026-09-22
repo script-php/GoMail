@@ -54,6 +54,7 @@ type Session struct {
 	readTimeout     time.Duration
 	writeTimeout    time.Duration
 	smtputf8Enabled bool      // true if client advertised SMTPUTF8 support
+	bodyMode        string    // MAIL FROM BODY= value
 	db              *store.DB // database reference for greylisting checks and domain lookups
 }
 
@@ -169,7 +170,6 @@ func (s *Session) handleEHLO(arg string) {
 		fmt.Sprintf("%s greets %s", s.hostname, arg),
 		fmt.Sprintf("SIZE %d", s.maxSize),
 		"8BITMIME",
-		"ENHANCEDSTATUSCODES",
 		"PIPELINING",
 		"DSN",
 		"SMTPUTF8",
@@ -288,6 +288,8 @@ func (s *Session) handleSTARTTLS() {
 	s.writer = bufio.NewWriter(tlsConn)
 	s.tls = true
 	s.reset()
+	s.ehlo = ""
+	s.state = StateGreeting // RFC 3207 requires a fresh EHLO/HELO after TLS.
 
 	log.Printf("[smtp] TLS established with %s (version: %x)", s.clientAddr, tlsConn.ConnectionState().Version)
 }
@@ -298,15 +300,63 @@ func (s *Session) handleMAIL(arg string) {
 		return
 	}
 
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(arg)), "FROM:<") {
+		s.send(501, "Syntax error in MAIL FROM")
+		return
+	}
 	from := extractAddress(arg, "FROM:")
 	if from == "" && !strings.Contains(strings.ToUpper(arg), "FROM:<>") {
 		s.send(501, "Syntax error in MAIL FROM")
 		return
 	}
 
-	// Check for UTF8 parameter (RFC 6531)
-	if strings.Contains(strings.ToUpper(arg), "UTF8") {
-		s.smtputf8Enabled = true
+	params, err := parseESMTPParameters(arg)
+	if err != nil {
+		s.send(501, err.Error())
+		return
+	}
+	for key, value := range params {
+		switch key {
+		case "SMTPUTF8":
+			if value != "" {
+				s.send(501, "SMTPUTF8 does not take a value")
+				return
+			}
+			s.smtputf8Enabled = true
+		case "BODY":
+			if value != "7BIT" && value != "8BITMIME" {
+				s.send(501, "Invalid BODY parameter")
+				return
+			}
+			s.bodyMode = value
+		case "SIZE":
+			n, e := strconv.ParseInt(value, 10, 64)
+			if e != nil || n < 0 {
+				s.send(501, "Invalid SIZE parameter")
+				return
+			}
+			if n > s.maxSize {
+				s.send(552, "Message exceeds maximum size")
+				return
+			}
+		case "RET":
+			if value != "FULL" && value != "HDRS" {
+				s.send(501, "Invalid RET parameter")
+				return
+			}
+		case "ENVID":
+			if value == "" {
+				s.send(501, "Invalid ENVID parameter")
+				return
+			}
+		default:
+			s.send(555, "Unsupported MAIL FROM parameter")
+			return
+		}
+	}
+	if hasNonASCII(from) && !s.smtputf8Enabled {
+		s.send(553, "SMTPUTF8 is required for internationalized address")
+		return
 	}
 
 	// Parse DSN parameters (RET, ENVID)
@@ -323,10 +373,40 @@ func (s *Session) handleRCPT(arg string) {
 		return
 	}
 
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(arg)), "TO:<") {
+		s.send(501, "Syntax error in RCPT TO")
+		return
+	}
 	to := extractAddress(arg, "TO:")
 	if to == "" {
 		s.send(501, "Syntax error in RCPT TO")
 		return
+	}
+	if hasNonASCII(to) && !s.smtputf8Enabled {
+		s.send(553, "SMTPUTF8 is required for internationalized address")
+		return
+	}
+	params, err := parseESMTPParameters(arg)
+	if err != nil {
+		s.send(501, err.Error())
+		return
+	}
+	for key, value := range params {
+		switch key {
+		case "NOTIFY":
+			if !validNotify(value) {
+				s.send(501, "Invalid NOTIFY parameter")
+				return
+			}
+		case "ORCPT":
+			if value == "" || !strings.Contains(value, ";") {
+				s.send(501, "Invalid ORCPT parameter")
+				return
+			}
+		default:
+			s.send(555, "Unsupported RCPT TO parameter")
+			return
+		}
 	}
 
 	// Check if recipient is for one of our domains
@@ -538,6 +618,73 @@ func (s *Session) reset() {
 	s.dsnRET = ""
 	s.dsnEnvID = ""
 	s.data.Reset()
+	s.smtputf8Enabled = false
+	s.bodyMode = ""
+}
+
+func parseESMTPParameters(arg string) (map[string]string, error) {
+	end := strings.IndexByte(arg, '>')
+	if end < 0 {
+		return nil, fmt.Errorf("path must end with >")
+	}
+	fields := strings.Fields(arg[end+1:])
+	out := make(map[string]string, len(fields))
+	for _, field := range fields {
+		parts := strings.SplitN(field, "=", 2)
+		key := strings.ToUpper(parts[0])
+		value := ""
+		if len(parts) == 2 {
+			value = strings.ToUpper(parts[1])
+		}
+		if key == "" {
+			return nil, fmt.Errorf("empty ESMTP parameter")
+		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("duplicate ESMTP parameter %s", key)
+		}
+		out[key] = value
+	}
+	return out, nil
+}
+
+func validNotify(value string) bool {
+	if value == "NEVER" {
+		return true
+	}
+	if value == "" {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, v := range strings.Split(value, ",") {
+		if v != "SUCCESS" && v != "FAILURE" && v != "DELAY" {
+			return false
+		}
+		if seen[v] {
+			return false
+		}
+		seen[v] = true
+	}
+	return true
+}
+
+func (s *Session) validateMessageEncoding() error {
+	raw := s.data.Bytes()
+	boundary := bytes.Index(raw, []byte("\r\n\r\n"))
+	separator := 4
+	if boundary < 0 {
+		boundary = bytes.Index(raw, []byte("\n\n"))
+		separator = 2
+	}
+	if boundary < 0 {
+		return fmt.Errorf("malformed message: missing header/body boundary")
+	}
+	if has8Bit(raw[:boundary]) && !s.smtputf8Enabled {
+		return fmt.Errorf("SMTPUTF8 is required for UTF-8 message headers")
+	}
+	if has8Bit(raw[boundary+separator:]) && s.bodyMode != "8BITMIME" {
+		return fmt.Errorf("BODY=8BITMIME is required for 8-bit content")
+	}
+	return nil
 }
 
 func (s *Session) send(code int, message string) {

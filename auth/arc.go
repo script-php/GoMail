@@ -96,7 +96,7 @@ func ARCMessageSignature(input *ARCMessageSignatureInput) (string, error) {
 
 	// Sign the data
 	hash := sha256.Sum256(dataToSign.Bytes())
-	signature, err := input.PrivateKey.Sign(rand.Reader, hash[:], crypto.SHA256)
+	signature, err := signARCHeaderHash(input.PrivateKey, hash[:])
 	if err != nil {
 		return "", fmt.Errorf("signing failed: %w", err)
 	}
@@ -178,7 +178,7 @@ func ARCSeal(input *ARCSealInput) (string, error) {
 
 	// Sign the data
 	hash := sha256.Sum256(dataToSign.Bytes())
-	signature, err := input.PrivateKey.Sign(rand.Reader, hash[:], crypto.SHA256)
+	signature, err := signARCHeaderHash(input.PrivateKey, hash[:])
 	if err != nil {
 		return "", fmt.Errorf("seal signing failed: %w", err)
 	}
@@ -198,6 +198,17 @@ func BodyHash(body string) string {
 	// Call the relaxed body hash function
 	hash := bodyHashFunc(false, bodyBytes) // false = not simple, so use relaxed
 	return base64.StdEncoding.EncodeToString(hash)
+}
+
+func signARCHeaderHash(key crypto.Signer, digest []byte) ([]byte, error) {
+	switch k := key.(type) {
+	case ed25519.PrivateKey:
+		return ed25519.Sign(k, digest), nil
+	case *rsa.PrivateKey:
+		return rsa.SignPKCS1v15(rand.Reader, k, crypto.SHA256, digest)
+	default:
+		return nil, fmt.Errorf("unsupported ARC key type %T", key)
+	}
 }
 
 // ARCChainSigner generates all three ARC headers in the correct order

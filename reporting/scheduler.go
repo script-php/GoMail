@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/mail"
+	"strconv"
+	"strings"
 	"time"
 
 	"gomail/config"
@@ -150,7 +153,7 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 
 	// Generate XML report
 	// Use our organization's domain as sender
-	policy := PolicyPublished{Domain: domain.Domain, P: "none"}
+	policy := PolicyPublished{Domain: domain.Domain, P: dmarcRecord.P, SP: dmarcRecord.SP, ADKIM: dmarcRecord.ADKIM, ASPF: dmarcRecord.ASPF, Pct: dmarcRecord.Pct}
 	reportXML, err := GenerateDMARCAggregateReport(
 		domain.Domain,
 		fmt.Sprintf("postmaster@%s", cfg.Server.Domain),
@@ -168,6 +171,10 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	// Send to rua= addresses (aggregate reports)
 	sentCount := 0
 	for _, reportAddr := range dmarcRecord.ReportMailto {
+		if !authorizedDMARCReportDestination(domain.Domain, reportAddr) {
+			logging.Warn(fmt.Sprintf("[dmarc] external report destination %s is not authorized for %s", reportAddr, domain.Domain))
+			continue
+		}
 		if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Domain, reportAddr, reportXML); err != nil {
 			logging.Error(fmt.Sprintf("[dmarc] %s→%s: error sending report: %v", domain.Domain, reportAddr, err))
 		} else {
@@ -210,6 +217,16 @@ func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 		if len(txt) > 0 && txt[0] == 'v' && txt == "v=DMARC1" || (len(txt) > 8 && txt[:8] == "v=DMARC1") {
 			// Parse rua= and ruf= tags
 			parts := extractDMARCTags(txt)
+			policy.P = parts["p"]
+			policy.SP = parts["sp"]
+			policy.ADKIM = parts["adkim"]
+			policy.ASPF = parts["aspf"]
+			policy.Pct = 100
+			if raw := parts["pct"]; raw != "" {
+				if n, e := strconv.Atoi(raw); e == nil && n >= 0 && n <= 100 {
+					policy.Pct = n
+				}
+			}
 			if ruaVal, ok := parts["rua"]; ok {
 				policy.ReportMailto = parseReportAddresses(ruaVal)
 			}
@@ -225,8 +242,35 @@ func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 
 // DMARCReportPolicy holds report recipient addresses
 type DMARCReportPolicy struct {
-	ReportMailto []string
-	ForensicMail []string
+	ReportMailto       []string
+	ForensicMail       []string
+	P, SP, ADKIM, ASPF string
+	Pct                int
+}
+
+func authorizedDMARCReportDestination(policyDomain, address string) bool {
+	parsed, err := mail.ParseAddress(address)
+	if err != nil {
+		return false
+	}
+	at := strings.LastIndex(parsed.Address, "@")
+	if at < 0 {
+		return false
+	}
+	destination := strings.ToLower(parsed.Address[at+1:])
+	if strings.EqualFold(destination, policyDomain) {
+		return true
+	}
+	records, err := net.LookupTXT(policyDomain + "._report._dmarc." + destination)
+	if err != nil {
+		return false
+	}
+	for _, record := range records {
+		if strings.HasPrefix(strings.TrimSpace(record), "v=DMARC1") {
+			return true
+		}
+	}
+	return false
 }
 
 // extractDMARCTags parses DMARC record tags from a TXT record value

@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -111,7 +112,9 @@ func GenerateDKIMKeyPair(algorithm string) (string, string, string, error) {
 			return "", "", "", fmt.Errorf("marshaling public key: %w", err)
 		}
 		pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}))
-		pubB64 := base64.StdEncoding.EncodeToString(pubBytes)
+		// RFC 8463 publishes the 32-byte Ed25519 public key directly, not
+		// SubjectPublicKeyInfo DER. Keep SPKI only for the downloadable PEM.
+		pubB64 := base64.StdEncoding.EncodeToString(pub)
 		dnsRecord := fmt.Sprintf("v=DKIM1; k=ed25519; p=%s", pubB64)
 		return privPEM, pubPEM, dnsRecord, nil
 
@@ -231,14 +234,48 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 	return result.Bytes(), nil
 }
 
-// VerifyDKIM performs basic DKIM verification on an inbound message.
-// VerifyDKIM verifies a DKIM signature on an email message.
-// Returns: (status, detail) where status is "pass", "fail", or "none"
+// VerifyDKIM evaluates every signature and succeeds when any acceptable
+// signature verifies. A transient DNS error is retained if none pass.
 func VerifyDKIM(message []byte) (string, string) {
+	status, detail, _, _ := VerifyDKIMDetailed(message)
+	return status, detail
+}
+
+func VerifyDKIMDetailed(message []byte) (status, detail, domain, selector string) {
+	hdrs, _, err := parseMessageHeaders(message)
+	if err != nil {
+		return "permerror", "malformed headers", "", ""
+	}
+	var signatures []*headerRaw
+	for _, h := range hdrs {
+		if strings.EqualFold(h.key, "dkim-signature") {
+			signatures = append(signatures, h)
+		}
+	}
+	if len(signatures) == 0 {
+		return "none", "no DKIM-Signature header", "", ""
+	}
+	bestStatus, bestDetail := "fail", "all DKIM signatures failed"
+	for i, sig := range signatures {
+		tags := parseDKIMTags(sig.value)
+		currentStatus, currentDetail := verifyDKIMAt(message, i)
+		if currentStatus == "pass" {
+			return currentStatus, currentDetail, tags["d"], tags["s"]
+		}
+		if currentStatus == "temperror" {
+			bestStatus, bestDetail = currentStatus, currentDetail
+		} else if currentStatus == "permerror" && bestStatus == "fail" {
+			bestStatus, bestDetail = currentStatus, currentDetail
+		}
+	}
+	return bestStatus, bestDetail, "", ""
+}
+
+func verifyDKIMAt(message []byte, targetSignature int) (string, string) {
 	// Parse the message into headers and body using proper line-ending preservation
 	hdrs, bodyOffset, err := parseMessageHeaders(message)
 	if err != nil {
-		return "none", "malformed headers"
+		return "permerror", "malformed headers"
 	}
 
 	// Debug: dump raw header section to see if Content-Type boundary is present
@@ -321,10 +358,14 @@ func VerifyDKIM(message []byte) (string, string) {
 
 	// Find DKIM-Signature header
 	var dkimSig *headerRaw
+	signatureIndex := 0
 	for _, h := range hdrs {
 		if strings.EqualFold(h.key, "dkim-signature") {
-			dkimSig = h
-			break
+			if signatureIndex == targetSignature {
+				dkimSig = h
+				break
+			}
+			signatureIndex++
 		}
 	}
 
@@ -343,8 +384,26 @@ func VerifyDKIM(message []byte) (string, string) {
 	sigB64 := tags["b"]
 	canonMethod := tags["c"]
 
-	if domain == "" || selector == "" || sigB64 == "" {
-		return "fail", "missing required DKIM tags"
+	if domain == "" || selector == "" || algo == "" || headersToVerify == "" || bodyHashB64 == "" || sigB64 == "" {
+		return "permerror", "missing required DKIM tags"
+	}
+	fromSigned := false
+	for _, name := range strings.Split(headersToVerify, ":") {
+		if strings.EqualFold(strings.TrimSpace(name), "from") {
+			fromSigned = true
+		}
+	}
+	if !fromSigned {
+		return "permerror", "From header is not signed"
+	}
+	if x := tags["x"]; x != "" {
+		expiry, parseErr := strconv.ParseInt(x, 10, 64)
+		if parseErr != nil {
+			return "permerror", "invalid signature expiration"
+		}
+		if time.Now().Unix() > expiry {
+			return "fail", "DKIM signature expired"
+		}
 	}
 
 	// Parse canonicalization (default: simple/simple)
@@ -352,10 +411,19 @@ func VerifyDKIM(message []byte) (string, string) {
 	bodySimple := true
 	if canonMethod != "" {
 		parts := strings.Split(canonMethod, "/")
+		if len(parts) > 2 {
+			return "permerror", "invalid canonicalization"
+		}
 		if len(parts) >= 1 {
+			if parts[0] != "simple" && parts[0] != "relaxed" {
+				return "permerror", "invalid header canonicalization"
+			}
 			headerSimple = strings.EqualFold(strings.TrimSpace(parts[0]), "simple")
 		}
 		if len(parts) >= 2 {
+			if parts[1] != "simple" && parts[1] != "relaxed" {
+				return "permerror", "invalid body canonicalization"
+			}
 			bodySimple = strings.EqualFold(strings.TrimSpace(parts[1]), "simple")
 		}
 	}
@@ -370,10 +438,13 @@ func VerifyDKIM(message []byte) (string, string) {
 
 	// Get public key from DNS
 	pubKeyRecord := fmt.Sprintf("%s._domainkey.%s", selector, domain)
-	txtRecords, err := net.LookupTXT(pubKeyRecord)
+	txtRecords, err := lookupTXT(pubKeyRecord)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[auth] DKIM DNS lookup failed for %s: %v", pubKeyRecord, err))
-		return "fail", fmt.Sprintf("DNS lookup failed: %v", err)
+		if dnsErr, ok := err.(*net.DNSError); ok && (dnsErr.IsTimeout || dnsErr.IsTemporary) {
+			return "temperror", fmt.Sprintf("temporary DNS lookup failure: %v", err)
+		}
+		return "fail", fmt.Sprintf("DKIM key lookup failed: %v", err)
 	}
 
 	if len(txtRecords) == 0 {
@@ -382,11 +453,16 @@ func VerifyDKIM(message []byte) (string, string) {
 	}
 
 	var pubKeyB64 string
+	keyRecords := 0
 	for _, txt := range txtRecords {
 		dkimTags := parseDKIMTags(txt)
-		if pubKeyB64 = dkimTags["p"]; pubKeyB64 != "" {
-			break
+		if candidate := dkimTags["p"]; candidate != "" {
+			pubKeyB64 = candidate
+			keyRecords++
 		}
+	}
+	if keyRecords > 1 {
+		return "permerror", "multiple DKIM key records found"
 	}
 
 	if pubKeyB64 == "" {
@@ -450,7 +526,7 @@ func VerifyDKIM(message []byte) (string, string) {
 
 	// Determine algorithm and verify
 	switch {
-	case strings.Contains(algo, "ed25519"):
+	case algo == "ed25519-sha256":
 		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
 		if err == nil {
 			if edPub, ok := key.(ed25519.PublicKey); ok {
@@ -465,7 +541,7 @@ func VerifyDKIM(message []byte) (string, string) {
 		}
 		return "fail", "DKIM signature invalid"
 
-	case strings.Contains(algo, "rsa"):
+	case algo == "rsa-sha256":
 		key, err := x509.ParsePKIXPublicKey(pubKeyBytes)
 		if err != nil {
 			return "fail", "cannot parse RSA public key"
@@ -501,6 +577,22 @@ func GetDKIMDomain(message []byte) string {
 	}
 
 	return ""
+}
+
+// GetDKIMIdentity returns the d= and s= values from the first signature.
+// Callers should only use this identity together with that signature's result.
+func GetDKIMIdentity(message []byte) (domain, selector string) {
+	hdrs, _, err := parseMessageHeaders(message)
+	if err != nil {
+		return "", ""
+	}
+	for _, h := range hdrs {
+		if strings.EqualFold(h.key, "dkim-signature") {
+			tags := parseDKIMTags(h.value)
+			return tags["d"], tags["s"]
+		}
+	}
+	return "", ""
 }
 
 // GenerateDKIMKeys generates a new Ed25519 key pair for DKIM signing and writes to files.

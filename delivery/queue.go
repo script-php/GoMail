@@ -28,45 +28,54 @@ func NewQueue(db *store.DB, cfg *config.Config) *Queue {
 }
 
 // getDKIMSigner returns a DKIM signer for the sender's domain (from DB).
-func (q *Queue) getDKIMSigner(from string) *auth.DKIMSigner {
+func (q *Queue) getDKIMSigner(from string) (*auth.DKIMSigner, error) {
 	domain := extractDomain(from)
 	if domain == "" {
-		return nil
+		return nil, fmt.Errorf("invalid sender address")
 	}
 
 	d, err := q.db.GetDomainByName(domain)
-	if err != nil || d == nil {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("loading sender domain: %w", err)
+	}
+	if d == nil {
+		return nil, fmt.Errorf("sender domain %s is not managed", domain)
+	}
+	if !d.IsActive {
+		return nil, fmt.Errorf("sender domain %s is inactive", domain)
+	}
+	if d.DKIMSelector == "" || d.DKIMAlgorithm == "" {
+		return nil, fmt.Errorf("DKIM is not configured for %s", domain)
 	}
 	if d.DKIMPrivateKey == "" {
-		return nil
+		return nil, fmt.Errorf("DKIM private key is missing for %s", domain)
 	}
 
 	signer, err := auth.NewDKIMSignerFromPEM(d.Domain, d.DKIMSelector, []byte(d.DKIMPrivateKey), d.DKIMAlgorithm)
 	if err != nil {
 		logging.Info(fmt.Sprintf("[delivery] DKIM signer init failed for %s: %v", domain, err))
-		return nil
+		return nil, err
 	}
-	return signer
+	return signer, nil
 }
 
 // Enqueue adds a new outbound message to the delivery queue.
 // It DKIM-signs the message (per-domain), stores it, and creates queue entries.
 func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID int64) error {
 	// Per-domain DKIM signing
-	signer := q.getDKIMSigner(from)
+	signer, signerErr := q.getDKIMSigner(from)
+	if signerErr != nil {
+		return fmt.Errorf("refusing unsigned delivery: %w", signerErr)
+	}
 	var signedMessage []byte
 	if signer != nil {
 		var err error
 		signedMessage, err = signer.Sign(rawMessage)
 		if err != nil {
-			logging.Info(fmt.Sprintf("[delivery] DKIM signing failed: %v (sending unsigned)", err))
-			signedMessage = rawMessage
+			return fmt.Errorf("refusing unsigned delivery after DKIM signing failure: %w", err)
 		} else {
 			logging.Info(fmt.Sprintf("[delivery] DKIM signed with selector=%s domain=%s", signer.Selector, signer.Domain))
 		}
-	} else {
-		signedMessage = rawMessage
 	}
 
 	// Store the outbound message in the messages table

@@ -125,8 +125,9 @@ func (w *Worker) processQueue() {
 	// Deliver outside the lock
 	var deliveryErr error
 
-	// Prepare message with ARC headers
-	messageWithARC := w.addARCHeaders(entry.RawMessage, entry.MailFrom, parseRecipientDomain(entry.RcptTo))
+	// Locally originated mail is DKIM-signed at enqueue time. ARC is only for
+	// intermediaries preserving authentication across a forward/relay hop.
+	messageForDelivery := entry.RawMessage
 
 	// Use VERP bounce address in MAIL FROM if available, otherwise use original sender
 	mailFromAddr := entry.MailFrom
@@ -136,7 +137,7 @@ func (w *Worker) processQueue() {
 	}
 
 	if w.isLocalRecipient(entry.RcptTo) {
-		deliveryErr = w.deliverLocal(entry, messageWithARC)
+		deliveryErr = w.deliverLocal(entry, messageForDelivery)
 	} else {
 		// Get domain's requireTLS setting for outbound delivery
 		domain := parseRecipientDomain(entry.RcptTo)
@@ -148,7 +149,7 @@ func (w *Worker) processQueue() {
 		deliveryErr = smtp.SendMail(
 			mailFromAddr,
 			entry.RcptTo,
-			messageWithARC,
+			messageForDelivery,
 			w.cfg.Server.Hostname,
 			w.tlsCfg,
 			requireTLS,

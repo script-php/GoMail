@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -57,7 +58,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			// Check if this MX host is allowed by the policy
 			hostAllowed := false
 			for _, policyMX := range policy.MXHosts {
-				if strings.EqualFold(mx.Host, policyMX) {
+				if matchSTSMX(mx.Host, policyMX) {
 					hostAllowed = true
 					break
 				}
@@ -144,6 +145,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 	// Check if server supports DSN (Delivery Status Notifications) and SMTPUTF8
 	supportsDSN := strings.Contains(ehloReply, "DSN")
 	supportsUTF8 := strings.Contains(ehloReply, "SMTPUTF8")
+	supports8Bit := strings.Contains(ehloReply, "8BITMIME")
 	daneEnforcement := "disabled"
 	if db != nil && senderDomain != "" {
 		if domainObj, lookupErr := db.GetDomainByName(senderDomain); lookupErr == nil && domainObj != nil && domainObj.DANEEnforcement != "" {
@@ -280,6 +282,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 						postTLSEhlo, _ := readReply(conn)
 						supportsDSN = strings.Contains(postTLSEhlo, "DSN")
 						supportsUTF8 = strings.Contains(postTLSEhlo, "SMTPUTF8")
+						supports8Bit = strings.Contains(postTLSEhlo, "8BITMIME")
 					}
 				}
 			}
@@ -302,9 +305,19 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 	// Even if not advertised, try anyway - some servers support it without advertising
 	mailFromCmd := fmt.Sprintf("MAIL FROM:<%s>", from)
 
-	// Add SMTPUTF8 parameter if sender has non-ASCII characters and server supports it
-	if hasNonASCII(from) && supportsUTF8 {
+	needsUTF8 := requiresSMTPUTF8(from, to, msg)
+	if needsUTF8 && !supportsUTF8 {
+		return fmt.Errorf("SMTPUTF8 required but not advertised by %s", host)
+	}
+	if needsUTF8 {
 		mailFromCmd += " SMTPUTF8"
+	}
+	needs8Bit := has8Bit(msg)
+	if needs8Bit && !supports8Bit {
+		return fmt.Errorf("8BITMIME required but not advertised by %s", host)
+	}
+	if needs8Bit {
+		mailFromCmd += " BODY=8BITMIME"
 	}
 
 	if supportsDSN {
@@ -328,14 +341,8 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("MAIL FROM rejected by %s: %s", host, mailReply)
 	}
 
-	// RCPT TO with DSN and SMTPUTF8 parameters (RFC 3461, RFC 6531)
-	// Format: RCPT TO:<addr> [SMTPUTF8] [NOTIFY=SUCCESS|FAILURE|DELAY|NEVER] [ORCPT=rfc822;<addr>]
+	// SMTPUTF8 is a MAIL FROM parameter, not an RCPT TO parameter.
 	rcptToCmd := fmt.Sprintf("RCPT TO:<%s>", to)
-
-	// Add SMTPUTF8 parameter if any recipient has non-ASCII characters and server supports it
-	if hasNonASCII(to) && supportsUTF8 {
-		rcptToCmd += " SMTPUTF8"
-	}
 
 	if supportsDSN && dsnNotify != "" {
 		rcptToCmd += fmt.Sprintf(" NOTIFY=%s", dsnNotify)
@@ -364,13 +371,9 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 		return fmt.Errorf("DATA rejected by %s: %s", host, dataReply)
 	}
 
-	// Send message body
-	if _, err := conn.Write(msg); err != nil {
+	// Send message with RFC 5321 dot transparency and exactly one terminator.
+	if err := writeSMTPData(conn, msg); err != nil {
 		return fmt.Errorf("writing message to %s: %w", host, err)
-	}
-	// End with CRLF.CRLF
-	if _, err := conn.Write([]byte("\r\n.\r\n")); err != nil {
-		return fmt.Errorf("writing end-of-data to %s: %w", host, err)
 	}
 
 	finalReply, err := readReply(conn)
@@ -431,4 +434,66 @@ func hasNonASCII(addr string) bool {
 		}
 	}
 	return false
+}
+
+func matchSTSMX(host, pattern string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	pattern = strings.ToLower(strings.TrimSuffix(pattern, "."))
+	if !strings.HasPrefix(pattern, "*.") {
+		return host == pattern
+	}
+	suffix := pattern[1:]
+	prefix := strings.TrimSuffix(host, suffix)
+	return strings.HasSuffix(host, suffix) && prefix != "" && !strings.Contains(prefix, ".")
+}
+
+func has8Bit(data []byte) bool {
+	for _, b := range data {
+		if b >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+func requiresSMTPUTF8(from, to string, msg []byte) bool {
+	if hasNonASCII(from) || hasNonASCII(to) {
+		return true
+	}
+	end := bytes.Index(msg, []byte("\r\n\r\n"))
+	if end < 0 {
+		end = bytes.Index(msg, []byte("\n\n"))
+	}
+	if end < 0 {
+		end = len(msg)
+	}
+	return has8Bit(msg[:end])
+}
+
+func writeSMTPData(w io.Writer, msg []byte) error {
+	data := bytes.ReplaceAll(msg, []byte("\r\n"), []byte("\n"))
+	data = bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
+	lines := bytes.Split(data, []byte("\n"))
+	for i, line := range lines {
+		if len(line) > 0 && line[0] == '.' {
+			if _, err := w.Write([]byte{'.'}); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(line); err != nil {
+			return err
+		}
+		if i < len(lines)-1 {
+			if _, err := w.Write([]byte("\r\n")); err != nil {
+				return err
+			}
+		}
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		if _, err := w.Write([]byte("\r\n")); err != nil {
+			return err
+		}
+	}
+	_, err := w.Write([]byte(".\r\n"))
+	return err
 }
