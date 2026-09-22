@@ -1,5 +1,14 @@
 # DANE (DNSSEC-based Authentication of Named Entities) Implementation
 
+> Security audit update (2026-09-22): TLSA data is now accepted only when a
+> validating resolver sets the DNSSEC AD bit. The default resolvers are reached
+> over authenticated DNS-over-TLS, preventing forged AD responses. Authenticated
+> NODATA, insecure DNS, malformed records, and resolver failures remain distinct.
+> All RFC 6698 usages are enforced: 0/1 additionally require PKIX validation,
+> 2 requires a cryptographically linked CA certificate, and 3 matches only the
+> leaf. Selectors 0/1 and matching types 0/1/2 are covered by unit tests. DANE-TA
+> and DANE-EE can authenticate peers that are not trusted by the Web PKI.
+
 ## Overview
 
 DANE (RFC 6698) provides a secure mechanism for verifying SMTP server certificates using DNSSEC and TLSA DNS records. This document describes GoMail's DANE implementation for outbound SMTP delivery.
@@ -179,13 +188,12 @@ go test -v ./dns -run TestTLSALookup
 
 ## Security Considerations
 
-### DNSSEC Chain
+### DNSSEC trust boundary
 
-The current implementation does **not** validate DNSSEC chains. Recommendations:
-
-1. **Use DNSSEC validator** in deployment: `dnssec-tools` or similar
-2. **Monitor DNS queries** for DNSSEC validation at firewall level
-3. **Trust network DNS resolver** that validates DNSSEC
+GoMail relies on the recursive resolver to validate the DNSSEC chain and requires
+its authenticated-data result. The built-in public resolvers use DNS-over-TLS
+with certificate verification. A custom plain DNS endpoint is safe only on a
+trusted host/network; for a remote resolver configure `host:853#tls-server-name`.
 
 ### Certificate Pinning
 
@@ -198,21 +206,13 @@ DANE is effectively certificate pinning via DNS. Benefits:
 
 ### Fallback Risks
 
-In "optional" mode, DANE provides no security if:
-
-- Attacker can intercept TLS handshake
-- Attacker registers certificate with legitimate CA
-- Network can block TLSA DNS queries
+In "optional" mode, DANE failures deliberately fall back to ordinary PKIX. A
+network that blocks the authenticated TLSA lookup can therefore remove DANE's
+additional protection, but cannot bypass Web PKI validation.
 
 **Mitigation**: Use "required" mode when DANE is critical or monitor logs for failures.
 
 ## Future Enhancements
-
-### Phase 2: DNSSEC Validation
-
-- Integrate `github.com/miekg/dns` for actual TLSA lookups
-- Validate DNSSEC chains with `github.com/miekg/dns`
-- Add DNSSEC status to TLS-RPT reports
 
 ### Phase 3: Per-Domain Configuration
 

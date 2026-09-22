@@ -1,149 +1,177 @@
 package dns
 
 import (
+	"crypto/tls"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/miekg/dns"
+	mdns "github.com/miekg/dns"
 )
 
-// dnsServers are the DNS servers used for TLSA lookups
-// Default: Google Public DNS and Cloudflare
-var dnsServers = []string{"8.8.8.8:53", "1.1.1.1:53"}
+var (
+	dnsServers   = []string{"1.1.1.1:853#cloudflare-dns.com", "8.8.8.8:853#dns.google"}
+	dnsServersMu sync.RWMutex
+)
 
-// SetDNSServers allows customizing the DNS resolvers used for TLSA lookups
 func SetDNSServers(servers []string) {
-	if len(servers) > 0 {
-		dnsServers = servers
+	if len(servers) == 0 {
+		return
 	}
+	dnsServersMu.Lock()
+	dnsServers = append([]string(nil), servers...)
+	dnsServersMu.Unlock()
 }
 
-// TLSARecord represents a TLSA record for DANE (DNSSEC-based Authentication of Named Entities).
 type TLSARecord struct {
-	Usage        uint8  // 0=PKIX-TA, 1=PKIX-EE, 2=DANE-TA, 3=DANE-EE
-	Selector     uint8  // 0=Full cert, 1=Public key
-	MatchingType uint8  // 0=Exact, 1=SHA-256, 2=SHA-512
-	CertData     string // Hex-encoded certificate or public key hash
+	Usage, Selector, MatchingType uint8
+	CertData                      string
 }
 
-// LookupTLSA returns TLSA records for an SMTP server (port 25).
-// Per RFC 6698, the DNS name is _port._proto.host (e.g., _25._tcp.example.com)
-// Uses miekg/dns library for actual DNS queries.
-func LookupTLSA(host string) ([]TLSARecord, error) {
-	host = strings.TrimSuffix(host, ".")
+// TLSAResult preserves the security distinction between authenticated absence,
+// insecure data and a lookup failure. DANE callers may only use authenticated data.
+type TLSAResult struct {
+	Records       []TLSARecord
+	Authenticated bool
+	Name          string
+	TTL           time.Duration
+}
 
-	// Check cache first
-	cacheKey := "tlsa:" + host
+var (
+	ErrDNSSECInsecure = errors.New("TLSA response is not DNSSEC authenticated")
+	ErrNoTLSA         = errors.New("authenticated denial of TLSA records")
+)
+
+func LookupTLSA(host string) (TLSAResult, error) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" {
+		return TLSAResult{}, fmt.Errorf("empty TLSA host")
+	}
+	name := fmt.Sprintf("_25._tcp.%s.", host)
+	cacheKey := "tlsa:v2:" + host
 	if cached, ok := globalCache.Get(cacheKey); ok {
-		records := cached.([]TLSARecord)
-		log.Printf("[dns] TLSA cache hit for %s: %d records", host, len(records))
-		return records, nil
+		return cached.(TLSAResult), nil
 	}
-
-	// Query TLSA records: _25._tcp.host (RFC 6698)
-	tlsaName := fmt.Sprintf("_25._tcp.%s.", host)
-	log.Printf("[dns] querying TLSA records for %s", tlsaName)
-
-	// Try each DNS server
-	var lastErr error
-	for _, server := range dnsServers {
-		records, err := queryTLSARecords(tlsaName, server)
-		if err == nil {
-			// Cache successful result (5 minutes TTL)
-			globalCache.SetWithTTL(cacheKey, records, 5*time.Minute)
-			log.Printf("[dns] TLSA lookup for %s: found %d records", host, len(records))
-			return records, nil
+	dnsServersMu.RLock()
+	servers := append([]string(nil), dnsServers...)
+	dnsServersMu.RUnlock()
+	var errs []error
+	for _, server := range servers {
+		result, err := queryTLSARecords(name, server)
+		if err == nil || errors.Is(err, ErrNoTLSA) {
+			globalCache.SetWithTTL(cacheKey, result, result.TTL)
+			return result, nil
 		}
-		lastErr = err
-		log.Printf("[dns] TLSA query failed on %s: %v", server, err)
+		errs = append(errs, fmt.Errorf("%s: %w", server, err))
 	}
-
-	// No TLSA records found
-	log.Printf("[dns] no TLSA records found for %s (fallback to standard TLS): %v", host, lastErr)
-	globalCache.SetWithTTL(cacheKey, []TLSARecord{}, 1*time.Minute) // Cache miss for 1 min
-	return []TLSARecord{}, nil
+	return TLSAResult{Name: name}, errors.Join(errs...)
 }
 
-// queryTLSARecords performs actual DNS query for TLSA records using miekg/dns
-func queryTLSARecords(tlsaName string, server string) ([]TLSARecord, error) {
-	// Create DNS client with timeout
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: 5 * time.Second,
+func queryTLSARecords(name, server string) (TLSAResult, error) {
+	endpoint, tlsName, _ := strings.Cut(server, "#")
+	msg := new(mdns.Msg)
+	msg.SetQuestion(name, mdns.TypeTLSA)
+	msg.SetEdns0(1232, true)
+	client := &mdns.Client{Net: "udp", Timeout: 5 * time.Second}
+	if tlsName != "" {
+		client.Net = "tcp-tls"
+		client.TLSConfig = &tls.Config{ServerName: tlsName, MinVersion: tls.VersionTLS12}
 	}
-
-	// Build DNS query
-	msg := &dns.Msg{}
-	msg.SetQuestion(tlsaName, dns.TypeTLSA)
-	msg.RecursionDesired = true
-
-	// Query DNS server
-	resp, _, err := client.Exchange(msg, server)
+	resp, _, err := client.Exchange(msg, endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("DNS query failed: %w", err)
+		return TLSAResult{Name: name}, fmt.Errorf("DNS query: %w", err)
 	}
-
-	// Check response code
-	if resp.Rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS response code: %s", dns.RcodeToString[resp.Rcode])
-	}
-
-	// Parse TLSA records from answer section
-	var records []TLSARecord
-	for _, ans := range resp.Answer {
-		if tlsaRR, ok := ans.(*dns.TLSA); ok {
-			record := TLSARecord{
-				Usage:        tlsaRR.Usage,
-				Selector:     tlsaRR.Selector,
-				MatchingType: tlsaRR.MatchingType,
-				CertData:     tlsaRR.Certificate, // Already hex-encoded string from miekg/dns
-			}
-			records = append(records, record)
-			log.Printf("[dns] parsed TLSA: usage=%d selector=%d matchingType=%d certDataLen=%d",
-				record.Usage, record.Selector, record.MatchingType, len(record.CertData))
+	if resp.Truncated && client.Net == "udp" {
+		client.Net = "tcp"
+		resp, _, err = client.Exchange(msg, endpoint)
+		if err != nil {
+			return TLSAResult{Name: name}, fmt.Errorf("DNS TCP retry: %w", err)
 		}
 	}
-
-	if len(records) == 0 {
-		return nil, fmt.Errorf("no TLSA records in response")
+	result := TLSAResult{Name: name, Authenticated: resp.AuthenticatedData, TTL: time.Minute}
+	if !resp.AuthenticatedData {
+		return result, ErrDNSSECInsecure
 	}
-
-	return records, nil
+	if resp.Rcode == mdns.RcodeNameError {
+		return result, ErrNoTLSA
+	}
+	if resp.Rcode != mdns.RcodeSuccess {
+		return result, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+	}
+	minTTL := uint32(300)
+	for _, answer := range resp.Answer {
+		rr, ok := answer.(*mdns.TLSA)
+		if !ok {
+			continue
+		}
+		record, parseErr := validateTLSA(TLSARecord{rr.Usage, rr.Selector, rr.MatchingType, rr.Certificate})
+		if parseErr != nil {
+			log.Printf("[dns] ignoring malformed TLSA record for %s: %v", name, parseErr)
+			continue
+		}
+		if rr.Hdr.Ttl < minTTL {
+			minTTL = rr.Hdr.Ttl
+		}
+		result.Records = append(result.Records, record)
+	}
+	result.TTL = time.Duration(minTTL) * time.Second
+	if result.TTL <= 0 || result.TTL > time.Hour {
+		result.TTL = 5 * time.Minute
+	}
+	if len(result.Records) == 0 {
+		return result, ErrNoTLSA
+	}
+	return result, nil
 }
 
-// ParseTLSARecord parses a TLSA record string.
-// Format: Usage Selector MatchingType CertData (space-separated hex digits)
-func ParseTLSARecord(recordData string) (TLSARecord, error) {
-	parts := strings.Fields(recordData)
+func validateTLSA(record TLSARecord) (TLSARecord, error) {
+	if record.Usage > 3 {
+		return TLSARecord{}, fmt.Errorf("unsupported certificate usage %d", record.Usage)
+	}
+	if record.Selector > 1 {
+		return TLSARecord{}, fmt.Errorf("unsupported selector %d", record.Selector)
+	}
+	if record.MatchingType > 2 {
+		return TLSARecord{}, fmt.Errorf("unsupported matching type %d", record.MatchingType)
+	}
+	record.CertData = strings.ToLower(strings.TrimSpace(record.CertData))
+	b, err := hex.DecodeString(record.CertData)
+	if err != nil {
+		return TLSARecord{}, fmt.Errorf("association data is not hex: %w", err)
+	}
+	if len(b) == 0 {
+		return TLSARecord{}, fmt.Errorf("empty association data")
+	}
+	expected := 0
+	if record.MatchingType == 1 {
+		expected = 32
+	}
+	if record.MatchingType == 2 {
+		expected = 64
+	}
+	if expected != 0 && len(b) != expected {
+		return TLSARecord{}, fmt.Errorf("matching type %d requires %d bytes, got %d", record.MatchingType, expected, len(b))
+	}
+	return record, nil
+}
+
+func ParseTLSARecord(data string) (TLSARecord, error) {
+	parts := strings.Fields(data)
 	if len(parts) < 4 {
-		return TLSARecord{}, fmt.Errorf("invalid TLSA record format: %s", recordData)
+		return TLSARecord{}, fmt.Errorf("invalid TLSA record format")
 	}
-
-	usage, err := strconv.ParseUint(parts[0], 10, 8)
-	if err != nil {
-		return TLSARecord{}, fmt.Errorf("invalid TLSA usage: %v", err)
+	values := make([]uint64, 3)
+	for i := range values {
+		v, err := strconv.ParseUint(parts[i], 10, 8)
+		if err != nil {
+			return TLSARecord{}, fmt.Errorf("invalid TLSA field %d: %w", i+1, err)
+		}
+		values[i] = v
 	}
-
-	selector, err := strconv.ParseUint(parts[1], 10, 8)
-	if err != nil {
-		return TLSARecord{}, fmt.Errorf("invalid TLSA selector: %v", err)
-	}
-
-	matchingType, err := strconv.ParseUint(parts[2], 10, 8)
-	if err != nil {
-		return TLSARecord{}, fmt.Errorf("invalid TLSA matching type: %v", err)
-	}
-
-	// Combine remaining parts as cert data (remove spaces)
-	certData := strings.Join(parts[3:], "")
-
-	return TLSARecord{
-		Usage:        uint8(usage),
-		Selector:     uint8(selector),
-		MatchingType: uint8(matchingType),
-		CertData:     certData,
-	}, nil
+	return validateTLSA(TLSARecord{uint8(values[0]), uint8(values[1]), uint8(values[2]), strings.Join(parts[3:], "")})
 }

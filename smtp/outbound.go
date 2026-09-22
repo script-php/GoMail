@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -143,17 +144,56 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 	// Check if server supports DSN (Delivery Status Notifications) and SMTPUTF8
 	supportsDSN := strings.Contains(ehloReply, "DSN")
 	supportsUTF8 := strings.Contains(ehloReply, "SMTPUTF8")
+	daneEnforcement := "disabled"
+	if db != nil && senderDomain != "" {
+		if domainObj, lookupErr := db.GetDomainByName(senderDomain); lookupErr == nil && domainObj != nil && domainObj.DANEEnforcement != "" {
+			daneEnforcement = domainObj.DANEEnforcement
+		}
+	}
+	var daneLookup godns.TLSAResult
+	if daneEnforcement != "disabled" {
+		daneLookup, err = godns.LookupTLSA(host)
+		if err != nil && daneEnforcement == "required" {
+			return fmt.Errorf("DANE DNSSEC lookup required for %s: %w", host, err)
+		}
+		if err == nil && len(daneLookup.Records) == 0 && daneEnforcement == "required" {
+			return fmt.Errorf("DANE required but no authenticated TLSA records exist for %s", host)
+		}
+	}
 
 	// Try STARTTLS if supported
 	if strings.Contains(ehloReply, "STARTTLS") && tlsCfg != nil {
 		if err := sendCmd(conn, "STARTTLS"); err == nil {
 			startTLSReply, err := readReply(conn)
 			if err == nil && strings.HasPrefix(startTLSReply, "220") {
-				clientTLS := tls.Client(conn, &tls.Config{
-					ServerName:         host,
-					InsecureSkipVerify: false,
-					MinVersion:         tls.VersionTLS12,
-				})
+				clientConfig := tlsCfg.Clone()
+				clientConfig.ServerName = host
+				clientConfig.MinVersion = tls.VersionTLS12
+				if daneLookup.Authenticated && len(daneLookup.Records) > 0 {
+					clientConfig.InsecureSkipVerify = true // VerifyConnection below replaces default verification.
+					clientConfig.VerifyConnection = func(state tls.ConnectionState) error {
+						result, verifyErr := tlsconfig.VerifyDANECertificates(host, state.PeerCertificates, daneLookup.Records, clientConfig.RootCAs, time.Now())
+						if verifyErr == nil && result.Matched {
+							return nil
+						}
+						if daneEnforcement == "required" {
+							if verifyErr != nil {
+								return verifyErr
+							}
+							return fmt.Errorf("authenticated TLSA records did not match: %s", result.Details)
+						}
+						if len(state.PeerCertificates) == 0 {
+							return fmt.Errorf("peer supplied no certificate")
+						}
+						pool := x509.NewCertPool()
+						for _, cert := range state.PeerCertificates[1:] {
+							pool.AddCert(cert)
+						}
+						_, pkixErr := state.PeerCertificates[0].Verify(x509.VerifyOptions{DNSName: host, Roots: clientConfig.RootCAs, Intermediates: pool})
+						return pkixErr
+					}
+				}
+				clientTLS := tls.Client(conn, clientConfig)
 				if err := clientTLS.Handshake(); err != nil {
 					// Record TLS failure for TLS-RPT reporting
 					if db != nil && recipientDomain != "" {
@@ -182,15 +222,6 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					conn = clientTLS
 
 					// DANE verification (RFC 6698): Check certificate against TLSA records
-					// Fetch DANE enforcement setting from sender domain config
-					daneEnforcement := "disabled"
-					if db != nil && senderDomain != "" {
-						domainObj, err := db.GetDomainByName(senderDomain)
-						if err == nil && domainObj != nil && domainObj.DANEEnforcement != "" {
-							daneEnforcement = domainObj.DANEEnforcement
-						}
-					}
-
 					// Only query DANE if enforcement is not disabled (avoid unnecessary DNS queries)
 					if daneEnforcement != "disabled" {
 						daneValid, daneDetails, daneErr := tlsconfig.VerifyDANE(host, clientTLS)
@@ -208,7 +239,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 							}
 						} else if daneValid {
 							log.Printf("[dane] DANE verification passed for %s: %s", host, daneDetails)
-						} else if daneDetails == "no TLSA records found (DANE not configured)" {
+						} else if daneDetails == "no authenticated TLSA records" {
 							// No TLSA records found
 							if daneEnforcement == "required" {
 								// Record DANE verification failure for TLS-RPT reporting

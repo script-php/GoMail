@@ -70,7 +70,9 @@
 
     <div class="message-body">
         {{if .Message.HTMLBody}}
-            <div class="html-body">{{safeHTML .Message.HTMLBody}}</div>
+			<iframe class="html-body email-frame" title="Email message content"
+				sandbox="" referrerpolicy="no-referrer"
+				src="/message-content/{{.Message.ID}}"></iframe>
         {{else}}
             <pre class="text-body">{{.Message.TextBody}}</pre>
         {{end}}

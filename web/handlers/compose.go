@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +57,17 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 	// Check for reply
 	replyTo := r.URL.Query().Get("reply")
 	var prefill map[string]string
+	var draftID int64
+	if raw := r.URL.Query().Get("draft"); raw != "" {
+		if _, err := fmt.Sscan(raw, &draftID); err == nil {
+			draft, _ := h.db.GetMessage(draftID, account.ID)
+			if draft != nil && draft.Direction == "draft" {
+				prefill = map[string]string{"to": draft.ToAddr, "cc": draft.CcAddr, "subject": draft.Subject, "body": draft.TextBody, "priority": "3"}
+			} else {
+				draftID = 0
+			}
+		}
+	}
 	if replyTo != "" {
 		prefill = map[string]string{
 			"to":      r.URL.Query().Get("to"),
@@ -71,6 +84,7 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 		"Prefill":   prefill,
 		"Account":   account,
 		"Folders":   folders,
+		"DraftID":   draftID,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -109,6 +123,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	body := r.FormValue("body")
 	priority := r.FormValue("priority")
 	readReceipt := r.FormValue("read_receipt") == "1"
+	draftID, _ := strconv.ParseInt(r.FormValue("draft_id"), 10, 64)
 	if priority == "" {
 		priority = "3" // Default to Normal
 	}
@@ -360,9 +375,40 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to send message", http.StatusInternalServerError)
 		return
 	}
+	if draftID > 0 {
+		_ = h.db.DeleteDraft(account.ID, draftID)
+	}
 
 	log.Printf("[web] message enqueued from=%s to=%v subject=%s attachments=%d", from, recipients, subject, len(attachmentData))
 	http.Redirect(w, r, "/sent", http.StatusSeeOther)
+}
+
+func (h *ComposeHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid form", http.StatusBadRequest)
+		return
+	}
+	id, _ := strconv.ParseInt(r.FormValue("draft_id"), 10, 64)
+	id, err := h.db.SaveDraft(account.ID, id, account.Email, r.FormValue("to"), r.FormValue("cc"), r.FormValue("subject"), r.FormValue("body"))
+	if err != nil {
+		http.Error(w, "Unable to save draft", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "saved_at": time.Now().Format(time.RFC3339)})
 }
 
 // parseRecipients splits a comma/semicolon-separated list of email addresses.

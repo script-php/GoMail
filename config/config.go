@@ -127,6 +127,8 @@ type WebConfig struct {
 	SessionMaxAge   int            `json:"session_max_age"`
 	BootstrapAdmin  BootstrapAdmin `json:"bootstrap_admin"`
 	RateLimitPerMin int            `json:"rate_limit_per_minute"`
+	TrustedProxies  []string       `json:"trusted_proxies"`
+	ExternalHTTPS   bool           `json:"external_https"`
 }
 
 // IsTLSEnabled returns whether TLS is enabled for the web interface (defaults to true).

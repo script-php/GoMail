@@ -268,13 +268,47 @@ Each account automatically has:
 | Inbox | System | Inbound messages (default) |
 | Sent | System | Outbound messages sent from this account |
 | Spam | System | Quarantined emails (failed authentication) |
-| Drafts | System | Unsaved compose drafts (future) |
-| Trash | System | Deleted messages (future) |
+| Drafts | System | Autosaved and explicitly saved compositions |
+| Trash | System | Soft-deleted messages |
 | Custom | User | User-created folders (future) |
 
 The `quarantine_folder` config setting only affects folder name; internally it's always the `spam` type.
 
 ## Environment Variables
+
+### Reverse proxy and TLS termination
+
+Forwarded client-address headers are ignored unless the immediate peer is in
+`web.trusted_proxies`. Values may be individual IP addresses or CIDR networks.
+Set `web.external_https` when the listed proxy terminates HTTPS and the GoMail
+listener itself is HTTP; this enables Secure session cookies and HSTS.
+
+```json
+"web": {
+  "enable_tls": false,
+  "external_https": true,
+  "trusted_proxies": ["127.0.0.1", "10.20.0.0/16"]
+}
+```
+
+Never add an untrusted client network or `0.0.0.0/0`: forwarded headers also
+control the identity used by request and login rate limiting.
+
+## Operations: monitoring and recovery
+
+Monitor process availability, SMTP port 25, HTTPS, outbound queue age/failures,
+disk space for the database and attachments, TLS certificate expiry, and DMARC/
+TLS-RPT processing errors. Alert on sustained SMTP 4xx/5xx changes and repeated
+DNSSEC/TLSA failures.
+
+For SQLite, take a transactionally consistent database backup with the SQLite
+backup command, then copy the attachments directory while message ingestion is
+paused or snapshot both paths atomically. For MySQL, use a consistent database
+dump/snapshot and capture the attachments directory from the same recovery point.
+Encrypt backups, keep at least one off-host copy, and regularly restore into an
+isolated environment. A restore is not verified until account/message counts,
+attachment hashes, queue state, login, inbound SMTP, and a test outbound delivery
+have all been checked.
 
 Environment variables can override config values:
 

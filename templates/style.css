@@ -737,3 +737,9 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
 #mail-action-error { padding: 12px; color: #b3261e; background: #fce8e6; }
 
 .toolbar-btn[data-bulk-action] { width: auto; padding: 0 10px; border-radius: 6px; font-size: 13px; white-space: nowrap; }
+.email-frame {
+    width: 100%;
+    min-height: 32rem;
+    border: 0;
+    background: white;
+}

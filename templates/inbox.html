@@ -30,7 +30,7 @@
 <div class="email-list">
     {{if .Messages}}
     {{range .Messages}}
-    <div class="email-row {{if not .IsRead}}unread{{else}}read{{end}}" data-id="{{.ID}}">
+    <div class="email-row {{if not .IsRead}}unread{{else}}read{{end}}" data-id="{{.ID}}" {{if eq .Direction "draft"}}data-draft="true"{{end}}>
         <div class="email-checkbox">
             <input type="checkbox" aria-label="Select">
         </div>

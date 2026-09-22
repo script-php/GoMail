@@ -2,6 +2,7 @@ package web
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -112,6 +113,64 @@ func extractIP(r *http.Request) string {
 		ip = ip[:idx]
 	}
 	return ip
+}
+
+// TrustedProxyMiddleware accepts forwarding headers only from explicitly
+// configured proxy networks and canonicalizes the original client address.
+func TrustedProxyMiddleware(cidrs []string, next http.Handler) http.Handler {
+	var trusted []*net.IPNet
+	for _, raw := range cidrs {
+		if ip := net.ParseIP(raw); ip != nil {
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+			}
+			trusted = append(trusted, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		if _, network, err := net.ParseCIDR(raw); err == nil {
+			trusted = append(trusted, network)
+		} else {
+			log.Printf("[web] ignoring invalid trusted proxy %q", raw)
+		}
+	}
+	isTrusted := func(ip net.IP) bool {
+		for _, network := range trusted {
+			if network.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		peer := net.ParseIP(strings.TrimSpace(host))
+		if peer == nil || !isTrusted(peer) {
+			r.Header.Del("X-Forwarded-For")
+			r.Header.Del("X-Real-IP")
+			r.Header.Del("X-Forwarded-Proto")
+			next.ServeHTTP(w, r)
+			return
+		}
+		client := peer
+		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := net.ParseIP(strings.TrimSpace(parts[i]))
+			if candidate == nil {
+				continue
+			}
+			client = candidate
+			if !isTrusted(candidate) {
+				break
+			}
+		}
+		r.Header.Set("X-Forwarded-For", client.String())
+		r.Header.Set("X-Real-IP", client.String())
+		next.ServeHTTP(w, r)
+	})
 }
 
 // LoginRateLimiter tracks failed login attempts per IP (prevents brute-force attacks without blocking legitimate users).

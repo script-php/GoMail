@@ -31,7 +31,8 @@ type Server struct {
 // NewServer creates the web server with all routes.
 func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueFunc reporting.EnqueueFunc) *Server {
 	tlsEnabled := cfg.Web.IsTLSEnabled()
-	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey, tlsEnabled)
+	secureRequest := tlsEnabled || cfg.Web.ExternalHTTPS
+	sessionMgr := security.NewSessionManager(db, cfg.Web.SessionMaxAge, cfg.Security.CSRFKey, secureRequest)
 	loginRateLimiter := NewLoginRateLimiter()
 
 	s := &Server{
@@ -47,7 +48,8 @@ func NewServer(cfg *config.Config, db *store.DB, queue *delivery.Queue, enqueueF
 	s.registerRoutes(mux)
 
 	// Wrap with security headers (HSTS only when TLS is enabled)
-	handler := security.SecureHeaders(mux, tlsEnabled)
+	handler := security.SecureHeaders(mux, secureRequest)
+	handler = TrustedProxyMiddleware(cfg.Web.TrustedProxies, handler)
 
 	// Wrap with rate limiter (configurable, applies only to non-static requests)
 	rateLimitPerMin := cfg.Web.GetRateLimitPerMin()
@@ -83,6 +85,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// MTA-STS well-known endpoint
 	policy := mta_sts.DefaultPolicy(s.cfg.Server.Hostname)
 	mux.HandleFunc("/.well-known/mta-sts.txt", handlers.MTASTSHandler(policy))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.db.PingContext(r.Context()); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ready\n"))
+	})
 
 	// ACME challenge endpoint (let autocert handler deal with it)
 	// This must NOT require authentication so Let's Encrypt can validate
@@ -113,12 +127,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/sent", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Sent)))
 	mux.Handle("/folder/{folderID}", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.FolderView)))
 	mux.Handle("/message/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.View)))
+	mux.Handle("/message-content/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Content)))
 	mux.Handle("/message/delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Delete)))
 	mux.Handle("/message/star/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.ToggleStar)))
 	mux.Handle("/forward/", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.ForwardPage)))
 	mux.Handle("/forward-send", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.Send)))
 	mux.Handle("/compose", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.ComposePage)))
 	mux.Handle("/send", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.Send)))
+	mux.Handle("/api/drafts", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.SaveDraft)))
 	mux.Handle("/attachment/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.DownloadAttachment)))
 
 	// API endpoints for JS

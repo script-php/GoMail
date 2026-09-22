@@ -125,6 +125,13 @@ function pollUnread() {
 
 // ===== EVENT LISTENERS (DOMContentLoaded) =====
 document.addEventListener('DOMContentLoaded', function() {
+	var composeForm=document.getElementById('compose-form');
+	if(composeForm){
+		var draftStatus=document.getElementById('draft-status'), draftTimer, draftDirty=false;
+		function saveDraft(){if(!draftDirty)return Promise.resolve();var data=new URLSearchParams();['draft_id','to','cc','subject','body'].forEach(function(id){data.set(id,document.getElementById(id).value)});data.set('csrf_token',composeForm.elements.csrf_token.value);draftStatus.textContent='Saving…';return fetch('/api/drafts',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data}).then(function(r){if(!r.ok)throw new Error();return r.json()}).then(function(v){document.getElementById('draft_id').value=v.id;draftDirty=false;draftStatus.textContent='Draft saved';}).catch(function(){draftStatus.textContent='Draft could not be saved';});}
+		['to','cc','subject','body'].forEach(function(id){document.getElementById(id).addEventListener('input',function(){draftDirty=true;clearTimeout(draftTimer);draftTimer=setTimeout(saveDraft,1500)})});
+		document.getElementById('save-draft').addEventListener('click',function(){draftDirty=true;saveDraft()});composeForm.addEventListener('submit',function(){draftDirty=false;clearTimeout(draftTimer)});
+	}
     // Menu toggle button
     var menuToggle = document.querySelector('.menu-toggle');
     if (menuToggle) {
@@ -181,7 +188,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (e.target.tagName === 'A') return;
 
             var id = this.dataset.id;
-            if (id) window.location.href = '/message/' + id;
+			if (id) window.location.href = row.dataset.draft === 'true' ? '/compose?draft=' + id : '/message/' + id;
         });
     });
 

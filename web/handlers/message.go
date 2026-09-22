@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -371,35 +370,29 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 	http.ServeFile(w, r, fullPath)
 }
 
-// sanitizeHTML removes potentially dangerous content from HTML emails
-func sanitizeHTML(html string) string {
-	// Remove script tags and content
-	html = regexp.MustCompile(`(?i)<script[^>]*>.*?</script>`).ReplaceAllString(html, "")
-
-	// Remove iframes
-	html = regexp.MustCompile(`(?i)<iframe[^>]*>.*?</iframe>`).ReplaceAllString(html, "")
-
-	// Remove event handlers (onclick, onerror, onload, etc.)
-	// Match: on<word>= followed by quoted or unquoted value
-	html = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)`).ReplaceAllString(html, " ")
-
-	// Remove form submissions
-	html = regexp.MustCompile(`(?i)<form[^>]*>`).ReplaceAllString(html, "<div>")
-	html = regexp.MustCompile(`(?i)</form>`).ReplaceAllString(html, "</div>")
-	html = regexp.MustCompile(`(?i)<input[^>]*>`).ReplaceAllString(html, "")
-	html = regexp.MustCompile(`(?i)<button[^>]*>.*?</button>`).ReplaceAllString(html, "")
-
-	// Remove meta refresh (can be used to redirect)
-	html = regexp.MustCompile(`(?i)<meta\s+http-equiv\s*=\s*['"]?refresh['"]?[^>]*>`).ReplaceAllString(html, "")
-
-	// Remove base tag (can be used to change relative URLs)
-	html = regexp.MustCompile(`(?i)<base[^>]*>`).ReplaceAllString(html, "")
-
-	// Allow safe tags and attributes
-	// Keep: a, img, table, tr, td, div, span, p, br, strong, em, etc.
-	// This is a basic whitelist - emails should mostly work
-
-	return strings.TrimSpace(html)
+// Content serves sanitized HTML mail in a sandboxed, origin-isolated frame.
+func (h *MessageHandler) Content(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	idText := strings.TrimPrefix(r.URL.Path, "/message-content/")
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	msg, err := h.db.GetMessage(id, account.ID)
+	if err != nil || msg == nil || msg.HTMLBody == "" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src data: cid: https: http:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; navigate-to 'none'")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8>" + sanitizeHTML(msg.HTMLBody)))
 }
 
 // BulkAction applies an account-scoped, atomic action to selected messages.
