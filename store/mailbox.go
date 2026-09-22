@@ -8,8 +8,13 @@ import (
 
 // SearchMessages searches visible mail, scoped to its owner. SQL wildcards are literal.
 func (db *DB) SearchMessages(accountID int64, query string, limit, offset int) ([]*Message, int, error) {
-	pattern := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(query) + "%"
-	where := `account_id = ? AND is_deleted = 0 AND (subject LIKE ? ESCAPE '\' OR from_addr LIKE ? ESCAPE '\' OR to_addr LIKE ? ESCAPE '\' OR text_body LIKE ? ESCAPE '\')`
+	pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query) + "%"
+	where := `account_id = ? AND is_deleted = 0 AND (subject LIKE ? ESCAPE '!' OR from_addr LIKE ? ESCAPE '!' OR to_addr LIKE ? ESCAPE '!' OR text_body LIKE ? ESCAPE '!')`
+	if db.IsMySQL() {
+		for _, field := range []string{"subject", "from_addr", "to_addr", "text_body"} {
+			where = strings.ReplaceAll(where, field+" LIKE", field+" COLLATE utf8mb4_unicode_ci LIKE")
+		}
+	}
 	args := []interface{}{accountID, pattern, pattern, pattern, pattern}
 	var total int
 	if err := db.QueryRow("SELECT COUNT(*) FROM messages WHERE "+where, args...).Scan(&total); err != nil {

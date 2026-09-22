@@ -89,6 +89,10 @@ func TestSearchOwnershipAndLiteralWildcards(t *testing.T) {
 }
 func TestQueueInsertionRollsBackAllRecipients(t *testing.T) {
 	db := mailboxDB(t)
+	// SQLite triggers are not supported on MySQL, skip this test
+	if db.IsMySQL() {
+		t.Skip("SQLite triggers not available on MySQL backend")
+	}
 	if _, err := db.Exec(`CREATE TRIGGER reject_recipient BEFORE INSERT ON outbound_queue WHEN NEW.rcpt_to = 'reject@example.com' BEGIN SELECT RAISE(ABORT, 'test failure'); END`); err != nil {
 		t.Fatal(err)
 	}

@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS greylisting (
     first_seen DATETIME NOT NULL DEFAULT (datetime('now')),  -- When we first saw this triplet
     whitelisted_at DATETIME,                -- When we first accepted a message from this triplet (NULL if never whitelisted)
     rejected_count INTEGER NOT NULL DEFAULT 1,  -- Number of times we rejected this triplet
-    UNIQUE(recipient_domain, remote_ip, sender_email, recipient_email)
+    UNIQUE(remote_ip, sender_email, recipient_email)
 );
 
 CREATE INDEX IF NOT EXISTS idx_greylisting_domain ON greylisting(recipient_domain);

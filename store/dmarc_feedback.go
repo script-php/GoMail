@@ -11,7 +11,7 @@ import (
 func (db *DB) SaveDMARCFeedback(domain, sourceIP, envelopeFromDomain, dkimResult, spfResult, disposition string) error {
 	_, err := db.Exec(`
 		INSERT INTO dmarc_feedback (domain, source_ip, envelope_from_domain, dkim_result, spf_result, disposition, received_at)
-		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	`, domain, sourceIP, envelopeFromDomain, dkimResult, spfResult, disposition)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to save DMARC feedback for %s: %v", domain, err))
@@ -25,10 +25,10 @@ func (db *DB) GetDMARCFeedbackForReport(domain string, startTime, endTime time.T
 	rows, err := db.Query(`
 		SELECT source_ip, COUNT(*) as count
 		FROM dmarc_feedback
-		WHERE domain = ? AND received_at >= datetime(?) AND received_at < datetime(?)
+		WHERE domain = ? AND received_at >= ? AND received_at < ?
 		GROUP BY source_ip
 		ORDER BY count DESC
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	`, domain, databaseTime(startTime), databaseTime(endTime))
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to query DMARC feedback for %s: %v", domain, err))
 		return nil, err
@@ -51,8 +51,8 @@ func (db *DB) GetDMARCFeedbackForReport(domain string, startTime, endTime time.T
 func (db *DB) CleanOldDMARCFeedback(retentionDays int) error {
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	_, err := db.Exec(`
-		DELETE FROM dmarc_feedback WHERE received_at < datetime(?)
-	`, cutoff.Format(time.RFC3339))
+		DELETE FROM dmarc_feedback WHERE received_at < ?
+	`, databaseTime(cutoff))
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to clean old DMARC feedback: %v", err))
 	}
@@ -63,9 +63,9 @@ func (db *DB) CleanOldDMARCFeedback(retentionDays int) error {
 func (db *DB) MarkDMARCFeedbackAsSent(domain string, startTime, endTime time.Time) error {
 	_, err := db.Exec(`
 		UPDATE dmarc_feedback
-		SET sent_at = datetime('now')
-		WHERE domain = ? AND received_at >= datetime(?) AND received_at < datetime(?) AND sent_at IS NULL
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+		SET sent_at = CURRENT_TIMESTAMP
+		WHERE domain = ? AND received_at >= ? AND received_at < ? AND sent_at IS NULL
+	`, domain, databaseTime(startTime), databaseTime(endTime))
 	return err
 }
 
@@ -75,25 +75,25 @@ func (db *DB) GetLastDMARCReportTime(domain string) (time.Time, error) {
 	err := db.QueryRow(`
 		SELECT last_sent_at FROM dmarc_report_log WHERE domain = ?
 	`, domain).Scan(&lastSent)
-	
+
 	if err != nil {
 		// Domain not in log yet, return epoch time (Jan 1, 1970)
 		return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), nil
 	}
-	
+
 	if lastSent == nil {
 		return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), nil
 	}
-	
+
 	return *lastSent, nil
 }
 
 // UpdateLastDMARCReportTime records when a report was successfully sent for a domain
 func (db *DB) UpdateLastDMARCReportTime(domain string) error {
-	_, err := db.Exec(`
-		INSERT INTO dmarc_report_log (domain, last_sent_at) 
-		VALUES (?, datetime('now'))
-		ON CONFLICT(domain) DO UPDATE SET last_sent_at = datetime('now')
-	`, domain)
+	_, err := db.ExecuteUpsert(
+		`INSERT INTO dmarc_report_log (domain, last_sent_at) VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT(domain) DO UPDATE SET last_sent_at = CURRENT_TIMESTAMP`,
+		`INSERT INTO dmarc_report_log (domain, last_sent_at) VALUES (?, CURRENT_TIMESTAMP) ON DUPLICATE KEY UPDATE last_sent_at = CURRENT_TIMESTAMP`,
+		domain,
+	)
 	return err
 }

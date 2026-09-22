@@ -87,7 +87,7 @@ func main() {
 	dns.InitCache(cfg.DNS.CacheTTL)
 
 	// Open database
-	db, err := store.Open(cfg.Store.DBPath, cfg.Store.AttachmentsPath)
+	db, err := store.OpenConfig(cfg.Store)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}

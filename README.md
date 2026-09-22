@@ -349,3 +349,13 @@ Contributions welcome! Areas for improvement:
 ---
 
 **Ready to deploy?** Start with [**Deployment Guide**](docs/deployment.md).
+
+## Database backends
+
+SQLite remains the default. Set `store.database` to `mysql` and configure
+`store.mysql` to use MySQL 8.0.13+. GoMail initializes a new database and adds
+missing schema objects when reopening an existing database. Completed data
+migrations are tracked; automatic schema upgrades preserve existing data.
+See [configuration](docs/config.md#mysql-example) and
+[database development](docs/database.md). Selecting MySQL does not copy existing
+SQLite data; attachments remain on the filesystem.

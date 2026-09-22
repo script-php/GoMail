@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"gomail/logging"
 )
@@ -61,8 +62,61 @@ type DKIMConfig struct {
 }
 
 type StoreConfig struct {
-	DBPath          string `json:"db_path"`
-	AttachmentsPath string `json:"attachments_path"`
+	Database        string      `json:"database"`
+	MySQL           MySQLConfig `json:"mysql"`
+	DBPath          string      `json:"db_path"`
+	AttachmentsPath string      `json:"attachments_path"`
+}
+
+// MySQLConfig configures the optional MySQL backend. Passwords are never logged.
+type MySQLConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	Name     string `json:"name"`
+	TLS      string `json:"tls"` // "false" for local connections, "true" for verified TLS
+}
+
+func (s *StoreConfig) Validate() error {
+	s.Database = strings.ToLower(strings.TrimSpace(s.Database))
+	if s.Database == "" {
+		s.Database = "sqlite"
+	}
+	if s.Database != "sqlite" && s.Database != "mysql" {
+		return fmt.Errorf("store.database must be 'sqlite' or 'mysql'")
+	}
+	if s.DBPath == "" {
+		s.DBPath = "data/mail.db"
+	}
+	if s.AttachmentsPath == "" {
+		s.AttachmentsPath = "data/attachments"
+	}
+	if s.Database == "mysql" {
+		m := &s.MySQL
+		if m.Host == "" {
+			m.Host = "127.0.0.1"
+		}
+		if m.Port == 0 {
+			m.Port = 3306
+		}
+		if m.Port < 1 || m.Port > 65535 {
+			return fmt.Errorf("store.mysql.port must be between 1 and 65535")
+		}
+		if m.User == "" || m.Name == "" {
+			return fmt.Errorf("store.mysql.user and store.mysql.name are required")
+		}
+		if len(m.Name) > 64 || strings.ContainsAny(m.Name, "/\\.\x00") {
+			return fmt.Errorf("invalid store.mysql.name")
+		}
+		if m.TLS == "" {
+			m.TLS = "false"
+		}
+		if m.TLS != "false" && m.TLS != "true" {
+			return fmt.Errorf("store.mysql.tls must be 'false' or 'true'")
+		}
+	}
+	return nil
 }
 
 type WebConfig struct {
@@ -218,11 +272,8 @@ func (c *Config) Validate() error {
 	if c.DKIM.KeysDir == "" {
 		c.DKIM.KeysDir = "keys"
 	}
-	if c.Store.DBPath == "" {
-		c.Store.DBPath = "data/mail.db"
-	}
-	if c.Store.AttachmentsPath == "" {
-		c.Store.AttachmentsPath = "data/attachments"
+	if err := c.Store.Validate(); err != nil {
+		return err
 	}
 	if c.Web.EnableTLS == nil {
 		t := true

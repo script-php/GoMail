@@ -50,7 +50,7 @@ func (db *DB) GetVERPBounceStats(senderEmail string, daysBack int) (map[string]i
 		WHERE sender_email = ? AND bounce_received_at >= ?
 		GROUP BY original_recipient
 		ORDER BY count DESC`,
-		senderEmail, sqliteTime(cutoff),
+		senderEmail, databaseTime(cutoff),
 	)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to query VERP bounce stats for %s: %v", senderEmail, err))
@@ -110,7 +110,7 @@ func (db *DB) CleanupOldVERPBounces(daysOld int) (int64, error) {
 	result, err := db.Exec(`
 		DELETE FROM verp_bounces
 		WHERE bounce_received_at < ?`,
-		sqliteTime(cutoff),
+		databaseTime(cutoff),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("cleaning up old VERP bounces: %w", err)

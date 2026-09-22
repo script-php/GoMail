@@ -17,10 +17,11 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-// DB wraps the SQLite database connection.
+// DB wraps a SQLite or MySQL database connection.
 type DB struct {
 	*sql.DB
 	attachmentsPath string
+	driver          string
 }
 
 // Open opens (or creates) the SQLite database and runs migrations.
@@ -44,33 +45,33 @@ func Open(dbPath, attachmentsPath string) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
-	// Run schema
-	if _, err := sqlDB.Exec(schemaSQL); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("running schema migration: %w", err)
+	db := &DB{DB: sqlDB, attachmentsPath: attachmentsPath, driver: "sqlite"}
+	// Create tables first; indexes may reference columns added by schema sync.
+	for _, statement := range schemaStatements(schemaSQL) {
+		if !strings.HasPrefix(statement, "CREATE TABLE") {
+			continue
+		}
+		if _, err := sqlDB.Exec(statement); err != nil {
+			sqlDB.Close()
+			return nil, fmt.Errorf("creating SQLite tables: %w", err)
+		}
 	}
-
-	db := &DB{
-		DB:              sqlDB,
-		attachmentsPath: attachmentsPath,
-	}
-
-	// Migrate existing accounts to have folders if they don't already
-	if err := db.migrateExistingAccounts(); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("migrating existing accounts: %w", err)
-	}
-
-	// Run all registered migrations
-	if err := db.runMigrations(); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("running migrations: %w", err)
-	}
-
-	// Sync database schema with schema.sql (auto-detects and applies differences)
 	if err := db.syncSchemaWithDefinition(); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("syncing schema: %w", err)
+	}
+	for _, statement := range schemaStatements(schemaSQL) {
+		if !strings.HasPrefix(statement, "CREATE INDEX") {
+			continue
+		}
+		if _, err := sqlDB.Exec(statement); err != nil {
+			sqlDB.Close()
+			return nil, fmt.Errorf("creating SQLite indexes: %w", err)
+		}
+	}
+	if err := db.runMigrations(); err != nil {
+		sqlDB.Close()
+		return nil, err
 	}
 
 	return db, nil
@@ -106,43 +107,38 @@ func (db *DB) migrateExistingAccounts() error {
 
 	// For each account, check if it has folders and create them if missing
 	for _, accountID := range accountIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM folders WHERE account_id = ?", accountID).Scan(&count)
-		if err != nil {
+		if err := db.DefaultFolders(accountID); err != nil {
 			return err
-		}
-
-		// If account has no folders, create the defaults
-		if count == 0 {
-			if err := db.DefaultFolders(accountID); err != nil {
-				// Log but don't fail - continue with other accounts
-				logging.Warn(fmt.Sprintf("failed to create folders for account %d: %v", accountID, err))
-				continue
-			}
 		}
 
 		// Assign existing messages to folders based on direction
 		// Inbound messages -> Inbox folder
 		inboxFolder, err := db.GetFolderByType(accountID, "inbox")
-		if err == nil && inboxFolder != nil {
+		if err != nil {
+			return err
+		}
+		if inboxFolder != nil {
 			_, err = db.Exec(`
 				UPDATE messages SET folder_id = ? 
 				WHERE account_id = ? AND direction = 'inbound' AND folder_id IS NULL
 			`, inboxFolder.ID, accountID)
 			if err != nil {
-				logging.Warn(fmt.Sprintf("failed to assign inbound messages for account %d: %v", accountID, err))
+				return fmt.Errorf("assigning inbound messages for account %d: %w", accountID, err)
 			}
 		}
 
 		// Outbound messages -> Sent folder
 		sentFolder, err := db.GetFolderByType(accountID, "sent")
-		if err == nil && sentFolder != nil {
+		if err != nil {
+			return err
+		}
+		if sentFolder != nil {
 			_, err = db.Exec(`
 				UPDATE messages SET folder_id = ? 
 				WHERE account_id = ? AND direction = 'outbound' AND folder_id IS NULL
 			`, sentFolder.ID, accountID)
 			if err != nil {
-				logging.Warn(fmt.Sprintf("failed to assign outbound messages for account %d: %v", accountID, err))
+				return fmt.Errorf("assigning outbound messages for account %d: %w", accountID, err)
 			}
 		}
 	}
@@ -178,6 +174,7 @@ type ColumnChange struct {
 // Schema changes should be made directly in schema.sql - they're automatically applied
 func (db *DB) RegisteredMigrations() []Migration {
 	return []Migration{
+		{Name: "mailbox_folders_v1", Run: func(db *DB) error { return db.migrateExistingAccounts() }},
 		// Example: Data migrations (not schema changes)
 		// {
 		//     Name: "migrate_user_data",
@@ -192,12 +189,25 @@ func (db *DB) RegisteredMigrations() []Migration {
 // runMigrations executes all registered migrations
 // Note: Schema changes are handled by syncSchemaWithDefinition() - migrations are for data transformations
 func (db *DB) runMigrations() error {
-	migrations := db.RegisteredMigrations()
-
-	for _, migration := range migrations {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+ name VARCHAR(190) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+ )`); err != nil {
+		return fmt.Errorf("creating migration history: %w", err)
+	}
+	for _, migration := range db.RegisteredMigrations() {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, migration.Name).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			continue
+		}
 		logging.Info(fmt.Sprintf("[db] Running data migration: %s", migration.Name))
 		if err := migration.Run(db); err != nil {
 			return fmt.Errorf("migration %s failed: %w", migration.Name, err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations (name) VALUES (?)`, migration.Name); err != nil {
+			return fmt.Errorf("recording migration %s: %w", migration.Name, err)
 		}
 	}
 
@@ -287,15 +297,8 @@ func (db *DB) computeColumnDiff(existing map[string]ColumnDef, desired map[strin
 		}
 	}
 
-	// Check for columns to delete (in existing but not in desired)
-	for existingName := range existing {
-		if _, inDesired := desired[existingName]; !inDesired {
-			changes = append(changes, ColumnChange{
-				Action: "delete",
-				Name:   existingName,
-			})
-		}
-	}
+	// Extra columns may belong to an older release or a custom installation.
+	// Destructive changes must be explicit migrations, never inferred from a diff.
 
 	return changes
 }

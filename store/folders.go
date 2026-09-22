@@ -9,11 +9,11 @@ import (
 
 // Folder represents a mailbox/folder for organizing messages.
 type Folder struct {
-	ID         int64
-	AccountID  int64
-	Name       string // Inbox, Sent, Spam, Drafts, Trash, or custom
-	FolderType string // inbox, sent, spam, drafts, trash, custom
-	IsDefault  bool
+	ID          int64
+	AccountID   int64
+	Name        string // Inbox, Sent, Spam, Drafts, Trash, or custom
+	FolderType  string // inbox, sent, spam, drafts, trash, custom
+	IsDefault   bool
 	UnreadCount int
 	TotalCount  int
 }
@@ -21,8 +21,8 @@ type Folder struct {
 // DefaultFolders creates the standard set of folders for a new account.
 func (db *DB) DefaultFolders(accountID int64) error {
 	folders := []struct {
-		name   string
-		fType  string
+		name  string
+		fType string
 	}{
 		{"Inbox", "inbox"},
 		{"Sent", "sent"},
@@ -32,10 +32,11 @@ func (db *DB) DefaultFolders(accountID int64) error {
 	}
 
 	for _, f := range folders {
-		_, err := db.Exec(`
-			INSERT OR IGNORE INTO folders (account_id, name, folder_type, is_default)
-			VALUES (?, ?, ?, 1)
-		`, accountID, f.name, f.fType)
+		_, err := db.ExecuteUpsert(
+			`INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON CONFLICT(account_id, name) DO NOTHING`,
+			`INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON DUPLICATE KEY UPDATE id = id`,
+			accountID, f.name, f.fType,
+		)
 		if err != nil {
 			logging.Error(fmt.Sprintf("[store] failed to create default folder %s for account %d: %v", f.name, accountID, err))
 			return fmt.Errorf("creating default folder %s: %w", f.name, err)

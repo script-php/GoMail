@@ -327,7 +327,7 @@ func saveMessage(exec sqlExecutor, m *Message) (int64, error) {
 		m.CcAddr, m.ReplyTo, m.Subject, m.TextBody, m.HTMLBody, m.RawHeaders,
 		m.RawMessage, m.Size, boolToInt(m.HasAttachments), boolToInt(m.IsRead),
 		boolToInt(m.IsStarred), m.SPFResult, m.DKIMResult, m.DMARCResult,
-		m.AuthResults, boolToInt(m.MDNRequested), m.MDNAddress, boolToInt(m.MDNSent), m.ReceivedAt,
+		m.AuthResults, boolToInt(m.MDNRequested), m.MDNAddress, boolToInt(m.MDNSent), databaseTime(m.ReceivedAt),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("saving message: %w", err)
@@ -515,8 +515,8 @@ func (db *DB) GetAttachments(messageID int64) ([]*Attachment, error) {
 
 // --- Queue CRUD ---
 
-// sqliteTime formats a time.Time as a SQLite-compatible datetime string.
-func sqliteTime(t time.Time) string {
+// databaseTime formats timestamps in UTC for both database backends.
+func databaseTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
@@ -527,7 +527,7 @@ func enqueueMessage(exec sqlExecutor, q *QueueEntry) (int64, error) {
 	result, err := exec.Exec(`
 		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid, verp_bounce_address, original_recipient)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, sqliteTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
+		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, databaseTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("enqueueing message: %w", err)
@@ -541,7 +541,7 @@ func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 		SELECT id, message_id, mail_from, rcpt_to, raw_message, attempts, max_attempts,
 			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, verp_bounce_address, original_recipient, created_at, updated_at
 		FROM outbound_queue
-		WHERE status = 'pending' AND next_retry <= datetime('now')
+		WHERE status = 'pending' AND next_retry <= CURRENT_TIMESTAMP
 		ORDER BY next_retry ASC
 		LIMIT ?`, limit)
 	if err != nil {
@@ -568,9 +568,9 @@ func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry time.Time, lastError string) error {
 	_, err := db.Exec(`
 		UPDATE outbound_queue
-		SET status = ?, attempts = ?, next_retry = ?, last_error = ?, updated_at = datetime('now')
+		SET status = ?, attempts = ?, next_retry = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`,
-		status, attempts, sqliteTime(nextRetry), lastError, id,
+		status, attempts, databaseTime(nextRetry), lastError, id,
 	)
 	return err
 }
@@ -579,41 +579,14 @@ func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry 
 // This handles the case where the worker process crashed mid-delivery.
 // Returns the number of entries recovered.
 func (db *DB) RecoverStaleQueueEntries() (int, error) {
-	// Find entries stuck in "sending" status for more than 30 minutes
-	staleBefore := time.Now().UTC().Add(-30 * time.Minute)
-
-	rows, err := db.Query(`
-		SELECT id, next_retry
-		FROM outbound_queue
-		WHERE status = 'sending' AND updated_at < datetime(?)
-	`, sqliteTime(staleBefore))
+	result, err := db.Exec(`UPDATE outbound_queue SET status = 'pending', attempts = 0,
+ next_retry = ?, last_error = 'recovered from stale sending status', updated_at = CURRENT_TIMESTAMP
+ WHERE status = 'sending' AND updated_at < ?`, databaseTime(time.Now().Add(time.Minute)), databaseTime(time.Now().Add(-30*time.Minute)))
 	if err != nil {
-		return 0, fmt.Errorf("querying stale entries: %w", err)
+		return 0, fmt.Errorf("recovering stale queue entries: %w", err)
 	}
-	defer rows.Close()
-
-	var recovered int
-	for rows.Next() {
-		var id int64
-		var nextRetry string
-		if err := rows.Scan(&id, &nextRetry); err != nil {
-			return recovered, fmt.Errorf("scanning stale entry: %w", err)
-		}
-
-		// Reset to pending with immediate retry (1 minute from now)
-		newRetryTime := time.Now().UTC().Add(1 * time.Minute)
-		if err := db.UpdateQueueEntry(id, "pending", 0, newRetryTime, "recovered from stale sending status"); err != nil {
-			return recovered, fmt.Errorf("updating stale entry %d: %w", id, err)
-		}
-		recovered++
-	}
-
-	if recovered > 0 {
-		// Log the recovery through fmt rather than log package to avoid circular imports
-		fmt.Printf("[store] recovered %d stale queue entries from sending status\n", recovered)
-	}
-
-	return recovered, rows.Err()
+	count, err := result.RowsAffected()
+	return int(count), err
 }
 
 // DeleteQueueEntry removes a completed/failed entry from the queue.
@@ -626,7 +599,7 @@ func (db *DB) DeleteQueueEntry(id int64) error {
 func (db *DB) MarkDSNSent(id int64) error {
 	_, err := db.Exec(`
 		UPDATE outbound_queue
-		SET dsn_sent = 1, updated_at = datetime('now')
+		SET dsn_sent = 1, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`,
 		id,
 	)
@@ -637,9 +610,11 @@ func (db *DB) MarkDSNSent(id int64) error {
 
 // SaveSession stores a web session.
 func (db *DB) SaveSession(token string, data string, expiresAt time.Time) error {
-	_, err := db.Exec(`
-		INSERT OR REPLACE INTO sessions (token, data, expires_at)
-		VALUES (?, ?, ?)`, token, data, expiresAt)
+	_, err := db.ExecuteUpsert(
+		`INSERT INTO sessions (token, data, expires_at) VALUES (?, ?, ?) ON CONFLICT(token) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`,
+		`INSERT INTO sessions (token, data, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data), expires_at = VALUES(expires_at)`,
+		token, data, databaseTime(expiresAt),
+	)
 	return err
 }
 
@@ -647,7 +622,7 @@ func (db *DB) SaveSession(token string, data string, expiresAt time.Time) error 
 func (db *DB) GetSession(token string) (string, error) {
 	var data string
 	err := db.QueryRow(`
-		SELECT data FROM sessions WHERE token = ? AND expires_at > datetime('now')`,
+		SELECT data FROM sessions WHERE token = ? AND expires_at > CURRENT_TIMESTAMP`,
 		token).Scan(&data)
 	if err == sql.ErrNoRows {
 		return "", nil
@@ -663,7 +638,7 @@ func (db *DB) DeleteSession(token string) error {
 
 // CleanExpiredSessions removes all expired sessions.
 func (db *DB) CleanExpiredSessions() error {
-	_, err := db.Exec(`DELETE FROM sessions WHERE expires_at <= datetime('now')`)
+	_, err := db.Exec(`DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP`)
 	return err
 }
 
@@ -697,7 +672,7 @@ func (db *DB) CheckGreylist(recipientDomain, remoteIP, senderEmail, recipientEma
 		status.IsNew = true
 		_, err := db.Exec(`
 			INSERT INTO greylisting (recipient_domain, remote_ip, sender_email, recipient_email, first_seen, rejected_count)
-			VALUES (?, ?, ?, ?, datetime('now'), 1)`,
+			VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
 			recipientDomain, remoteIP, senderEmail, recipientEmail)
 		if err != nil {
 			return nil, fmt.Errorf("recording greylisting entry: %w", err)
@@ -721,7 +696,7 @@ func (db *DB) CheckGreylist(recipientDomain, remoteIP, senderEmail, recipientEma
 		status.DelayExpired = true
 		// Mark as whitelisted
 		_, err := db.Exec(`
-			UPDATE greylisting SET whitelisted_at = datetime('now')
+			UPDATE greylisting SET whitelisted_at = CURRENT_TIMESTAMP
 			WHERE recipient_domain = ? AND remote_ip = ? AND sender_email = ? AND recipient_email = ?`,
 			recipientDomain, remoteIP, senderEmail, recipientEmail)
 		if err != nil {
@@ -737,8 +712,8 @@ func (db *DB) CheckGreylist(recipientDomain, remoteIP, senderEmail, recipientEma
 func (db *DB) CleanupGreylisting() error {
 	_, err := db.Exec(`
 		DELETE FROM greylisting
-		WHERE first_seen < datetime('now', '-30 days')
-		AND whitelisted_at IS NULL`)
+		WHERE first_seen < ?
+		AND whitelisted_at IS NULL`, databaseTime(time.Now().AddDate(0, 0, -30)))
 	if err != nil {
 		return fmt.Errorf("cleaning up greylisting: %w", err)
 	}
@@ -810,7 +785,7 @@ func (db *DB) DeleteGreylistingEntry(id int64) error {
 
 // WhitelistGreylistingEntry manually marks an entry as whitelisted
 func (db *DB) WhitelistGreylistingEntry(id int64) error {
-	_, err := db.Exec(`UPDATE greylisting SET whitelisted_at = datetime('now') WHERE id = ?`, id)
+	_, err := db.Exec(`UPDATE greylisting SET whitelisted_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("whitelisting entry: %w", err)
 	}
@@ -926,14 +901,17 @@ func minInt(a, b int) int {
 
 // IncrementTarpittingFailure increments the failure count for an IP or creates new entry
 func (db *DB) IncrementTarpittingFailure(recipientDomain, remoteIP, lastInvalidCommand string) error {
-	_, err := db.Exec(`
-		INSERT INTO tarpitting (recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure)
-		VALUES (?, ?, 1, ?, datetime('now'), datetime('now'))
-		ON CONFLICT(recipient_domain, remote_ip) DO UPDATE SET
-			failure_count = failure_count + 1,
-			last_invalid_command = excluded.last_invalid_command,
-			last_failure = datetime('now')`,
-		recipientDomain, remoteIP, lastInvalidCommand)
+	_, err := db.ExecuteUpsert(
+		`INSERT INTO tarpitting (recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure)
+ VALUES (?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ ON CONFLICT(recipient_domain, remote_ip) DO UPDATE SET failure_count = failure_count + 1,
+ last_invalid_command = excluded.last_invalid_command, last_failure = CURRENT_TIMESTAMP`,
+		`INSERT INTO tarpitting (recipient_domain, remote_ip, failure_count, last_invalid_command, first_failure, last_failure)
+ VALUES (?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ ON DUPLICATE KEY UPDATE failure_count = failure_count + 1,
+ last_invalid_command = VALUES(last_invalid_command), last_failure = CURRENT_TIMESTAMP`,
+		recipientDomain, remoteIP, lastInvalidCommand,
+	)
 	if err != nil {
 		return fmt.Errorf("incrementing tarpitting failure: %w", err)
 	}
@@ -1009,7 +987,7 @@ func (db *DB) CheckTarpittingWithMaxDelay(recipientDomain, remoteIP string, maxD
 
 // WhitelistTarpittingEntry manually marks an entry as whitelisted
 func (db *DB) WhitelistTarpittingEntry(id int64) error {
-	_, err := db.Exec(`UPDATE tarpitting SET whitelisted_at = datetime('now') WHERE id = ?`, id)
+	_, err := db.Exec(`UPDATE tarpitting SET whitelisted_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("whitelisting tarpitting entry: %w", err)
 	}
@@ -1029,8 +1007,8 @@ func (db *DB) DeleteTarpittingEntry(id int64) error {
 func (db *DB) CleanupTarpitting() error {
 	_, err := db.Exec(`
 		DELETE FROM tarpitting
-		WHERE first_failure < datetime('now', '-90 days')
-		AND whitelisted_at IS NULL`)
+		WHERE first_failure < ?
+		AND whitelisted_at IS NULL`, databaseTime(time.Now().AddDate(0, 0, -90)))
 	if err != nil {
 		return fmt.Errorf("cleaning up tarpitting: %w", err)
 	}
@@ -1056,12 +1034,18 @@ func (db *DB) SaveQueuedMessage(m *Message, entries []*QueueEntry) (int64, error
 		return 0, err
 	}
 	defer tx.Rollback()
-	id, err := saveMessage(tx, m)
-	if err != nil {
-		return 0, err
+	var id int64
+	if m.AccountID != 0 {
+		id, err = saveMessage(tx, m)
+		if err != nil {
+			return 0, err
+		}
 	}
 	for _, entry := range entries {
-		entry.MessageID = &id
+		entry.MessageID = nil
+		if id != 0 {
+			entry.MessageID = &id
+		}
 		if _, err := enqueueMessage(tx, entry); err != nil {
 			return 0, err
 		}

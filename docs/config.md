@@ -38,6 +38,7 @@ GoMail is configured via a single `config.json` file in JSON format.
   },
 
   "store": {
+    "database": "sqlite",
     "db_path": "./data/mail.db",
     "attachments_path": "./data/attachments"
   },
@@ -121,8 +122,65 @@ GoMail is configured via a single `config.json` file in JSON format.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `database` | string | `sqlite` | Backend: `sqlite` or `mysql`; omitted keeps existing SQLite behavior |
 | `db_path` | string | `./data/mail.db` | Path to SQLite database file |
+| `mysql.host` | string | `127.0.0.1` | MySQL server hostname or IP |
+| `mysql.port` | int | `3306` | MySQL TCP port |
+| `mysql.user` | string | | Required when using MySQL |
+| `mysql.password` | string | | MySQL password |
+| `mysql.name` | string | | Required database name |
+| `mysql.tls` | string | `false` | `true` enables certificate-verified TLS; use for remote servers |
 | `attachments_path` | string | `./data/attachments` | Directory for storing email attachments |
+
+#### MySQL example
+
+MySQL 8.0.13 or newer is supported. Replace the `store` section with:
+
+```json
+"store": {
+  "database": "mysql",
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "gomail",
+    "password": "replace-with-your-password",
+    "name": "gomail",
+    "tls": "false"
+  },
+  "attachments_path": "./data/attachments"
+}
+```
+
+Startup connects to the selected database. If it does not exist, GoMail attempts
+to create it; the user must have permission to do so. Alternatively, create an
+empty database and grant the GoMail user privileges on that database beforehand.
+Existing databases do not require server-wide CREATE DATABASE privileges.
+
+GoMail creates missing tables, columns, indexes, and declared table constraints.
+It preserves existing rows and extra columns. Existing column type/default changes
+are not automatically applied; put these in an explicit reviewed migration.
+Completed data migrations are recorded in `schema_migrations`. MySQL startup uses
+an advisory lock to serialize schema upgrades across starting processes. Schema
+DDL commits implicitly in MySQL, so a failed startup can leave earlier additive
+steps applied; the next startup resumes by inspecting what already exists. Data
+migrations must be idempotent so interrupted migrations can be retried safely.
+
+The application user needs SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX,
+and REFERENCES privileges on the application database. Explicit future migrations
+may require additional privileges. Back up before upgrading.
+
+MySQL connections use UTF-8 (`utf8mb4`), UTC timestamps, and a bounded connection
+pool. Configure `max_allowed_packet` on the MySQL server large enough for complete
+messages and queue inserts (for example, 64 MiB for the default 25 MiB message
+limit). Attachments still live under `attachments_path`; back up that directory
+along with the database. The connection password is passed through the driver
+configuration and is not printed in logs.
+
+Changing `database` selects a different backend. **It does not import existing
+SQLite mail into MySQL.** An empty backend starts with the normal bootstrap-admin
+flow; an existing backend reuses its accounts. Keep the old SQLite file if you
+intend to switch back. See [Database development](database.md) for migration and
+test instructions.
 
 ### web
 

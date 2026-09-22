@@ -342,10 +342,10 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 		       SUM(CASE WHEN spf_result = 'pass' THEN 1 ELSE 0 END) as spf_pass,
 		       disposition, envelope_from_domain
 		FROM dmarc_feedback
-		WHERE domain = ? AND received_at >= datetime(?) AND received_at < datetime(?) AND sent_at IS NULL
-		GROUP BY source_ip, disposition
+		WHERE domain = ? AND received_at >= ? AND received_at < ? AND sent_at IS NULL
+		GROUP BY source_ip, disposition, envelope_from_domain
 		ORDER BY count DESC
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	`, domain, startTime.UTC().Format("2006-01-02 15:04:05"), endTime.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		return nil, err
 	}

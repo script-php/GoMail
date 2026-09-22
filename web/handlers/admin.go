@@ -715,10 +715,10 @@ func (h *AdminHandler) DMARCFeedback(w http.ResponseWriter, r *http.Request) {
 		       SUM(CASE WHEN dkim_result = 'pass' THEN 1 ELSE 0 END) as dkim_pass,
 		       disposition
 		FROM dmarc_feedback
-		WHERE received_at >= datetime(?)
+		WHERE received_at >= ?
 		GROUP BY domain, source_ip, disposition
 		ORDER BY domain ASC, count DESC
-	`, startTime.Format(time.RFC3339))
+	`, startTime.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		log.Printf("[admin] error querying DMARC feedback: %v", err)
 		http.Error(w, "Error querying feedback", http.StatusInternalServerError)
@@ -821,10 +821,10 @@ func (h *AdminHandler) TLSRPTReports(w http.ResponseWriter, r *http.Request) {
 		SELECT recipient_domain, failure_reason, COUNT(*) as count,
 		       SUM(CASE WHEN sending_mta_ip IS NOT NULL THEN 1 ELSE 0 END) as with_ip
 		FROM tls_failures
-		WHERE attempted_at >= datetime(?)
+		WHERE attempted_at >= ?
 		GROUP BY recipient_domain, failure_reason
 		ORDER BY recipient_domain ASC, count DESC
-	`, startTime.Format(time.RFC3339))
+	`, startTime.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		log.Printf("[admin] error querying TLS failures: %v", err)
 		http.Error(w, "Error querying TLS failures", http.StatusInternalServerError)

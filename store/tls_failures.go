@@ -11,7 +11,7 @@ import (
 func (db *DB) RecordTLSFailure(recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP string) error {
 	_, err := db.Exec(`
 		INSERT INTO tls_failures (recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname, receiving_ip, attempted_at)
-		VALUES (?, ?, ?, ?, ?, datetime('now'))
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	`, recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to record TLS failure for %s: %v", recipientDomain, err))
@@ -35,9 +35,9 @@ func (db *DB) GetTLSFailuresForReport(domain string, startTime, endTime time.Tim
 	rows, err := db.Query(`
 		SELECT recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname, receiving_ip, attempted_at
 		FROM tls_failures
-		WHERE recipient_domain = ? AND attempted_at >= datetime(?) AND attempted_at < datetime(?) AND sent_at IS NULL
+		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL
 		ORDER BY attempted_at DESC
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	`, domain, databaseTime(startTime), databaseTime(endTime))
 	if err != nil {
 		logging.Error(fmt.Sprintf("[store] failed to query TLS failures for %s: %v", domain, err))
 		return nil, fmt.Errorf("querying TLS failures: %w", err)
@@ -47,12 +47,10 @@ func (db *DB) GetTLSFailuresForReport(domain string, startTime, endTime time.Tim
 	var failures []TLSFailureRecord
 	for rows.Next() {
 		var record TLSFailureRecord
-		var attemptedAtStr string
 		if err := rows.Scan(&record.RecipientDomain, &record.FailureReason, &record.SendingMTAIP,
-			&record.ReceivingMXHostname, &record.ReceivingIP, &attemptedAtStr); err != nil {
+			&record.ReceivingMXHostname, &record.ReceivingIP, &record.AttemptedAt); err != nil {
 			return nil, err
 		}
-		record.AttemptedAt, _ = time.Parse(time.RFC3339, attemptedAtStr)
 		failures = append(failures, record)
 	}
 	return failures, rows.Err()
@@ -87,10 +85,10 @@ func (db *DB) CountTLSFailuresByReason(domain string, startTime, endTime time.Ti
 	rows, err := db.Query(`
 		SELECT failure_reason, COUNT(*) as count
 		FROM tls_failures
-		WHERE recipient_domain = ? AND attempted_at >= datetime(?) AND attempted_at < datetime(?) AND sent_at IS NULL
+		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL
 		GROUP BY failure_reason
 		ORDER BY count DESC
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	`, domain, databaseTime(startTime), databaseTime(endTime))
 	if err != nil {
 		return nil, err
 	}
@@ -112,9 +110,9 @@ func (db *DB) CountTLSFailuresByReason(domain string, startTime, endTime time.Ti
 func (db *DB) MarkTLSFailuresAsReported(domain string, startTime, endTime time.Time) error {
 	_, err := db.Exec(`
 		UPDATE tls_failures
-		SET sent_at = datetime('now')
-		WHERE recipient_domain = ? AND attempted_at >= datetime(?) AND attempted_at < datetime(?) AND sent_at IS NULL
-	`, domain, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+		SET sent_at = CURRENT_TIMESTAMP
+		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL
+	`, domain, databaseTime(startTime), databaseTime(endTime))
 	return err
 }
 
@@ -122,7 +120,7 @@ func (db *DB) MarkTLSFailuresAsReported(domain string, startTime, endTime time.T
 func (db *DB) CleanOldTLSFailures(retentionDays int) error {
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	_, err := db.Exec(`
-		DELETE FROM tls_failures WHERE attempted_at < datetime(?)
-	`, cutoff.Format(time.RFC3339))
+		DELETE FROM tls_failures WHERE attempted_at < ?
+	`, databaseTime(cutoff))
 	return err
 }
