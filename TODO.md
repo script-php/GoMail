@@ -1,41 +1,41 @@
+# Remaining work
 
-priority {cm:2026-03-26}
-received headers (DONE) {cm:2026-03-26}
-autocert {cm:2026-03-26}
-user-agent header (DONE) {cm:2026-03-27}
-importance header (DONE) {cm:2026-03-27}
-x-originating-ip (DONE) {cm:2026-03-27}
-organization header
-resent-from resent-to resent-date
-list-id list-help list-unsubscribe list-subscribe list-post list-owner list-archive
-thread-index thread-topic
-arc-seal arc-message-signature arc-authentication-results (DONE - Full ARC with RSA+Ed25519) {cm:2026-03-27}
-ARC cryptographic verification (DONE - Full DKIM-style signature verification with RSA+Ed25519) {cm:2026-04-06}
-configurable strict-TLS mode (DONE - per-domain require_tls flag with RFC 8689 semantics) {cm:2026-04-06}
-smtp authentication (plain, login, cram-md5)
-bounce handling ndr detection
-spam filtering
-vacation auto-reply
-mailing lists
-message search
-tag label system
-message templates
-backup restore
-pgp gpg support
-caldav calendar
-carddav contacts
-dane tlsa validation
-rate limiting ui
-two-factor authentication
-monitoring metrics prometheus
-webhook api
-mobile app
-message context threading
-webmail interface
-DSN (Delivery Status Notifications) - No detailed bounce reports
-SMTPUTF8 - No Unicode email support (e.g., 用户@example.com)
-List-Unsubscribe headers - No automatic unsubscribe links
- IPv6 - Only IPv4 connections (1-line fix: change "tcp4" to "tcp")
-VERP - Per-recipient bounce tracking
-ARF - Abuse report processing
-DANE, BIMI, Greylisting, Tarpitting, enhanced status codes
+## Protocol and interoperability
+
+- Complete ARC multi-hop sealing and validation with published vectors and live
+  intermediary tests. Do not enable ARC on ordinary originated mail.
+- Complete SPF MX/PTR DNS subquery/error accounting.
+- Add complete TLS-RPT success/failure event storage and policy grouping.
+- Expand DMARC aggregate `auth_results` data and external destination tests.
+- Complete DSN syntax/interoperability and use enhanced status codes consistently
+  before advertising `ENHANCEDSTATUSCODES`.
+- Add MIME charset conversion, RFC 2231 filename handling, and multipart
+  alternative/related fixtures.
+- Run live SMTP interoperability against major providers.
+
+## Mail clients
+
+- Run Thunderbird, Outlook and Apple Mail interoperability matrices for POP3
+  and submission.
+- Implement IMAP only as a complete mailbox synchronization project: stable
+  UID/UIDVALIDITY, folders, flags, SEARCH/FETCH/STORE, IDLE, concurrent updates
+  and expunge semantics.
+- Add standard client autoconfiguration/autodiscovery only after endpoints and
+  certificate deployment are stable.
+
+## Product and operations
+
+- Browser-level interaction and accessibility automation.
+- Complete mailbox quota enforcement.
+- Structured metrics/alerts for queues, SMTP results, auth failures, reports,
+  DNSSEC/TLSA and certificate expiry.
+- Automated, documented backup tooling and repeated restore tests.
+- Broader parser, reporting and web-handler integration coverage.
+- Review logging consistency and remove remaining direct `log`/`fmt` output.
+- Cursor-based mailbox pagination for large installations.
+
+## Optional future features
+
+- Vacation responses, Sieve-style filtering and mailing lists.
+- Two-factor web authentication and account recovery.
+- BIMI, CalDAV/CardDAV and PGP/S/MIME integrations.

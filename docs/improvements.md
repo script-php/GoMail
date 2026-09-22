@@ -1,38 +1,32 @@
-# Mailbox improvements
+# Implemented improvements and remaining work
 
-The header search now searches the signed-in account's subject, sender, recipient,
-and plain-text body. Trash is excluded. Results are paginated and preserve the
-search term. Search uses SQLite LIKE; non-ASCII case folding is limited by SQLite.
+## Implemented
 
-Select messages using row checkboxes or Select all (the current page). The toolbar
-supports read/unread, moving to an existing folder, Trash, and Restore. Restore
-returns received messages to Inbox and sent messages to Sent. Moving to Drafts is
-not supported. Bulk changes validate ownership and destination before committing
-and update folder counts in the same transaction. These actions do not send read
-receipts. Individual message viewing retains the existing receipt behavior.
+- Account-scoped mailbox search, pagination, bulk read/unread/move/trash/restore
+  and ownership validation.
+- Transactional Sent-copy and recipient-queue insertion.
+- Draft create/resume/update, explicit save, autosave and deletion after send.
+- Allowlist HTML sanitizer and sandboxed iframe rendering.
+- Trusted-proxy CIDRs, external HTTPS awareness, secure cookies and correct
+  client-IP rate-limit identity.
+- Liveness/readiness endpoints and documented backup/restore expectations.
+- Stricter SMTP command parameters, STARTTLS reset, outbound dot transparency,
+  SMTPUTF8 and 8BITMIME negotiation.
+- Multi-signature DKIM identity handling, SPF/HELO behavior, PSL-aware DMARC and
+  safer Authentication-Results construction.
+- DNSSEC-authenticated DANE/TLSA matching for every usage/selector/matching type.
+- MTA-STS TXT discovery and stricter policy parsing/matching.
+- Removal of unconditional ARC from ordinary outbound mail.
+- Optional POP3-over-TLS and authenticated SMTP submission, disabled by default.
 
-Mutating message endpoints require CSRF tokens and account ownership checks.
-Disabled accounts cannot continue using existing sessions. Outgoing sent copies
-and all recipient queue entries now commit together; a queue insertion failure is
-returned to the sender. Attachment storage remains separate from that transaction.
-Unknown delivery errors retry; SMTP 5xx replies are permanent failures. Oversized
-BDAT requests are rejected before allocation, and the connection is closed to
-avoid interpreting the rejected chunk as commands. DATA reads are bounded by the
-remaining message-size allowance; incomplete data is not accepted for delivery.
+## Remaining
 
-Run `make test` for all source packages. The package list deliberately excludes
-runtime data and release directories, which may contain restricted certificate
-files. Tests cover queue rollback, mailbox ownership, literal search wildcards,
-trash/restore counts, oversized SMTP chunks, retry classification, rendered pages,
-CSRF checks, and disabled sessions. Tests use isolated in-memory databases.
+- Complete ARC multi-hop interoperability.
+- Complete TLS-RPT and DMARC aggregate event/report fields.
+- Exact SPF MX/PTR DNS accounting and broader MIME/DSN fixtures.
+- Live POP3/submission client matrices and a complete IMAP design.
+- Browser-level interaction and accessibility automation.
+- Complete quota enforcement, metrics/alerting, backup tooling and restore drills.
 
-## Remaining work
-
-- Draft save/resume and autosave (the Drafts folder exists, but has no editor flow).
-- Replace regex-based email HTML sanitization with a reviewed allowlist sanitizer
-  and isolate rendered email from the application layout.
-- Trusted proxy configuration for rate limiting and secure cookies behind TLS
-  termination.
-- SMTP interoperability and email-authentication coverage, operational monitoring,
-  and backup/restore.
-- Browser-level interaction and accessibility coverage.
+The authoritative list is [../TODO.md](../TODO.md); protocol detail is in
+[../STANDARDS_AUDIT.md](../STANDARDS_AUDIT.md).

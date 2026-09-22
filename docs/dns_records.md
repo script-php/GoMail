@@ -24,6 +24,8 @@ Optional but recommended:
 - **DMARC** — Policy for failed auth checks
 - **CAA** — Certificate authority authorization
 - **Reverse DNS (PTR)** — Critical for deliverability
+- **MTA-STS/TLS-RPT** — Published SMTP TLS policy and reporting address
+- **DNSSEC/TLSA** — DANE authentication for the MX certificate
 
 ## Detailed Record Configuration
 
@@ -168,6 +170,10 @@ v=DMARC1; p=reject; rua=mailto:admin@example.com
 - `aspf=r|s` — Relaxed (r) or strict (s) SPF alignment
 - `fo=0|1` — Report all failures (1) or only policy fails (0)
 
+When `rua` points outside the policy domain, the destination must publish the
+DMARC external-report authorization TXT record required by the protocol. GoMail
+checks this authorization before sending aggregate reports externally.
+
 ### 6. CAA Record (Certificate Authority)
 
 Restricts which CAs can issue certificates for your domain.
@@ -246,6 +252,37 @@ _smtp._tls.example.com     TXT     "v=TLSRPTv1; rua=mailto:admin@example.com"
 | Value | `v=TLSRPTv1; rua=mailto:admin@example.com` |
 | TTL | 3600 |
 
+GoMail's TLS-RPT pipeline currently records failures, but complete success
+counts and policy grouping remain under development. Keep independent transport
+monitoring even when this record is published.
+
+### 10. DNSSEC and TLSA/DANE (Optional, Advanced)
+
+DANE is secure only when the zone and TLSA response validate through DNSSEC.
+After enabling and verifying DNSSEC, publish TLSA for the actual MX hostname and
+SMTP service:
+
+```text
+_25._tcp.mail.example.com. TLSA 3 1 1 <sha256-spki-digest>
+```
+
+`3 1 1` means DANE end entity, SubjectPublicKeyInfo selector, SHA-256 matching.
+GoMail can also verify Usage 0/1/2/3, Selector 0/1 and Matching 0/1/2 records.
+Use the exact record generated for the active certificate/key; do not copy the
+example digest.
+
+Verify the chain and authenticated response before setting enforcement to
+required:
+
+```bash
+dig +dnssec DNSKEY example.com
+dig +dnssec TLSA _25._tcp.mail.example.com
+```
+
+Check that the resolver used by GoMail returns authenticated data. During
+certificate/key rotation, overlap valid TLSA records so required-mode senders do
+not see a mismatch. See [DANE behavior](dane_implementation.md).
+
 ## Complete Single Domain Example
 
 For `example.com` on server `mail.example.com` (IP: 203.0.113.1):
@@ -267,6 +304,7 @@ _dmarc.example.com  TXT      "v=DMARC1; p=quarantine; rua=mailto:admin@example.c
 example.com         CAA      0 issue "letsencrypt.org"
 _mta-sts.example.com TXT     "v=STSv1; id=20250101"
 _smtp._tls.example.com TXT   "v=TLSRPTv1; rua=mailto:admin@example.com"
+_25._tcp.mail.example.com TLSA 3 1 1 <digest-from-active-key>
 ```
 
 **With PTR record** (configured at hosting provider):
@@ -324,6 +362,9 @@ dig _dmarc.example.com TXT
 
 # Check CAA
 dig example.com CAA
+
+# Check DNSSEC-authenticated TLSA
+dig +dnssec TLSA _25._tcp.mail.example.com
 ```
 
 **Online tools:**

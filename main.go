@@ -19,6 +19,7 @@ import (
 	"gomail/delivery"
 	"gomail/dns"
 	"gomail/logging"
+	"gomail/mailclient"
 	"gomail/reporting"
 	"gomail/smtp"
 	"gomail/store"
@@ -141,6 +142,13 @@ func main() {
 	// Create delivery queue for the web interface (per-domain DKIM from DB)
 	queue := delivery.NewQueue(db, cfg)
 
+	// Desktop/mobile client protocols are opt-in and require TLS. POP3 uses
+	// implicit TLS; SMTP submission requires STARTTLS before authentication.
+	clientServer := mailclient.NewServer(cfg, db, queue, smtpTLS)
+	if err := clientServer.Start(); err != nil {
+		log.Fatalf("Failed to start mail-client services: %v", err)
+	}
+
 	// Start DMARC report scheduler (weekly reports)
 	// Create a wrapper function to queue DMARC reports for delivery
 	enqueueFunc := func(from, to, message string) error {
@@ -212,6 +220,7 @@ func main() {
 
 	logging.Info("[main] shutting down...")
 	smtpServer.Stop()
+	clientServer.Stop()
 	deliveryPool.Stop()
 	webServer.Shutdown()
 	logging.Info("[main] GoMail stopped.")

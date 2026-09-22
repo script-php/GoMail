@@ -11,19 +11,47 @@ import (
 
 // Config holds all server configuration parsed from config.json.
 type Config struct {
-	Server   ServerConfig   `json:"server"`
-	SMTP     SMTPConfig     `json:"smtp"`
-	TLS      TLSConfig      `json:"tls"`
-	DKIM     DKIMConfig     `json:"dkim"`
-	Store    StoreConfig    `json:"store"`
-	Web      WebConfig      `json:"web"`
-	Mail     MailConfig     `json:"mail"`
-	Delivery DeliveryConfig `json:"delivery"`
-	DNS      DNSConfig      `json:"dns"`
-	Security SecurityConfig `json:"security"`
-	MDN      MDNConfig      `json:"mdn"`
-	DMARC    DMARCConfig    `json:"dmarc"`
-	Logging  LoggingConfig  `json:"logging"`
+	Server   ServerConfig      `json:"server"`
+	SMTP     SMTPConfig        `json:"smtp"`
+	TLS      TLSConfig         `json:"tls"`
+	DKIM     DKIMConfig        `json:"dkim"`
+	Store    StoreConfig       `json:"store"`
+	Web      WebConfig         `json:"web"`
+	Mail     MailConfig        `json:"mail"`
+	Delivery DeliveryConfig    `json:"delivery"`
+	DNS      DNSConfig         `json:"dns"`
+	Security SecurityConfig    `json:"security"`
+	MDN      MDNConfig         `json:"mdn"`
+	DMARC    DMARCConfig       `json:"dmarc"`
+	Clients  MailClientsConfig `json:"mail_clients"`
+	Logging  LoggingConfig     `json:"logging"`
+}
+
+// MailClientsConfig controls the optional protocols used by desktop and mobile
+// mail clients. The master switch is intentionally false by default.
+type MailClientsConfig struct {
+	Enabled        bool                `json:"enabled"`
+	POP3           ClientServiceConfig `json:"pop3"`
+	Submission     ClientServiceConfig `json:"submission"`
+	ReadTimeout    int                 `json:"read_timeout"`
+	WriteTimeout   int                 `json:"write_timeout"`
+	MaxConnections int                 `json:"max_connections"`
+	AuthAttempts   int                 `json:"auth_attempts_per_minute"`
+}
+
+type ClientServiceConfig struct {
+	Enabled    *bool  `json:"enabled"`
+	ListenAddr string `json:"listen_addr"`
+}
+
+func (s ClientServiceConfig) IsEnabled(master bool) bool {
+	if !master {
+		return false
+	}
+	if s.Enabled == nil {
+		return true
+	}
+	return *s.Enabled
 }
 
 type ServerConfig struct {
@@ -300,6 +328,27 @@ func (c *Config) Validate() error {
 	}
 	if c.DNS.CacheTTL <= 0 {
 		c.DNS.CacheTTL = 300
+	}
+	if c.Clients.ReadTimeout <= 0 {
+		c.Clients.ReadTimeout = 60
+	}
+	if c.Clients.WriteTimeout <= 0 {
+		c.Clients.WriteTimeout = 60
+	}
+	if c.Clients.MaxConnections <= 0 {
+		c.Clients.MaxConnections = 50
+	}
+	if c.Clients.AuthAttempts <= 0 {
+		c.Clients.AuthAttempts = 10
+	}
+	if c.Clients.POP3.ListenAddr == "" {
+		c.Clients.POP3.ListenAddr = ":995"
+	}
+	if c.Clients.Submission.ListenAddr == "" {
+		c.Clients.Submission.ListenAddr = ":587"
+	}
+	if c.Clients.Enabled && c.TLS.Mode == "none" {
+		return fmt.Errorf("mail_clients requires TLS; tls.mode cannot be 'none'")
 	}
 	if c.Security.AuthEnforcement == "" {
 		c.Security.AuthEnforcement = "observe" // observe, quarantine, reject, none

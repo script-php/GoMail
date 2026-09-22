@@ -1,234 +1,91 @@
-# DANE (DNSSEC-based Authentication of Named Entities) Implementation
+# DANE and DNSSEC behavior
 
-> Security audit update (2026-09-22): TLSA data is now accepted only when a
-> validating resolver sets the DNSSEC AD bit. The default resolvers are reached
-> over authenticated DNS-over-TLS, preventing forged AD responses. Authenticated
-> NODATA, insecure DNS, malformed records, and resolver failures remain distinct.
-> All RFC 6698 usages are enforced: 0/1 additionally require PKIX validation,
-> 2 requires a cryptographically linked CA certificate, and 3 matches only the
-> leaf. Selectors 0/1 and matching types 0/1/2 are covered by unit tests. DANE-TA
-> and DANE-EE can authenticate peers that are not trusted by the Web PKI.
+GoMail applies DANE/TLSA to outbound SMTP MX connections. The implementation is
+split between `dns/tlsa.go` (authenticated lookup/parsing), `tls/dane.go`
+(certificate matching), and `smtp/outbound.go` (policy and handshake behavior).
 
-## Overview
+## Security invariant
 
-DANE (RFC 6698) provides a secure mechanism for verifying SMTP server certificates using DNSSEC and TLSA DNS records. This document describes GoMail's DANE implementation for outbound SMTP delivery.
+TLSA data is never treated as authoritative merely because a record was returned.
+The DNS response must be authenticated by DNSSEC. The default resolver path uses
+DNS-over-TLS resolvers with certificate verification and requires authenticated
+data. A custom plain DNS resolver is safe only when it is local or reached over a
+trusted network; a remote custom resolver should use
+`host:853#tls-server-name`.
 
-## Implementation Status
+## Supported record semantics
 
-### ✅ Completed Components
+| Usage | Name | Candidate and trust behavior |
+|---:|---|---|
+| 0 | PKIX-TA | Matching chain trust anchor; PKIX validation still required |
+| 1 | PKIX-EE | Matching leaf/end entity; PKIX validation still required |
+| 2 | DANE-TA | Matching chain trust anchor can establish DANE trust |
+| 3 | DANE-EE | Matching leaf/end entity can establish DANE trust |
 
-1. **TLSA Record Lookup and Parsing** (`dns/tlsa.go`)
-   - `LookupTLSA(host string)` - Queries TLSA records for SMTP server
-   - `ParseTLSARecord(record string)` - Parses RFC 6698 TLSA record format
-   - `TLSARecord` struct with fields: Usage, Selector, MatchingType, CertData
-   - DNS cache integration for performance
+Selectors:
 
-2. **DANE Verification** (`tls/dane.go`)
-   - `VerifyDANE(host string, tlsConn *tls.Conn)` - Main verification entry point
-   - `isDANEMatch(cert *x509.Certificate, tlsa TLSARecord)` - RFC 6698 §2.4 certificate matching
-   - Support for all RFC 6698:
-     - Usage types: PKIX-TA (0), PKIX-EE (1), DANE-TA (2), DANE-EE (3)
-     - Selectors: Full cert (0), Public key only (1)
-     - Matching types: Exact (0), SHA-256 (1), SHA-512 (2)
+- `0`: complete DER certificate.
+- `1`: DER SubjectPublicKeyInfo.
 
-3. **SMTP Outbound Integration** (`smtp/outbound.go`)
-   - DANE verification called after successful TLS handshake
-   - Enforcement levels: disabled, optional (default), required
-   - Proper error handling and logging
-   - TLS-RPT failure recording for DANE violations
+Matching types:
 
-4. **Domain Configuration** (`store/models.go`, `store/schema.sql`)
-   - Added `DANEEnforcement` field to Domain model
-   - Database column: `dane_enforcement TEXT` (values: disabled, optional, required)
-   - Default: "disabled" for backward compatibility
+- `0`: exact selected bytes.
+- `1`: SHA-256.
+- `2`: SHA-512.
 
-## DANE Enforcement Modes
+Malformed fields, unsupported values and invalid hex data are rejected. Usage 0
+and 2 consider appropriate chain candidates; Usage 1 and 3 match the leaf.
 
-### 1. **Disabled** (Default)
-- DANE checks are not performed
-- Standard TLS certificate validation only
-- Most conservative, widely compatible
+## Policy modes
 
-### 2. **Optional**
-- DANE records are checked if present
-- Certificate verification fails gracefully
-- Logs warnings but allows delivery
-- Recommended for gradual rollout
+DANE enforcement is stored on the managed sender-domain record:
 
-### 3. **Required**
-- Must have valid TLSA records
-- Certificate must match DANEF
-- Delivery fails if DANE verification fails
-- Most secure, requires sender domain participation
+- `disabled` — no TLSA lookup; normal SMTP TLS/PKIX policy applies.
+- `optional` — authenticated TLSA is evaluated when available. A lookup,
+  malformed-record or mismatch problem is logged and delivery may fall back to
+  ordinary PKIX according to the outbound TLS policy.
+- `required` — authenticated usable TLSA must exist and authenticate the peer;
+  otherwise delivery fails and retries according to queue classification.
 
-## Current Limitations
+Optional mode intentionally permits downgrade to PKIX if the DANE path is
+unavailable. Use required mode only when DNSSEC and TLSA availability are
+monitored and operationally reliable.
 
-### Go Standard Library Limitation
+## Interaction with MTA-STS
 
-Go's `net` package does not provide native TLSA record lookup. The current implementation:
+MTA-STS and DANE are evaluated as separate transport-policy signals. Neither is
+fabricated when its DNS discovery record is absent. The strictest applicable
+requirement determines whether delivery may proceed. DANE authentication does
+not make an out-of-policy MTA-STS MX name valid.
 
-1. **Returns empty list** from `LookupTLSA()` if system has no TLSA library support
-2. **Requires external library** for full TLSA support: `github.com/miekg/dns`
+## Tests
 
-### Future Enhancement (Priority: Low)
-
-To enable actual TLSA lookups:
+`dns/tlsa_test.go` and `tls/dane_test.go` cover authenticated/unauthenticated
+responses, all four usages, both selectors, all matching types, malformed
+records, leaf/chain handling, PKIX requirements and enforcement behavior.
 
 ```bash
-go get github.com/miekg/dns
+go test ./dns ./tls ./smtp
 ```
 
-Then update `dns/tlsa.go` `LookupTLSA()` function to use `dns.Client` for DNS lookups.
+These deterministic tests do not replace live DNSSEC rollover, resolver outage,
+certificate rotation and external SMTP interoperability exercises.
 
-## Implementation Details
-
-### RFC 6698 Compliance
-
-The implementation follows RFC 6698 specification:
-
-- **SERVERNAME** field in TLSA record matches SMTP server hostname
-- **PORT** always 25 for SMTP
-- **PROTO** always tcp for SMTP
-- Certificate extraction and hashing follows RFC specifications
-- Support for hex-encoded certificate data
-
-### Certificate Matching Logic
-
-The `isDANEMatch()` function implements RFC 6698 §2.4:
-
-1. **Extract certificate data**:
-   - Usage 0 (PKIX-TA): Issuer's public key or certificate
-   - Usage 1 (PKIX-EE): End-entity certificate
-   - Usage 2 (DANE-TA): Trust anchor certificate or key
-   - Usage 3 (DANE-EE): End-entity certificate or key
-
-2. **Hash matching**:
-   - Selector 0: Compare against full certificate
-   - Selector 1: Extract public key and compare
-   - Matching type 0: Exact byte-for-byte match
-   - Matching type 1: Compare SHA-256 hashes
-   - Matching type 2: Compare SHA-512 hashes
-
-### TLS-RPT Integration
-
-DANE verification failures can be recorded for **TLS-RPT** (RFC 8460) reporting:
-
-```go
-// Recorded as failure type "tlsa-invalid-certificate"
-db.RecordTLSFailure(
-    domain,                     // Recipient domain
-    "tlsa-invalid-certificate", // Failure reason
-    clientIP,                   // Sending MTA IP
-    host,                       // Receiving MX hostname
-    ip,                         // Receiving IPv4/IPv6
-)
-```
-
-## Usage
-
-### For End Users
-
-DANE enforcement is configured per sending domain in the admin panel:
-
-1. Navigate to Domain settings
-2. Set "DANE Enforcement" to: Disabled, Optional, or Required
-3. Save settings
-
-### For Administrators
-
-Via database:
-
-```sql
--- Enable DANE enforcement for outbound delivery
-UPDATE domains SET dane_enforcement = 'required' WHERE domain = 'example.com';
-
--- Check current DANE settings for all domains
-SELECT domain, dane_enforcement FROM domains;
-```
-
-### For Developers
-
-Integration point in outbound delivery:
-
-```go
-// Verify DANE after TLS handshake
-daneValid, daneDetails, daneErr := tlsconfig.VerifyDANE(host, clientTLS)
-
-if !daneValid && daneErr == nil {
-    // TLSA records exist but don't match certificate
-    // Handle per enforcement level (disabled/optional/required)
-}
-```
-
-## Testing
-
-### Manual Testing (Local Dev)
-
-1. Build binary: `go build -o gomail .`
-2. No changes needed to `config.dev.json` (DANE disabled by default)
-3. Automatic verification logs to console with `[dane]` prefix
-
-### Expected Log Output
-
-```
-[dane] no TLSA records for mail.example.com (DANE not configured, using standard TLS)
-[dane] DANE verification passed for mail.example.com: Usage 3, Selector 1 matched
-[dane] WARNING: DANE verification failed for mail.example.com: certificate mismatch
-```
-
-### Automated Testing
-
-Currently no unit tests for DANE (awaiting external DNS library). Future testing:
+## Operational checks
 
 ```bash
-# With github.com/miekg/dns installed
-go test -v ./tls -run TestDANEVerification
-go test -v ./dns -run TestTLSALookup
+dig +dnssec TLSA _25._tcp.mail.example.com
+dig +dnssec DNSKEY example.com
 ```
 
-## Security Considerations
+Verify the AD bit through the resolver path actually used by GoMail. Monitor
+DNSSEC signature expiry, TLSA/certificate rotation ordering and repeated lookup
+or mismatch failures. Never publish a new required TLSA pin after replacing the
+certificate; overlap records during controlled rotation.
 
-### DNSSEC trust boundary
+## Known remaining work
 
-GoMail relies on the recursive resolver to validate the DNSSEC chain and requires
-its authenticated-data result. The built-in public resolvers use DNS-over-TLS
-with certificate verification. A custom plain DNS endpoint is safe only on a
-trusted host/network; for a remote resolver configure `host:853#tls-server-name`.
-
-### Certificate Pinning
-
-DANE is effectively certificate pinning via DNS. Benefits:
-
-✅ Pins certificates without hardcoding  
-✅ Domain admin controls pins  
-✅ Reduces X.509 CA compromise risk  
-✅ Hidden from public certificate logs (no pre-issuance logs)  
-
-### Fallback Risks
-
-In "optional" mode, DANE failures deliberately fall back to ordinary PKIX. A
-network that blocks the authenticated TLSA lookup can therefore remove DANE's
-additional protection, but cannot bypass Web PKI validation.
-
-**Mitigation**: Use "required" mode when DANE is critical or monitor logs for failures.
-
-## Future Enhancements
-
-### Phase 3: Per-Domain Configuration
-
-- Admin UI for setting DANE enforcement per recipient domain
-- Policy table: `domain → dane_enforcement` mapping
-- Support DANE for inbound receiving (reverse on MX)
-
-### Phase 4: Advanced Features
-
-- DANE with MTA-STS integration (RFC 8461 + RFC 6698)
-- CAA (Certificate Authority Authorization) checks (RFC 6844)
-- ACME automatic certificate pinning (RFC 8555)
-
-## References
-
-- [RFC 6698 - DANE](https://tools.ietf.org/html/rfc6698) - DNSSEC-based Authentication of Named Entities
-- [RFC 6844 - CAA](https://tools.ietf.org/html/rfc6844) - Certification Authority Authorization
-- [RFC 8460 - TLS-RPT](https://tools.ietf.org/html/rfc8460) - TLS Reporting
-- [RFC 8461 - MTA-STS](https://tools.ietf.org/html/rfc8461) - SMTP MTA Strict Transport Security
+- Broader live resolver and DNSSEC rollover tests.
+- Complete TLS-RPT event/policy accounting for successful and failed DANE paths.
+- Administrative configuration model clarity: enforcement currently belongs to
+  managed sender domains, not arbitrary recipient-policy rows.

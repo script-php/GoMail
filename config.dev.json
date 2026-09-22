@@ -19,6 +19,22 @@
     }
   },
 
+  "mail_clients": {
+    "enabled": false,
+    "read_timeout": 60,
+    "write_timeout": 60,
+    "max_connections": 50,
+    "auth_attempts_per_minute": 10,
+    "pop3": {
+      "enabled": true,
+      "listen_addr": ":995"
+    },
+    "submission": {
+      "enabled": true,
+      "listen_addr": ":587"
+    }
+  },
+
   "tls": {
     "mode": "autocert",
     "cert_file": "",
@@ -45,8 +61,8 @@
     "session_secret": "change-me-to-a-random-64-char-string",
     "session_max_age": 86400,
     "rate_limit_per_minute": 5,
-	"trusted_proxies": [],
-	"external_https": false,
+    "trusted_proxies": [],
+    "external_https": false,
     "bootstrap_admin": {
       "email": "admin@example.com",
       "password_hash": ""
@@ -66,7 +82,13 @@
   },
 
   "security": {
-    "csrf_key": "change-me-to-another-random-32-char-string"
+    "csrf_key": "change-me-to-another-random-32-char-string",
+    "auth_enforcement": "observe",
+    "quarantine_folder": "Spam"
+  },
+
+  "mail": {
+    "strip_originating_ip": false
   },
 
   "mdn": {

@@ -5,7 +5,7 @@ BINARY_NAME=gomail
 RELEASE_DIR=release
 BUILD_DIR=build
 # Keep runtime data and release artifacts out of source-package discovery.
-GO_PACKAGES=. ./auth ./config ./delivery ./dns ./logging ./mdn ./mta_sts ./parser ./reporting ./security ./smtp ./store ./templates ./tls ./web ./web/handlers
+GO_PACKAGES=. ./auth ./config ./delivery ./dns ./logging ./mailclient ./mdn ./mta_sts ./parser ./reporting ./security ./smtp ./store ./templates ./tls ./web ./web/handlers
 
 # Default target
 help:
@@ -32,7 +32,7 @@ clean:
 # Run with dev config
 run:
 	@echo "Running GoMail with config.dev.json..."
-	@$(RELEASE_DIR)/$(BINARY_NAME) -config $(RELEASE_DIR)/config.local.json
+	@$(RELEASE_DIR)/$(BINARY_NAME) -config config.dev.json
 
 # Hash password
 hash:

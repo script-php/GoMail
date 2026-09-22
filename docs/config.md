@@ -23,6 +23,16 @@ GoMail is configured via a single `config.json` file in JSON format.
     }
   },
 
+  "mail_clients": {
+    "enabled": false,
+    "pop3": { "enabled": true, "listen_addr": ":995" },
+    "submission": { "enabled": true, "listen_addr": ":587" },
+    "read_timeout": 60,
+    "write_timeout": 60,
+    "max_connections": 50,
+    "auth_attempts_per_minute": 10
+  },
+
   "tls": {
     "mode": "autocert",
     "cert_file": "",
@@ -34,7 +44,7 @@ GoMail is configured via a single `config.json` file in JSON format.
 
   "dkim": {
     "default_selector": "mail",
-    "default_algorithm": "ed25519",
+    "default_algorithm": "ed25519"
   },
 
   "store": {
@@ -49,6 +59,9 @@ GoMail is configured via a single `config.json` file in JSON format.
     "enable_tls": true,
     "session_secret": "long-random-string-min-32-chars",
     "session_max_age": 86400,
+    "rate_limit_per_minute": 300,
+    "trusted_proxies": [],
+    "external_https": false,
     "bootstrap_admin": {
       "email": "admin@example.com",
       "password_hash": "$2a$10$..."
@@ -58,7 +71,9 @@ GoMail is configured via a single `config.json` file in JSON format.
   "delivery": {
     "queue_workers": 2,
     "retry_intervals": [60, 300, 900],
-    "max_retries": 3
+    "max_retries": 3,
+    "network": "tcp",
+    "enable_verp": true
   },
 
   "dns": {
@@ -69,6 +84,19 @@ GoMail is configured via a single `config.json` file in JSON format.
     "csrf_key": "random-string-min-32-chars",
     "auth_enforcement": "observe",
     "quarantine_folder": "Spam"
+  },
+
+  "mail": {
+    "strip_originating_ip": false
+  },
+
+  "mdn": {
+    "enabled": "no",
+    "mode": "manual"
+  },
+
+  "dmarc": {
+    "send_reports": false
   },
 
   "logging": {
@@ -84,7 +112,7 @@ GoMail is configured via a single `config.json` file in JSON format.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `hostname` | string | `localhost` | Primary hostname (used for Message-ID generation, certificate requests) |
+| `hostname` | string | required | Primary hostname used for SMTP identity, Message-ID generation and certificates |
 
 ### smtp
 
@@ -109,6 +137,36 @@ GoMail is configured via a single `config.json` file in JSON format.
 | `acme_email` | string | `` | Email for Let's Encrypt notifications (required if mode=autocert) |
 | `acme_dir` | string | `./data/certs` | Directory for Let's Encrypt certificates and cache |
 | `min_version` | string | `1.2` | Minimum TLS version (`1.2` or `1.3`) |
+
+### mail_clients
+
+Mail-client access is disabled unless `mail_clients.enabled` is explicitly set
+to `true`. It cannot be enabled with `tls.mode: "none"`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for all mail-client listeners |
+| `pop3.enabled` | bool | `true` when master enabled | Enable POP3 retrieval over implicit TLS |
+| `pop3.listen_addr` | string | `:995` | POP3-over-TLS bind address |
+| `submission.enabled` | bool | `true` when master enabled | Enable authenticated SMTP submission |
+| `submission.listen_addr` | string | `:587` | Submission bind address; STARTTLS is mandatory before AUTH |
+| `read_timeout` | int | `60` | Per-command/data read timeout in seconds |
+| `write_timeout` | int | `60` | Response write timeout in seconds |
+| `max_connections` | int | `50` | Shared concurrent POP3/submission connection limit |
+| `auth_attempts_per_minute` | int | `10` | Shared authentication-attempt limit per client IP |
+
+Use the full mailbox email address and the same bcrypt-backed account password
+used by the web UI. POP3 exposes Inbox only and supports `USER`, `PASS`, `STAT`,
+`LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, and `QUIT`. Deletions are committed
+to GoMail Trash only on a successful `QUIT`. SMTP submission supports `AUTH PLAIN`
+and `AUTH LOGIN` only after STARTTLS, requires the envelope sender and `From`
+header to match the authenticated account, strips `Bcc`, and queues mail through
+the normal DKIM/delivery path.
+
+This first client-access implementation is POP3, not IMAP: POP3 downloads the
+Inbox but does not synchronize folders, flags, drafts, or sent-mail changes.
+Clients needing multi-device folder synchronization should continue to use the
+web UI until a complete IMAP implementation is added.
 
 ### dkim
 
@@ -189,8 +247,11 @@ test instructions.
 | `listen_addr` | string | `:443` | HTTPS bind address |
 | `http_addr` | string | `:80` | HTTP bind address (for redirects and Let's Encrypt validation) |
 | `enable_tls` | bool | `true` | Enable TLS for web interface |
-| `session_secret` | string | `` | Secret for session cookies (min 32 chars, auto-generated if empty) |
+| `session_secret` | string | `` | Reserved compatibility field; sessions currently use random opaque database tokens rather than this value |
 | `session_max_age` | int | `86400` | Session cookie lifetime in seconds (24 hours) |
+| `rate_limit_per_minute` | int | `300` | Per-client non-static HTTP request limit |
+| `trusted_proxies` | string array | `[]` | Immediate proxy IPs/CIDRs allowed to supply forwarded client headers |
+| `external_https` | bool | `false` | Treat requests from trusted proxies as externally HTTPS for cookies/HSTS |
 | `bootstrap_admin.email` | string | `` | Initial admin account email |
 | `bootstrap_admin.password_hash` | string | `` | Bcrypt hash of admin password (generate with `./gomail -hash-password 'password'`) |
 
@@ -198,9 +259,11 @@ test instructions.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `queue_workers` | int | `2` | Parallel workers processing outbound queue |
-| `retry_intervals` | array | `[60, 300, 900]` | Retry delays in seconds (1m, 5m, 15m) |
-| `max_retries` | int | `3` | Max delivery attempts before permanent failure |
+| `queue_workers` | int | `4` | Parallel workers processing outbound queue |
+| `retry_intervals` | array | `[60,300,900,3600,14400,86400]` | Retry delays in seconds |
+| `max_retries` | int | `6` | Max delivery attempts before permanent failure |
+| `network` | string | `tcp` | Outbound network: `tcp`, `tcp4`, or `tcp6` |
+| `enable_verp` | bool | `true` | Use per-recipient bounce envelope addresses |
 
 ### dns
 
@@ -208,13 +271,32 @@ test instructions.
 |-----|------|---------|-------------|
 | `cache_ttl` | int | `300` | DNS cache TTL in seconds (5 minutes) |
 
+### mail
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `strip_originating_ip` | bool | `false` | Omit X-Originating-IP from web-composed mail |
+
+### mdn
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | string | `no` | Enable MDN handling: `yes` or `no` |
+| `mode` | string | `manual` | `manual` prompts the user; `auto` sends automatically |
+
+### dmarc
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `send_reports` | bool | `false` | Enable scheduled DMARC aggregate report generation/delivery |
+
 ### security
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `csrf_key` | string | `` | Secret for CSRF token generation (min 32 chars, auto-generated if empty) |
-| `auth_enforcement` | string | `observe` | Enforce email authentication policies: `none` (skip checks), `observe` (check, don't enforce), `quarantine` (failed auth → Spam folder), `reject` (reject at SMTP) |
-| `quarantine_folder` | string | `Spam` | Mailbox folder name for quarantined emails (when auth_enforcement=quarantine) |
+| `csrf_key` | string | `` | Secret mixed into CSRF tokens; configure a long random value |
+| `auth_enforcement` | string | `observe` | Reserved compatibility setting; current routing follows discovered DMARC policy rather than this value |
+| `quarantine_folder` | string | `Spam` | Reserved folder-name setting; current storage resolves the default `spam` folder type |
 
 ### logging
 
@@ -223,41 +305,18 @@ test instructions.
 | `level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `format` | string | `text` | Log format: `text` or `json` |
 
-## Authentication & Spam Policy
+## Authentication and Spam Routing
 
-### auth_enforcement Modes
+GoMail evaluates SPF, DKIM and DMARC for inbound messages. DMARC passes when an
+aligned SPF result or an aligned passing DKIM signature exists. A DMARC failure
+with discovered `p=quarantine` or `p=reject` is currently accepted and routed to
+Spam; `p=none`, no policy, temporary lookup errors and successful alignment route
+normally. GoMail does not currently issue SMTP 550 solely for `p=reject`.
 
-GoMail validates SPF, DKIM, and DMARC signatures on all inbound emails. The `auth_enforcement` setting controls how strict the server is:
-
-| Mode | Behavior | Policy Result | When to Use |
-|------|----------|-------|-----------|
-| `none` | Skip all auth checks | All emails accepted | Testing, development |
-| `observe` | Check and log, deliver all | Logged for monitoring | Initial deployment, learning phase |
-| `quarantine` | Check, route failures to Spam | DMARC p=quarantine → Spam folder | Most installations, gradual enforcement |
-| `reject` | Reject invalid emails at SMTP | DMARC p=reject → 550 error | Strict security, post-DMARC validation |
-
-#### Example: Quarantine Mode
-
-```json
-{
-  "security": {
-    "auth_enforcement": "quarantine",
-    "quarantine_folder": "Spam"
-  }
-}
-```
-
-When an email arrives:
-- **Passes SPF & DKIM** → Goes to Inbox
-- **Fails SPF/DKIM, DMARC p=reject** → Rejected (550 error, never stored)
-- **Fails SPF/DKIM, DMARC p=quarantine** → Stored in Spam folder
-- **Fails SPF/DKIM, no DMARC policy** → Goes to Inbox (permissive default)
-
-### Recommended Configuration Progression
-
-1. **Week 1 - Observe**: `auth_enforcement: "observe"` — Monitor logs, understand rejection rates
-2. **Week 2 - Quarantine**: `auth_enforcement: "quarantine"` — Route failures to Spam, users can review
-3. **Month 2 - Reject**: `auth_enforcement: "reject"` — Strict enforcement, only after confirming legitimate mail passes
+The `security.auth_enforcement` configuration values are retained for
+compatibility but are not currently used to switch this routing algorithm. Do
+not document or operate them as an SMTP rejection control until the code wires
+that policy explicitly.
 
 ### Mailbox Folders
 
@@ -273,8 +332,6 @@ Each account automatically has:
 | Custom | User | User-created folders (future) |
 
 The `quarantine_folder` config setting only affects folder name; internally it's always the `spam` type.
-
-## Environment Variables
 
 ### Reverse proxy and TLS termination
 
@@ -310,14 +367,8 @@ isolated environment. A restore is not verified until account/message counts,
 attachment hashes, queue state, login, inbound SMTP, and a test outbound delivery
 have all been checked.
 
-Environment variables can override config values:
-
-```bash
-export GOMAIL_SMTP_LISTEN_ADDR=":2525"
-export GOMAIL_TLS_MODE="none"
-export GOMAIL_WEB_SESSION_SECRET="..."
-./gomail -config config.json
-```
+Configuration is read from the JSON file selected by `-config`. GoMail does not
+currently implement general `GOMAIL_*` environment-variable overrides.
 
 ## Generating Passwords
 
@@ -351,7 +402,7 @@ For local testing without TLS:
     "session_secret": "local-test-secret",
     "bootstrap_admin": {
       "email": "admin@localhost",
-      "password_hash": "$2a$10$xKUZqLFPijh5HM52Di6XlOwHMc0ZRwaVOEaZGT/4RnR86dN055.J."
+      "password_hash": "$2a$10$...generated-with-hash-password..."
     }
   }
 }
@@ -409,7 +460,8 @@ Then configure DNS (see [DNS Records Guide](dns_records.md)) and run as systemd 
 - Review logs for ACME errors
 
 ### Session issues
-- Ensure `session_secret` is exactly same across all instances
+- Sessions are opaque random tokens persisted in the selected database
+- Keep `security.csrf_key` stable across restarts
 - Session cookie must be HttpOnly (secure setting, automatic)
 - Check system time is synchronized (NTP)
 
@@ -420,7 +472,7 @@ Then configure DNS (see [DNS Records Guide](dns_records.md)) and run as systemd 
 
 ## Security Notes
 
-- **session_secret** — Use a cryptographically random string (min 32 chars)
+- **session_secret** — Reserved compatibility field; not currently used to sign sessions
 - **csrf_key** — Use a cryptographically random string (min 32 chars)
 - **password_hash** — Always use bcrypt (never plaintext)
 - **acme_email** — Use a valid email for Let's Encrypt notifications
