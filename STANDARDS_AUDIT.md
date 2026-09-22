@@ -87,6 +87,8 @@ remain to be run.
 - Bcrypt account passwords; HTTP-only session cookies; Secure cookies with
   direct HTTPS or configured external HTTPS termination.
 - CSRF checks and account-scoped mailbox operations.
+- Attachment download authorization is joined through the owning account;
+  attachment identifiers alone never authorize file access.
 - Trusted proxy CIDRs are required before forwarded client-address headers are
   honored.
 - Web and SMTP rate limits plus mail-client authentication throttling.

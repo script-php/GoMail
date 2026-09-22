@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -337,6 +338,12 @@ func (h *MessageHandler) SendMDN(w http.ResponseWriter, r *http.Request) {
 
 // DownloadAttachment serves an attachment file.
 func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	idStr := strings.TrimPrefix(r.URL.Path, "/attachment/")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -344,20 +351,27 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Find the attachment
-	// We need to look it up — for simplicity, query by attachment ID
-	var att store.Attachment
-	err = h.db.QueryRow(`
-		SELECT id, message_id, filename, content_type, size, storage_path
-		FROM attachments WHERE id = ?`, id).Scan(
-		&att.ID, &att.MessageID, &att.Filename, &att.ContentType, &att.Size, &att.StoragePath,
-	)
-	if err != nil {
+	att, err := h.db.GetAttachmentForAccount(id, account.ID)
+	if err != nil || att == nil {
 		http.NotFound(w, r)
 		return
 	}
 
-	fullPath := filepath.Join(h.db.AttachmentsPath(), att.StoragePath)
+	basePath, err := filepath.Abs(h.db.AttachmentsPath())
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	fullPath, err := filepath.Abs(filepath.Join(basePath, filepath.Clean(att.StoragePath)))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	relative, err := filepath.Rel(basePath, fullPath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		http.NotFound(w, r)
+		return
+	}
 
 	// Check file exists
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
@@ -365,8 +379,13 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	w.Header().Set("Content-Type", att.ContentType)
-	w.Header().Set("Content-Disposition", "attachment; filename=\""+att.Filename+"\"")
+	contentType := att.ContentType
+	if _, _, err := mime.ParseMediaType(contentType); err != nil {
+		contentType = "application/octet-stream"
+	}
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(att.Filename)})
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", disposition)
 	http.ServeFile(w, r, fullPath)
 }
 

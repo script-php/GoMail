@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"gomail/security"
 	"gomail/store"
@@ -69,4 +70,17 @@ func encodeHeaderValue(value string) string {
 	}
 	// All ASCII: return as-is
 	return value
+}
+
+func originatingHeaders(strip bool, clientIP, hostname, messageID, recipient string, date time.Time) string {
+	var headers strings.Builder
+	if strip {
+		fmt.Fprintf(&headers, "Received: from webmail\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+			hostname, messageID, recipient, date.Format(time.RFC1123Z))
+	} else {
+		fmt.Fprintf(&headers, "Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
+			clientIP, hostname, messageID, recipient, date.Format(time.RFC1123Z))
+		fmt.Fprintf(&headers, "X-Originating-IP: [%s]\r\n", clientIP)
+	}
+	return headers.String()
 }

@@ -513,6 +513,29 @@ func (db *DB) GetAttachments(messageID int64) ([]*Attachment, error) {
 	return attachments, rows.Err()
 }
 
+// GetAttachmentForAccount returns an attachment only when its parent message
+// belongs to the supplied account. The join prevents cross-account access when
+// attachment IDs are guessed or enumerated.
+func (db *DB) GetAttachmentForAccount(attachmentID, accountID int64) (*Attachment, error) {
+	attachment := &Attachment{}
+	err := db.QueryRow(`
+		SELECT a.id, a.message_id, a.filename, a.content_type, a.size, a.storage_path, a.created_at
+		FROM attachments a
+		JOIN messages m ON m.id = a.message_id
+		WHERE a.id = ? AND m.account_id = ?`, attachmentID, accountID).Scan(
+		&attachment.ID, &attachment.MessageID, &attachment.Filename,
+		&attachment.ContentType, &attachment.Size, &attachment.StoragePath,
+		&attachment.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting attachment %d for account: %w", attachmentID, err)
+	}
+	return attachment, nil
+}
+
 // --- Queue CRUD ---
 
 // databaseTime formats timestamps in UTC for both database backends.

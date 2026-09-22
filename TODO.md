@@ -1,5 +1,15 @@
 # Remaining work
 
+## Completed security follow-up (2026-09-23)
+
+- Attachment downloads now join through the owning message/account; guessed IDs
+  return 404 across accounts. Stored paths are confined to `attachments_path`,
+  and download headers use safe media-type formatting.
+- Audited the remaining user-facing ID routes for account scoping.
+- Corrected `strip_originating_ip`: enabled now removes the address from both
+  Received and X-Originating-IP headers.
+- Removed the unused outbound ARC helper that hard-coded authentication passes.
+
 ## Protocol and interoperability
 
 - Complete ARC multi-hop sealing and validation with published vectors and live

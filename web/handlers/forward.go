@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"gomail/auth"
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/security"
@@ -195,25 +194,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	// Build forwarded message
 	var msg strings.Builder
 
-	// Build Received header - show IP only if explicitly enabled
-	var receivedLine string
-	if h.cfg.Mail.StripOriginatingIP {
-		receivedLine = fmt.Sprintf("Received: from webmail (%s)\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
-			clientIP,
-			h.cfg.Server.Hostname,
-			msgID2,
-			to,
-			time.Now().Format(time.RFC1123Z),
-		)
-	} else {
-		receivedLine = fmt.Sprintf("Received: from webmail\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s",
-			h.cfg.Server.Hostname,
-			msgID2,
-			to,
-			time.Now().Format(time.RFC1123Z),
-		)
-	}
-	msg.WriteString(receivedLine + "\r\n")
+	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID2, to, time.Now()))
 
 	// Add Resent- headers (RFC 5322 forwarding convention)
 	// These encode non-ASCII characters if present
@@ -244,33 +225,6 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	// User agent
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
-
-	// Include X-Originating-IP unless disabled in config
-	if !h.cfg.Mail.StripOriginatingIP {
-		msg.WriteString(fmt.Sprintf("X-Originating-IP: [%s]\r\n", clientIP))
-	}
-
-	// Extract existing ARC chain from original message for verification
-	// The original message/rfc822 part preserves the ARC chain intact
-	var messageForARCExtraction []byte
-	if len(originalMsg.RawMessage) > 0 {
-		messageForARCExtraction = originalMsg.RawMessage
-		log.Printf("[forward.Send] checking RawMessage for existing ARC chain (size=%d)", len(originalMsg.RawMessage))
-	} else if len(originalMsg.RawHeaders) > 0 {
-		// Reconstruct minimal message from headers + body for ARC detection
-		messageForARCExtraction = append([]byte(originalMsg.RawHeaders+"\r\n\r\n"), []byte(originalMsg.TextBody)...)
-		log.Printf("[forward.Send] checking reconstructed message for ARC chain")
-	}
-
-	if len(messageForARCExtraction) > 0 {
-		existingInstance := auth.GetHighestArcInstance(messageForARCExtraction)
-		if existingInstance > 0 {
-			// Original message has ARC chain - we'll add i=2+
-			log.Printf("[forward.Send] original message has ARC chain at instance=%d", existingInstance)
-			// Note: The original ARC headers are preserved in the message/rfc822 part
-			// The delivery worker will add new ARC headers at i=2 for this wrapper message
-		}
-	}
 
 	// Generate boundary for multipart message
 	boundary := fmt.Sprintf("boundary_%d", time.Now().UnixNano())

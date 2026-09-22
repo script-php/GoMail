@@ -18,6 +18,9 @@
 - MTA-STS TXT discovery and stricter policy parsing/matching.
 - Removal of unconditional ARC from ordinary outbound mail.
 - Optional POP3-over-TLS and authenticated SMTP submission, disabled by default.
+- Account-scoped attachment downloads with path containment and safe download
+  header formatting; cross-account attachment IDs return 404.
+- Correct originating-IP privacy behavior for both compose and forward paths.
 
 ## Remaining
 
