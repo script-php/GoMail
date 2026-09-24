@@ -7,8 +7,12 @@
         <span id="selection-count" aria-live="polite"></span>
         <button class="toolbar-btn" data-bulk-action="read" disabled>Mark read</button>
         <button class="toolbar-btn" data-bulk-action="unread" disabled>Mark unread</button>
-        <button class="toolbar-btn" data-bulk-action="trash" disabled>Trash</button>
+        {{if .IsTrash}}
+        <button class="toolbar-btn" data-bulk-action="delete" data-confirm-bulk="Permanently delete the selected messages and attachments? This cannot be undone." disabled>Delete forever</button>
         <button class="toolbar-btn" data-bulk-action="restore" disabled>Restore</button>
+        {{else}}
+        <button class="toolbar-btn" data-bulk-action="trash" disabled>Trash</button>
+        {{end}}
         <select id="move-folder" aria-label="Move selected messages to folder" disabled>
             <option value="">Move to…</option>
             {{range .Folders}}{{if ne .FolderType "drafts"}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}

@@ -162,6 +162,13 @@ CREATE TABLE IF NOT EXISTS tls_failures (
     sending_mta_ip      TEXT,               -- Our IP address
     receiving_mx_hostname TEXT,             -- Remote MX hostname
     receiving_ip        TEXT,               -- Remote MX IP
+    successful          INTEGER NOT NULL DEFAULT 0,
+    policy_type         TEXT NOT NULL DEFAULT 'no-policy-found',
+    policy_string       TEXT NOT NULL DEFAULT '[]',
+    policy_domain       TEXT NOT NULL DEFAULT '',
+    mx_host_pattern     TEXT NOT NULL DEFAULT '[]',
+    additional_information TEXT,
+    failure_reason_code TEXT,
     attempted_at        DATETIME NOT NULL DEFAULT (datetime('now')),
     sent_at             DATETIME            -- When this record was included in a sent report (NULL if not yet sent)
 );

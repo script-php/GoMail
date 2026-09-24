@@ -327,8 +327,8 @@ Each account automatically has:
 | Inbox | System | Inbound messages (default) |
 | Sent | System | Outbound messages sent from this account |
 | Spam | System | Quarantined emails (failed authentication) |
-| Drafts | System | Autosaved and explicitly saved compositions |
-| Trash | System | Soft-deleted messages |
+| Drafts | System | Autosaved and explicitly saved compositions; users can permanently delete drafts |
+| Trash | System | Soft-deleted messages; users can restore or permanently delete them |
 | Custom | User | User-created folders (future) |
 
 The `quarantine_folder` config setting only affects folder name; internally it's always the `spam` type.

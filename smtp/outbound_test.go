@@ -3,6 +3,9 @@ package smtp
 import (
 	"bytes"
 	"testing"
+
+	"gomail/dns"
+	"gomail/mta_sts"
 )
 
 func TestWriteSMTPDataDotTransparency(t *testing.T) {
@@ -13,6 +16,26 @@ func TestWriteSMTPDataDotTransparency(t *testing.T) {
 	want := "Subject: test\r\n\r\none\r\n..\r\n...two\r\nlast\r\n.\r\n"
 	if out.String() != want {
 		t.Fatalf("got %q want %q", out.String(), want)
+	}
+}
+
+func TestTLSReportEventsDescribeAppliedPolicies(t *testing.T) {
+	sts := &mta_sts.Policy{Version: "STSv1", Mode: "enforce", MXHosts: []string{"*.example.net"}, MaxAge: 86400}
+	dane := dns.TLSAResult{Authenticated: true, Records: []dns.TLSARecord{{Usage: 3, Selector: 1, MatchingType: 1, CertData: "aabb"}}}
+	events := tlsReportEvents("example.net", "mx.example.net.", nil, sts, dane)
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want STS and TLSA", len(events))
+	}
+	if events[0].PolicyType != "sts" || events[0].PolicyString[2] != "mx: *.example.net" {
+		t.Fatalf("bad STS event: %+v", events[0])
+	}
+	if events[1].PolicyType != "tlsa" || events[1].PolicyString[0] != "3 1 1 aabb" || events[1].PolicyDomain != "mx.example.net" {
+		t.Fatalf("bad TLSA event: %+v", events[1])
+	}
+
+	plain := tlsReportEvents("example.net", "mx.example.net", nil, nil, dns.TLSAResult{})
+	if len(plain) != 1 || plain[0].PolicyType != "no-policy-found" {
+		t.Fatalf("bad no-policy event: %+v", plain)
 	}
 }
 func TestSMTPUTF8Requirement(t *testing.T) {

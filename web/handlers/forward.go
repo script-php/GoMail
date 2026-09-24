@@ -81,22 +81,35 @@ func (h *ForwardHandler) ForwardPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prepare forward form with original message details
+	h.renderForwardForm(w, r, account, originalMsg, "", "", "", "", "", http.StatusOK)
+}
+
+func (h *ForwardHandler) renderForwardForm(w http.ResponseWriter, r *http.Request, account *store.Account, originalMsg *store.Message, errorMessage, to, cc, subject, notes string, status int) {
+	if subject == "" {
+		subject = forwardSubject(originalMsg.Subject)
+	}
+	folders, _ := h.db.ListFolders(account.ID)
 	data := map[string]interface{}{
 		"Section":         "forward",
 		"OriginalMsg":     originalMsg,
 		"OriginalFrom":    originalMsg.FromAddr,
 		"OriginalTo":      originalMsg.ToAddr,
 		"OriginalCC":      originalMsg.CcAddr,
-		"OriginalSubject": "Fwd: " + originalMsg.Subject,
+		"OriginalSubject": subject,
 		"OriginalText":    originalMsg.TextBody,
 		"OriginalHTML":    originalMsg.HTMLBody,
 		"IsHTML":          originalMsg.HTMLBody != "",
 		"Account":         account,
 		"CSRFToken":       h.sessionMgr.GenerateCSRFToken(r),
+		"Folders":         folders,
+		"Error":           errorMessage,
+		"To":              to,
+		"CC":              cc,
+		"ForwardNotes":    notes,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[forward] template error: %v", err)
 	}
@@ -123,10 +136,11 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msgIDStr := r.FormValue("original_message_id")
 	to := r.FormValue("to")
 	cc := r.FormValue("cc")
+	subject := strings.TrimSpace(r.FormValue("subject"))
 	forwardNotes := r.FormValue("forward_notes")
 
-	if msgIDStr == "" || to == "" {
-		http.Error(w, "Message ID and recipient are required", http.StatusBadRequest)
+	if msgIDStr == "" || to == "" || subject == "" {
+		http.Error(w, "Message ID, recipient, and subject are required", http.StatusBadRequest)
 		return
 	}
 
@@ -216,8 +230,8 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if cc != "" {
 		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(cc)))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(originalMsg.Subject)))
-	msg.WriteString(fmt.Sprintf("Date: %s\r\n", originalMsg.ReceivedAt.Format(time.RFC1123Z)))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(subject)))
+	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 
 	// Message-ID for the wrapper message (not the original)
 	// Use msgID2 which was generated for this wrapper message
@@ -234,39 +248,103 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=\"%s\"\r\n", boundary))
 	msg.WriteString("\r\n")
 
-	// Part 1: Forwarding note (if provided)
+	// Part 1 is always a normal text body. Some clients hide message/rfc822 parts,
+	// so include a readable copy of the original message here as well.
+	msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	msg.WriteString("Content-Disposition: inline\r\n")
+	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+	msg.WriteString("\r\n")
 	if forwardNotes != "" {
-		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-		msg.WriteString("Content-Disposition: inline\r\n")
-		msg.WriteString("\r\n")
-		msg.WriteString("--- Forwarded message ---\r\n")
-		msg.WriteString(forwardNotes)
+		msg.WriteString(normalizeBodyLineEndings(forwardNotes))
 		msg.WriteString("\r\n\r\n")
 	}
-
-	// Part 2: Original message as message/rfc822
-	// Build a clean rfc822 message with essential headers and decoded body
-	// (Don't use RawMessage directly - it includes all headers/encoding which displays messily)
-	msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-	msg.WriteString("Content-Type: message/rfc822\r\n")
-	msg.WriteString("Content-Disposition: inline\r\n")
+	msg.WriteString("---------- Forwarded message ----------\r\n")
+	msg.WriteString("From: " + singleLineBodyValue(originalMsg.FromAddr) + "\r\n")
+	msg.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
+	msg.WriteString("Subject: " + singleLineBodyValue(originalMsg.Subject) + "\r\n")
+	msg.WriteString("To: " + singleLineBodyValue(originalMsg.ToAddr) + "\r\n")
+	if originalMsg.CcAddr != "" {
+		msg.WriteString("Cc: " + singleLineBodyValue(originalMsg.CcAddr) + "\r\n")
+	}
+	msg.WriteString("\r\n")
+	if originalMsg.TextBody != "" {
+		msg.WriteString(normalizeBodyLineEndings(originalMsg.TextBody))
+	} else if originalMsg.HTMLBody != "" {
+		msg.WriteString("[The original message contains HTML content. See the attached original message.]\r\n")
+	}
 	msg.WriteString("\r\n")
 
-	// Build clean RFC822 message with just essential headers and decoded body
+	// Part 2 attaches the complete source message. RawMessage preserves the
+	// original MIME structure, headers, and attachments.
+	msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	msg.WriteString("Content-Type: message/rfc822; name=\"forwarded-message.eml\"\r\n")
+	msg.WriteString("Content-Disposition: attachment; filename=\"forwarded-message.eml\"\r\n")
+	msg.WriteString("\r\n")
+	if len(originalMsg.RawMessage) > 0 {
+		msg.WriteString(normalizeBodyLineEndings(string(originalMsg.RawMessage)))
+	} else {
+		msg.WriteString(buildForwardedRFC822(originalMsg))
+	}
+	msg.WriteString("\r\n")
+
+	// End of multipart
+	msg.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
+
+	messageToEnqueue := []byte(msg.String())
+	log.Printf("[forward.Send] final wrapper message size=%d", len(messageToEnqueue))
+
+	// Enqueue for delivery
+	if err := h.queue.Enqueue(from, recipients, messageToEnqueue, account.ID); err != nil {
+		log.Printf("[forward] enqueue error: %v", err)
+		message := "The message could not be queued. Please try again."
+		if strings.Contains(err.Error(), "DKIM") || strings.Contains(err.Error(), "unsigned delivery") {
+			message = "Forwarding is unavailable because DKIM is not configured for your sender domain. An administrator must open Admin → Domains, edit the domain, and generate DKIM keys."
+		}
+		h.renderForwardForm(w, r, account, originalMsg, message, to, cc, subject, forwardNotes, http.StatusUnprocessableEntity)
+		return
+	}
+
+	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
+	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+}
+
+func forwardSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if strings.HasPrefix(strings.ToLower(subject), "fwd:") {
+		return subject
+	}
+	return "Fwd: " + subject
+}
+
+func normalizeBodyLineEndings(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return strings.ReplaceAll(value, "\n", "\r\n")
+}
+
+func singleLineBodyValue(value string) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	return strings.ReplaceAll(value, "\n", " ")
+}
+
+// buildForwardedRFC822 provides a valid fallback for legacy messages whose raw
+// source was not retained. Newer messages use RawMessage above.
+func buildForwardedRFC822(originalMsg *store.Message) string {
+
 	var rfc822Message strings.Builder
 
 	// Essential headers only (From, To, Cc, Date, Subject, Message-ID, Reply-To)
-	rfc822Message.WriteString("From: " + originalMsg.FromAddr + "\r\n")
-	rfc822Message.WriteString("To: " + originalMsg.ToAddr + "\r\n")
+	rfc822Message.WriteString("From: " + encodeHeaderValue(originalMsg.FromAddr) + "\r\n")
+	rfc822Message.WriteString("To: " + encodeHeaderValue(originalMsg.ToAddr) + "\r\n")
 	if originalMsg.CcAddr != "" {
-		rfc822Message.WriteString("Cc: " + originalMsg.CcAddr + "\r\n")
+		rfc822Message.WriteString("Cc: " + encodeHeaderValue(originalMsg.CcAddr) + "\r\n")
 	}
 	if originalMsg.ReplyTo != "" {
-		rfc822Message.WriteString("Reply-To: " + originalMsg.ReplyTo + "\r\n")
+		rfc822Message.WriteString("Reply-To: " + encodeHeaderValue(originalMsg.ReplyTo) + "\r\n")
 	}
 	rfc822Message.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
-	rfc822Message.WriteString("Subject: " + originalMsg.Subject + "\r\n")
+	rfc822Message.WriteString("Subject: " + encodeHeaderValue(originalMsg.Subject) + "\r\n")
 
 	// Message-ID must be wrapped in angle brackets per RFC 5322
 	messageID := originalMsg.MessageID
@@ -289,43 +367,22 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		rfc822Message.WriteString(fmt.Sprintf("--%s\r\n", bodyBoundary))
 		rfc822Message.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 		rfc822Message.WriteString("\r\n")
-		rfc822Message.WriteString(originalMsg.TextBody)
+		rfc822Message.WriteString(normalizeBodyLineEndings(originalMsg.TextBody))
 		rfc822Message.WriteString("\r\n")
 
 		// HTML part
 		rfc822Message.WriteString(fmt.Sprintf("--%s\r\n", bodyBoundary))
 		rfc822Message.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
 		rfc822Message.WriteString("\r\n")
-		rfc822Message.WriteString(originalMsg.HTMLBody)
+		rfc822Message.WriteString(sanitizeHTML(originalMsg.HTMLBody))
 		rfc822Message.WriteString(fmt.Sprintf("\r\n--%s--\r\n", bodyBoundary))
 	} else {
 		// Plain text only
 		rfc822Message.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 		rfc822Message.WriteString("\r\n")
-		rfc822Message.WriteString(originalMsg.TextBody)
+		rfc822Message.WriteString(normalizeBodyLineEndings(originalMsg.TextBody))
 	}
-
-	// Append the clean RFC822 message
-	msg.WriteString(rfc822Message.String())
-
-	// End of multipart
-	msg.WriteString(fmt.Sprintf("\r\n--%s--\r\n", boundary))
-
-	// Build final message to enqueue
-	// The delivery worker will detect this as a forward (has multipart/mixed with message/rfc822)
-	// and add ARC chain appropriately
-	messageToEnqueue := []byte(msg.String())
-	log.Printf("[forward.Send] final wrapper message size=%d", len(messageToEnqueue))
-
-	// Enqueue for delivery
-	if err := h.queue.Enqueue(from, recipients, messageToEnqueue, account.ID); err != nil {
-		log.Printf("[forward] enqueue error: %v", err)
-		http.Error(w, "Failed to forward message", http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
-	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+	return rfc822Message.String()
 }
 
 // escapeHTML escapes text for safe HTML inclusion.

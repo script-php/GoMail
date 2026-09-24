@@ -219,6 +219,7 @@ func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
 		"Account":      account,
 		"Folders":      folders,
 		"ActiveFolder": folderID,
+		"IsTrash":      folder.FolderType == "trash",
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

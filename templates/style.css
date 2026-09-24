@@ -743,3 +743,16 @@ main.with-sidebar { margin-left: var(--sidebar-width); }
     border: 0;
     background: white;
 }
+
+/* ===== USER SETTINGS ===== */
+.settings-container { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+.settings-card { background: var(--card-bg); border: 1px solid var(--border-light); border-radius: 12px; padding: 28px; }
+.settings-card h1 { margin: 0 0 4px; font-size: 24px; }
+.settings-email { color: var(--text-secondary); margin: 0 0 24px; }
+.settings-form { display: grid; gap: 22px; }
+.settings-form fieldset { display: grid; gap: 10px; border: 1px solid var(--border-light); border-radius: 8px; padding: 18px; }
+.settings-form legend { font-weight: 600; padding: 0 6px; }
+.settings-form label { font-weight: 500; }
+.settings-form input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+.settings-form p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.success-notification { padding: 12px 16px; margin-bottom: 16px; color: #137333; background: #e6f4ea; border: 1px solid #34a853; border-radius: var(--radius); }

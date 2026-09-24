@@ -28,10 +28,11 @@
         </div>
         <div class="header-actions">
             {{if .Account}}
-            <a href="/logout" class="header-account" title="Sign out">
+            <a href="/settings" class="header-account" title="Account settings">
                 <span class="header-email">{{.Account.Email}}</span>
                 <div class="avatar">{{avatarInitial .Account.Email}}</div>
             </a>
+            <a href="/logout" class="btn btn-ghost" title="Sign out">Sign out</a>
             {{end}}
         </div>
     </header>
@@ -113,6 +114,14 @@
                 </a>
             </li>
             {{end}}
+            {{end}}
+            {{if not .AdminPanel}}
+            <li class="{{if eq .Section "settings"}}active{{end}}">
+                <a href="/settings">
+                    <span class="nav-icon">&#9881;</span>
+                    <span class="nav-text">Settings</span>
+                </a>
+            </li>
             {{end}}
             {{if and .Account .Account.IsAdmin}}
             <li class="nav-divider"></li>

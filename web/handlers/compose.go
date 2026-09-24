@@ -54,10 +54,9 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 	folders, _ := h.db.ListFolders(account.ID)
 
-	// Check for reply
-	replyTo := r.URL.Query().Get("reply")
 	var prefill map[string]string
 	var draftID int64
+	var replyMessageID int64
 	if raw := r.URL.Query().Get("draft"); raw != "" {
 		if _, err := fmt.Sscan(raw, &draftID); err == nil {
 			draft, _ := h.db.GetMessage(draftID, account.ID)
@@ -68,23 +67,37 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if replyTo != "" {
-		prefill = map[string]string{
-			"to":      r.URL.Query().Get("to"),
-			"subject": r.URL.Query().Get("subject"),
+	if raw := r.URL.Query().Get("reply"); raw != "" {
+		if _, err := fmt.Sscan(raw, &replyMessageID); err == nil {
+			original, _ := h.db.GetMessage(replyMessageID, account.ID)
+			if original != nil {
+				recipient := strings.TrimSpace(original.ReplyTo)
+				if recipient == "" {
+					recipient = original.FromAddr
+				}
+				prefill = map[string]string{
+					"to":       recipient,
+					"subject":  replySubject(original.Subject),
+					"body":     quotedReplyBody(original),
+					"priority": "3",
+				}
+			} else {
+				replyMessageID = 0
+			}
 		}
 	}
 
 	data := map[string]interface{}{
-		"Title":     "Compose",
-		"From":      account.Email,
-		"Unread":    unread,
-		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-		"Section":   "compose",
-		"Prefill":   prefill,
-		"Account":   account,
-		"Folders":   folders,
-		"DraftID":   draftID,
+		"Title":          "Compose",
+		"From":           account.Email,
+		"Unread":         unread,
+		"CSRFToken":      h.sessionMgr.GenerateCSRFToken(r),
+		"Section":        "compose",
+		"Prefill":        prefill,
+		"Account":        account,
+		"Folders":        folders,
+		"DraftID":        draftID,
+		"ReplyMessageID": replyMessageID,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -124,6 +137,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	priority := r.FormValue("priority")
 	readReceipt := r.FormValue("read_receipt") == "1"
 	draftID, _ := strconv.ParseInt(r.FormValue("draft_id"), 10, 64)
+	replyMessageID, _ := strconv.ParseInt(r.FormValue("reply_message_id"), 10, 64)
 	if priority == "" {
 		priority = "3" // Default to Normal
 	}
@@ -175,14 +189,16 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		unread, _ := h.db.CountUnread(account.ID)
 
 		data := map[string]interface{}{
-			"Title":     "Compose",
-			"From":      account.Email,
-			"Unread":    unread,
-			"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-			"Section":   "compose",
-			"Account":   account,
-			"Folders":   folders,
-			"Error":     strings.Join(validationErrors, "; "),
+			"Title":          "Compose",
+			"From":           account.Email,
+			"Unread":         unread,
+			"CSRFToken":      h.sessionMgr.GenerateCSRFToken(r),
+			"Section":        "compose",
+			"Account":        account,
+			"Folders":        folders,
+			"Error":          strings.Join(validationErrors, "; "),
+			"DraftID":        draftID,
+			"ReplyMessageID": replyMessageID,
 			"Prefill": map[string]string{
 				"to":       to,
 				"cc":       cc,
@@ -250,14 +266,16 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		unread, _ := h.db.CountUnread(account.ID)
 
 		data := map[string]interface{}{
-			"Title":     "Compose",
-			"From":      account.Email,
-			"Unread":    unread,
-			"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-			"Section":   "compose",
-			"Account":   account,
-			"Folders":   folders,
-			"Error":     strings.Join(attachmentErrors, "; "),
+			"Title":          "Compose",
+			"From":           account.Email,
+			"Unread":         unread,
+			"CSRFToken":      h.sessionMgr.GenerateCSRFToken(r),
+			"Section":        "compose",
+			"Account":        account,
+			"Folders":        folders,
+			"Error":          strings.Join(attachmentErrors, "; "),
+			"DraftID":        draftID,
+			"ReplyMessageID": replyMessageID,
 			"Prefill": map[string]string{
 				"to":       to,
 				"cc":       cc,
@@ -294,6 +312,20 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(subject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
+	if replyMessageID > 0 {
+		if original, _ := h.db.GetMessage(replyMessageID, account.ID); original != nil && original.MessageID != "" {
+			originalMessageID := strings.TrimSpace(original.MessageID)
+			if !strings.HasPrefix(originalMessageID, "<") {
+				originalMessageID = "<" + originalMessageID + ">"
+			}
+			msg.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", encodeHeaderValue(originalMessageID)))
+			references := strings.TrimSpace(extractHeaderValue(original.RawHeaders, "References"))
+			if references != "" {
+				references += " "
+			}
+			msg.WriteString(fmt.Sprintf("References: %s%s\r\n", encodeHeaderValue(references), encodeHeaderValue(originalMessageID)))
+		}
+	}
 	msg.WriteString(fmt.Sprintf("User-Agent: %s\r\n", config.UserAgent()))
 	msg.WriteString(fmt.Sprintf("X-Priority: %s\r\n", priority))
 	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
@@ -360,6 +392,28 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/sent", http.StatusSeeOther)
 }
 
+func replySubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if strings.HasPrefix(strings.ToLower(subject), "re:") {
+		return subject
+	}
+	return "Re: " + subject
+}
+
+func quotedReplyBody(original *store.Message) string {
+	body := original.TextBody
+	if body == "" && original.HTMLBody != "" {
+		body = "[The original message contains HTML content.]"
+	}
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\r", "\n")
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		lines[i] = "> " + line
+	}
+	return fmt.Sprintf("\n\nOn %s, %s wrote:\n%s", original.ReceivedAt.Format("Mon, 2 Jan 2006 at 15:04"), original.FromAddr, strings.Join(lines, "\n"))
+}
+
 func (h *ComposeHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -386,6 +440,34 @@ func (h *ComposeHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "saved_at": time.Now().Format(time.RFC3339)})
+}
+
+// DeleteDraft permanently deletes an account-owned draft.
+func (h *ComposeHandler) DeleteDraft(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/draft/delete/"), 10, 64)
+	if err != nil || h.db.DeleteDraft(account.ID, id) != nil {
+		http.NotFound(w, r)
+		return
+	}
+	drafts, _ := h.db.GetFolderByType(account.ID, "drafts")
+	if drafts != nil {
+		http.Redirect(w, r, fmt.Sprintf("/folder/%d", drafts.ID), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/inbox", http.StatusSeeOther)
 }
 
 // parseRecipients splits a comma/semicolon-separated list of email addresses.

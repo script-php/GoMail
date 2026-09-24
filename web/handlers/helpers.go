@@ -60,6 +60,9 @@ func getRealClientIP(r *http.Request) string {
 // encodeHeaderValue encodes a header value using RFC 2047 if it contains non-ASCII characters
 // Format: =?UTF-8?B?base64_encoded_value?=
 func encodeHeaderValue(value string) string {
+	// Header values must never be allowed to create additional fields.
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
 	// Check if value contains non-ASCII characters
 	for _, r := range value {
 		if r > 127 {

@@ -293,6 +293,18 @@ func (db *DB) UpdateAccountPassword(id int64, hash string) error {
 	return err
 }
 
+// UpdateAccountProfile updates fields a mailbox owner may change themselves.
+func (db *DB) UpdateAccountProfile(id int64, displayName string) error {
+	result, err := db.Exec(`UPDATE accounts SET display_name = ? WHERE id = ? AND is_active = 1`, displayName, id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // DeleteAccount removes an account.
 func (db *DB) DeleteAccount(id int64) error {
 	_, err := db.Exec(`DELETE FROM accounts WHERE id = ?`, id)

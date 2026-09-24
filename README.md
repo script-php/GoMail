@@ -21,9 +21,10 @@ for the known limits.
 - MTA-STS policy discovery/enforcement and DNSSEC-authenticated DANE/TLSA
   verification for outbound SMTP.
 - SQLite and MySQL storage, default mailbox folders, attachment extraction,
-  search, bulk actions and soft deletion.
+  search, bulk actions, Trash restore and account-scoped permanent deletion.
 - Webmail with Inbox, Sent, Spam, Drafts and Trash. Drafts can be created,
-  resumed and autosaved, and are removed after a successful send.
+  resumed, autosaved and explicitly deleted, and are removed after a successful
+  send. Users can update their display name and password from Settings.
 - Allowlist-based HTML sanitization. Rendered HTML email is placed in a
   sandboxed iframe, isolated from the application document.
 - Admin UI for domains, accounts, DKIM keys, greylisting, tarpitting and report
@@ -41,9 +42,10 @@ for the known limits.
 - ARC parsing/signing/validation code exists, but full multi-hop RFC 8617
   interoperability is not established. GoMail does not add ARC to ordinary
   outbound messages; ARC belongs on a real intermediary/forwarding path.
-- TLS-RPT and DMARC aggregate-report infrastructure exists, but reporting still
-  needs broader event accounting and interoperability coverage.
-- MIME charset/RFC 2231 edge cases, complete SPF DNS subquery accounting,
+- TLS-RPT records success/failure events and groups STS/TLSA/no-policy results;
+  daily scheduling, HTTPS report delivery and broader interoperability coverage
+  remain. DMARC aggregate reporting still needs broader event fields.
+- MIME charset/RFC 2231 edge cases, exhaustive SPF macro/grammar fixtures,
   enhanced status codes and broad live-provider testing remain open work.
 - Quota fields exist, but mailbox quota enforcement is not complete. There is
   no built-in antivirus engine.

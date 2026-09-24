@@ -105,6 +105,7 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 			return SPFNone, "no SPF record found"
 		}
 		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+			recordSPFVoidLookup(ctx)
 			return SPFPermError, fmt.Sprintf("included domain does not exist: %v", err)
 		}
 		return SPFTempError, fmt.Sprintf("temporary DNS lookup failure: %v", err)
@@ -112,7 +113,8 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 
 	var spfRecords []string
 	for _, txt := range txtRecords {
-		if strings.HasPrefix(txt, "v=spf1 ") || txt == "v=spf1" {
+		fields := strings.Fields(txt)
+		if len(fields) > 0 && strings.EqualFold(fields[0], "v=spf1") {
 			spfRecords = append(spfRecords, txt)
 		}
 	}
@@ -137,13 +139,42 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 
 	// First pass: extract modifiers (redirect=, exp=)
 	var mechanisms []string
+	seenModifiers := make(map[string]bool)
 	for _, term := range terms[1:] { // Skip "v=spf1"
-		if strings.HasPrefix(term, "redirect=") {
-			redirectDomain = term[9:]
-		} else if strings.HasPrefix(term, "exp=") {
-			expModifier = term[4:]
-		} else {
-			mechanisms = append(mechanisms, term)
+		if i := strings.IndexByte(term, '='); i >= 0 {
+			name, value := strings.ToLower(term[:i]), term[i+1:]
+			if !validSPFModifierName(name) || value == "" {
+				return SPFPermError, fmt.Sprintf("invalid or duplicate SPF modifier %q", term)
+			}
+			switch name {
+			case "redirect":
+				if seenModifiers[name] {
+					return SPFPermError, "duplicate redirect modifier"
+				}
+				seenModifiers[name] = true
+				redirectDomain = value
+			case "exp":
+				if seenModifiers[name] {
+					return SPFPermError, "duplicate exp modifier"
+				}
+				seenModifiers[name] = true
+				expModifier = value
+			default:
+				// RFC 7208 section 6: unrecognized modifiers are ignored.
+			}
+			continue
+		}
+		mechanisms = append(mechanisms, term)
+	}
+	// RFC 7208 section 4.6 requires syntax validation of the complete record
+	// before interpretation, even when an earlier mechanism would match.
+	for _, term := range mechanisms {
+		mechanism := strings.TrimLeft(term, "+-~?")
+		if len(term)-len(mechanism) > 1 || mechanism == "" {
+			return SPFPermError, fmt.Sprintf("invalid SPF mechanism %q", term)
+		}
+		if err := validateSPFMechanism(normalizeSPFMechanism(mechanism)); err != nil {
+			return SPFPermError, err.Error()
 		}
 	}
 
@@ -167,10 +198,8 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 			qualifier = SPFNeutral
 			mechanism = mechanism[1:]
 		}
+		mechanism = normalizeSPFMechanism(mechanism)
 
-		if err := validateSPFMechanism(mechanism); err != nil {
-			return SPFPermError, err.Error()
-		}
 		matched, mechResult := evaluateMechanism(clientIP, domain, mechanism, ctx, explanation)
 
 		// Handle mechanism-specific error propagation
@@ -209,6 +238,27 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 	return SPFNeutral, fmt.Sprintf("no match in %s", domain)
 }
 
+func normalizeSPFMechanism(mechanism string) string {
+	end := strings.IndexAny(mechanism, ":/")
+	if end < 0 {
+		return strings.ToLower(mechanism)
+	}
+	return strings.ToLower(mechanism[:end]) + mechanism[end:]
+}
+
+func validSPFModifierName(name string) bool {
+	if name == "" || (name[0] < 'a' || name[0] > 'z') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 // evaluateMechanism evaluates a single SPF mechanism.
 // Returns (matched bool, errorResult string). errorResult is non-empty for temperror/permerror.
 func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContext, explanation *string) (bool, string) {
@@ -218,11 +268,11 @@ func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContex
 
 	case mechanism == "a" || strings.HasPrefix(mechanism, "a:") || strings.HasPrefix(mechanism, "a/"):
 		checkDomain, cidr4, cidr6 := parseAMXMechanism(mechanism, "a", domain, ctx)
-		return matchAWithCIDR(clientIP, checkDomain, cidr4, cidr6, ctx), ""
+		return matchAWithCIDR(clientIP, checkDomain, cidr4, cidr6, ctx, true)
 
 	case mechanism == "mx" || strings.HasPrefix(mechanism, "mx:") || strings.HasPrefix(mechanism, "mx/"):
 		checkDomain, cidr4, cidr6 := parseAMXMechanism(mechanism, "mx", domain, ctx)
-		return matchMXWithCIDR(clientIP, checkDomain, cidr4, cidr6, ctx), ""
+		return matchMXWithCIDR(clientIP, checkDomain, cidr4, cidr6, ctx)
 
 	case strings.HasPrefix(mechanism, "ip4:"):
 		cidr := mechanism[4:]
@@ -234,7 +284,7 @@ func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContex
 
 	case strings.HasPrefix(mechanism, "exists:"):
 		queryDomain := expandMacros(mechanism[7:], ctx, false)
-		return matchExists(queryDomain, ctx), ""
+		return matchExists(queryDomain, ctx)
 
 	case strings.HasPrefix(mechanism, "include:"):
 		if ctx.lookups >= 10 {
@@ -262,7 +312,7 @@ func evaluateMechanism(clientIP net.IP, domain, mechanism string, ctx *spfContex
 		if strings.HasPrefix(mechanism, "ptr:") {
 			checkDomain = expandMacros(mechanism[4:], ctx, false)
 		}
-		return matchPTR(clientIP, checkDomain, ctx), ""
+		return matchPTR(clientIP, checkDomain, ctx)
 	}
 
 	return false, "permerror"
@@ -294,7 +344,53 @@ func validateSPFMechanism(mechanism string) error {
 			}
 		}
 	}
+	if base == "include" || base == "exists" {
+		if !strings.HasPrefix(mechanism, base+":") || len(mechanism) == len(base)+1 {
+			return fmt.Errorf("invalid %s mechanism", base)
+		}
+	}
+	if base == "a" || base == "mx" {
+		if err := validateAMXMechanism(mechanism, base); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validateAMXMechanism(mechanism, prefix string) error {
+	rest := strings.TrimPrefix(mechanism, prefix)
+	if rest == "" {
+		return nil
+	}
+	if rest[0] == ':' {
+		rest = rest[1:]
+		if rest == "" || rest[0] == '/' {
+			return fmt.Errorf("invalid %s mechanism", prefix)
+		}
+	} else if rest[0] != '/' {
+		return fmt.Errorf("invalid %s mechanism", prefix)
+	}
+	if i := strings.Index(rest, "//"); i >= 0 {
+		if strings.Contains(rest[i+2:], "/") || !validPrefix(rest[i+2:], 128) {
+			return fmt.Errorf("invalid %s IPv6 CIDR", prefix)
+		}
+		rest = rest[:i]
+	}
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		if !validPrefix(rest[i+1:], 32) {
+			return fmt.Errorf("invalid %s IPv4 CIDR", prefix)
+		}
+		rest = rest[:i]
+	}
+	if strings.Contains(rest, "/") {
+		return fmt.Errorf("invalid %s mechanism", prefix)
+	}
+	return nil
+}
+
+func validPrefix(value string, max int) bool {
+	n, err := strconv.Atoi(value)
+	return err == nil && n >= 0 && n <= max
 }
 
 // parseAMXMechanism parses a or mx mechanism with optional domain and CIDR.
@@ -534,22 +630,16 @@ func expandIP(ip string) string {
 }
 
 // matchAWithCIDR checks if clientIP matches A/AAAA records for domain with CIDR prefix.
-func matchAWithCIDR(clientIP net.IP, domain string, cidr4, cidr6 int, ctx *spfContext) bool {
-	if ctx.lookups >= 10 {
-		return false
+func matchAWithCIDR(clientIP net.IP, domain string, cidr4, cidr6 int, ctx *spfContext, countTerm bool) (bool, string) {
+	if countTerm && !consumeSPFLookup(ctx) {
+		return false, "permerror"
 	}
-	ctx.lookups++
-	addrs, err := net.LookupHost(domain)
+	addrs, err := lookupHost(domain)
 	if err != nil {
-		// RFC 7208 §4.6.4: Track void lookups (NXDOMAIN or empty)
-		ctx.voidLookups++
-		if ctx.voidLookups > 2 {
-			return false // SHOULD limit void lookups to 2
-		}
-		return false
+		return false, classifySPFDNSError(err, ctx)
 	}
 	if len(addrs) == 0 {
-		ctx.voidLookups++
+		return false, recordSPFVoidLookup(ctx)
 	}
 	for _, addr := range addrs {
 		ip := net.ParseIP(addr)
@@ -561,41 +651,36 @@ func matchAWithCIDR(clientIP net.IP, domain string, cidr4, cidr6 int, ctx *spfCo
 			cidr = cidr4
 		}
 		if matchIPWithPrefix(clientIP, ip, cidr) {
-			return true
+			return true, ""
 		}
 	}
-	return false
+	return false, ""
 }
 
 // matchMXWithCIDR checks if clientIP matches any MX host's A/AAAA records with CIDR.
 // RFC 7208 §4.6.4: Limits MX records processed to 10.
-func matchMXWithCIDR(clientIP net.IP, domain string, cidr4, cidr6 int, ctx *spfContext) bool {
-	if ctx.lookups >= 10 {
-		return false
+func matchMXWithCIDR(clientIP net.IP, domain string, cidr4, cidr6 int, ctx *spfContext) (bool, string) {
+	if !consumeSPFLookup(ctx) {
+		return false, "permerror"
 	}
-	ctx.lookups++
-	mxRecords, err := net.LookupMX(domain)
+	mxRecords, err := lookupMX(domain)
 	if err != nil {
-		ctx.voidLookups++
-		return false
+		return false, classifySPFDNSError(err, ctx)
 	}
 	if len(mxRecords) == 0 {
-		ctx.voidLookups++
-		return false
+		return false, recordSPFVoidLookup(ctx)
 	}
-	// RFC 7208 §4.6.4: SHOULD limit MX records to 10
-	maxMX := 10
-	if len(mxRecords) > maxMX {
-		mxRecords = mxRecords[:maxMX]
+	if len(mxRecords) > 10 {
+		return false, "permerror"
 	}
 	for _, mx := range mxRecords {
 		host := strings.TrimSuffix(mx.Host, ".")
-		// A lookup for each MX host counts against limit
-		if matchAWithCIDR(clientIP, host, cidr4, cidr6, ctx) {
-			return true
+		matched, result := matchAWithCIDR(clientIP, host, cidr4, cidr6, ctx, false)
+		if result != "" || matched {
+			return matched, result
 		}
 	}
-	return false
+	return false, ""
 }
 
 // matchIPWithPrefix checks if two IPs are in the same prefix.
@@ -634,41 +719,41 @@ func matchIPWithPrefix(clientIP, recordIP net.IP, prefixLen int) bool {
 }
 
 // matchExists checks if any A record exists for the domain.
-func matchExists(queryDomain string, ctx *spfContext) bool {
-	if ctx.lookups >= 10 {
-		return false
+func matchExists(queryDomain string, ctx *spfContext) (bool, string) {
+	if !consumeSPFLookup(ctx) {
+		return false, "permerror"
 	}
-	ctx.lookups++
-	addrs, err := net.LookupHost(queryDomain)
+	addrs, err := lookupHost(queryDomain)
 	if err != nil {
-		ctx.voidLookups++
-		return false
+		return false, classifySPFDNSError(err, ctx)
 	}
 	if len(addrs) == 0 {
-		ctx.voidLookups++
-		return false
+		return false, recordSPFVoidLookup(ctx)
 	}
-	return true
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			return true, ""
+		}
+	}
+	return false, ""
 }
 
 // matchPTR implements the ptr mechanism (deprecated but required for compatibility).
 // RFC 7208 §5.5: Check if any PTR record for clientIP resolves to a name under checkDomain.
 // Limits PTR records processed to 10 per RFC 7208 §4.6.4.
-func matchPTR(clientIP net.IP, checkDomain string, ctx *spfContext) bool {
-	if ctx.lookups >= 10 {
-		return false
+func matchPTR(clientIP net.IP, checkDomain string, ctx *spfContext) (bool, string) {
+	if !consumeSPFLookup(ctx) {
+		return false, "permerror"
 	}
-	ctx.lookups++
 
 	// Get PTR records for the IP
-	names, err := net.LookupAddr(clientIP.String())
+	names, err := lookupAddr(clientIP.String())
 	if err != nil {
-		ctx.voidLookups++
-		return false
+		// RFC 7208 section 5.5 explicitly makes PTR DNS errors no-match.
+		return false, ""
 	}
 	if len(names) == 0 {
-		ctx.voidLookups++
-		return false
+		return false, recordSPFVoidLookup(ctx)
 	}
 
 	// RFC 7208 §5.5: SHOULD limit PTR records to 10
@@ -684,23 +769,42 @@ func matchPTR(clientIP net.IP, checkDomain string, ctx *spfContext) bool {
 		// Check if name ends with checkDomain or equals checkDomain
 		if name == checkDomain || strings.HasSuffix(name, "."+checkDomain) {
 			// Validate: the name must resolve back to the client IP
-			if ctx.lookups >= 10 {
-				return false
-			}
-			ctx.lookups++
-			addrs, err := net.LookupHost(name)
+			addrs, err := lookupHost(name)
 			if err != nil {
-				ctx.voidLookups++
+				// Forward-confirmation errors skip this name (RFC 7208 section 5.5).
 				continue
 			}
 			for _, addr := range addrs {
 				if net.ParseIP(addr).Equal(clientIP) {
-					return true
+					return true, ""
 				}
 			}
 		}
 	}
-	return false
+	return false, ""
+}
+
+func consumeSPFLookup(ctx *spfContext) bool {
+	if ctx.lookups >= 10 {
+		return false
+	}
+	ctx.lookups++
+	return true
+}
+
+func recordSPFVoidLookup(ctx *spfContext) string {
+	ctx.voidLookups++
+	if ctx.voidLookups > 2 {
+		return "permerror"
+	}
+	return ""
+}
+
+func classifySPFDNSError(err error, ctx *spfContext) string {
+	if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+		return recordSPFVoidLookup(ctx)
+	}
+	return "temperror"
 }
 
 // matchIP checks if clientIP is within the given CIDR or matches the IP.

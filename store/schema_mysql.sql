@@ -170,6 +170,13 @@ CREATE TABLE IF NOT EXISTS tls_failures (
     sending_mta_ip      LONGTEXT,
     receiving_mx_hostname LONGTEXT,
     receiving_ip        LONGTEXT,
+    successful          BOOLEAN NOT NULL DEFAULT FALSE,
+    policy_type         VARCHAR(32) NOT NULL DEFAULT 'no-policy-found',
+    policy_string       VARCHAR(4096) NOT NULL DEFAULT '[]',
+    policy_domain       VARCHAR(253) NOT NULL DEFAULT '',
+    mx_host_pattern     VARCHAR(4096) NOT NULL DEFAULT '[]',
+    additional_information LONGTEXT,
+    failure_reason_code LONGTEXT,
     attempted_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     sent_at             DATETIME
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

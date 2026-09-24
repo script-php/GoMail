@@ -4,6 +4,7 @@
         <div class="compose-header">
             <h2>Forward Message</h2>
         </div>
+        {{if .Error}}<div class="error-notification" role="alert">{{.Error}}</div>{{end}}
         <form method="POST" action="/forward-send">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <input type="hidden" name="original_message_id" value="{{.OriginalMsg.ID}}">
@@ -14,18 +15,18 @@
                 </div>
                 <div class="compose-field">
                     <label for="to">To</label>
-                    <input type="text" id="to" name="to" required placeholder="Recipients">
+                    <input type="text" id="to" name="to" required placeholder="Recipients" value="{{.To}}">
                 </div>
                 <div class="compose-field">
                     <label for="cc">Cc</label>
-                    <input type="text" id="cc" name="cc" placeholder="Cc (optional)">
+                    <input type="text" id="cc" name="cc" placeholder="Cc (optional)" value="{{.CC}}">
                 </div>
                 <div class="compose-field">
                     <label for="subject">Subject</label>
                     <input type="text" id="subject" name="subject" required value="{{.OriginalSubject}}">
                 </div>
                 <textarea id="forward_notes" name="forward_notes" class="compose-textarea" rows="6"
-                          placeholder="Add a note (optional)..." style="min-height:120px"></textarea>
+                          placeholder="Add a note (optional)..." style="min-height:120px">{{.ForwardNotes}}</textarea>
 
                 <div class="original-message">
                     <div class="original-message-header">Original Message</div>

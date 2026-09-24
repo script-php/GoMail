@@ -30,6 +30,8 @@ function updateSelection() {
 function bulkAction(action, folderID) {
     var ids = Array.from(document.querySelectorAll('.email-row input:checked')).map(function(cb) { return Number(cb.closest('.email-row').dataset.id); });
     if (!ids.length) return;
+    var trigger = document.querySelector('[data-bulk-action="' + action + '"]');
+    if (trigger && trigger.dataset.confirmBulk && !window.confirm(trigger.dataset.confirmBulk)) return;
     document.querySelectorAll('[data-bulk-action], #move-folder').forEach(function(el) { el.disabled = true; });
     fetch('/api/messages/action', { method: 'POST', headers: csrfHeaders(), body: JSON.stringify({ ids: ids, action: action, folder_id: Number(folderID || 0) }) })
         .then(checkedResponse).then(function() { location.reload(); })

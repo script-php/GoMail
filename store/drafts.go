@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -36,8 +37,21 @@ func (db *DB) DeleteDraft(accountID, draftID int64) error {
 	if err := db.QueryRow(`SELECT folder_id FROM messages WHERE id=? AND account_id=? AND direction='draft'`, draftID, accountID).Scan(&folderID); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`DELETE FROM messages WHERE id=? AND account_id=? AND direction='draft'`, draftID, accountID); err != nil {
+	attachments, err := db.GetAttachments(draftID)
+	if err != nil {
 		return err
+	}
+	result, err := db.Exec(`DELETE FROM messages WHERE id=? AND account_id=? AND direction='draft'`, draftID, accountID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return sql.ErrNoRows
+	}
+	for _, attachment := range attachments {
+		if fullPath, ok := db.safeAttachmentPath(attachment.StoragePath); ok {
+			_ = os.Remove(fullPath)
+		}
 	}
 	return db.UpdateFolderCounts(folderID)
 }

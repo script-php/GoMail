@@ -119,6 +119,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	messageHandler := handlers.NewMessageHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 	composeHandler := handlers.NewComposeHandler(s.cfg, s.db, s.queue, s.sessionMgr)
 	forwardHandler := handlers.NewForwardHandler(s.cfg, s.db, s.queue, s.sessionMgr)
+	settingsHandler := handlers.NewSettingsHandler(s.db, s.sessionMgr)
 
 	mux.Handle("/", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Welcome)))
 	mux.Handle("/inbox", s.sessionMgr.RequireAuth(http.HandlerFunc(inboxHandler.Inbox)))
@@ -129,13 +130,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.Handle("/message/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.View)))
 	mux.Handle("/message-content/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Content)))
 	mux.Handle("/message/delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.Delete)))
+	mux.Handle("/message/permanent-delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.PermanentDelete)))
 	mux.Handle("/message/star/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.ToggleStar)))
 	mux.Handle("/forward/", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.ForwardPage)))
 	mux.Handle("/forward-send", s.sessionMgr.RequireAuth(http.HandlerFunc(forwardHandler.Send)))
 	mux.Handle("/compose", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.ComposePage)))
 	mux.Handle("/send", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.Send)))
 	mux.Handle("/api/drafts", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.SaveDraft)))
+	mux.Handle("/draft/delete/", s.sessionMgr.RequireAuth(http.HandlerFunc(composeHandler.DeleteDraft)))
 	mux.Handle("/attachment/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.DownloadAttachment)))
+	mux.Handle("/settings", s.sessionMgr.RequireAuth(http.HandlerFunc(settingsHandler.Settings)))
 
 	// API endpoints for JS
 	mux.Handle("/api/mark-read/", s.sessionMgr.RequireAuth(http.HandlerFunc(messageHandler.MarkRead)))

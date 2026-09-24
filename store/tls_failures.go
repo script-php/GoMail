@@ -1,39 +1,93 @@
 package store
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"gomail/logging"
 )
 
-// RecordTLSFailure records a TLS connection failure for TLS-RPT report generation
-func (db *DB) RecordTLSFailure(recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP string) error {
-	_, err := db.Exec(`
-		INSERT INTO tls_failures (recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname, receiving_ip, attempted_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	`, recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP)
+// TLSEvent records one policy evaluation for TLS-RPT aggregation.
+type TLSEvent struct {
+	RecipientDomain       string
+	Successful            bool
+	FailureReason         string
+	SendingMTAIP          string
+	ReceivingMXHostname   string
+	ReceivingIP           string
+	PolicyType            string
+	PolicyString          []string
+	PolicyDomain          string
+	MXHostPattern         []string
+	AdditionalInformation string
+	FailureReasonCode     string
+}
+
+// RecordTLSEvent stores a successful or failed policy evaluation.
+func (db *DB) RecordTLSEvent(event TLSEvent) error {
+	policyString, err := json.Marshal(event.PolicyString)
 	if err != nil {
-		logging.Error(fmt.Sprintf("[store] failed to record TLS failure for %s: %v", recipientDomain, err))
+		return fmt.Errorf("encoding TLS policy: %w", err)
+	}
+	mxPattern, err := json.Marshal(event.MXHostPattern)
+	if err != nil {
+		return fmt.Errorf("encoding TLS MX pattern: %w", err)
+	}
+	if event.PolicyType == "" {
+		event.PolicyType = "no-policy-found"
+	}
+	if event.PolicyDomain == "" {
+		event.PolicyDomain = event.RecipientDomain
+	}
+	_, err = db.Exec(`
+		INSERT INTO tls_failures
+		(recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname,
+		 receiving_ip, successful, policy_type, policy_string, policy_domain,
+		 mx_host_pattern, additional_information, failure_reason_code, attempted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`, event.RecipientDomain, event.FailureReason, event.SendingMTAIP,
+		event.ReceivingMXHostname, event.ReceivingIP, event.Successful,
+		event.PolicyType, string(policyString), event.PolicyDomain, string(mxPattern),
+		event.AdditionalInformation, event.FailureReasonCode)
+	if err != nil {
+		logging.Error(fmt.Sprintf("[store] failed to record TLS event for %s: %v", event.RecipientDomain, err))
 	}
 	return err
 }
 
+// RecordTLSFailure records a TLS connection failure for TLS-RPT report generation
+func (db *DB) RecordTLSFailure(recipientDomain, failureReason, sendingMTAIP, receivingMXHostname, receivingIP string) error {
+	return db.RecordTLSEvent(TLSEvent{RecipientDomain: recipientDomain, FailureReason: failureReason,
+		SendingMTAIP: sendingMTAIP, ReceivingMXHostname: receivingMXHostname,
+		ReceivingIP: receivingIP, PolicyType: "no-policy-found", PolicyDomain: recipientDomain})
+}
+
 // TLSFailureRecord represents a single TLS failure entry
 type TLSFailureRecord struct {
-	RecipientDomain     string
-	FailureReason       string
-	SendingMTAIP        string
-	ReceivingMXHostname string
-	ReceivingIP         string
-	AttemptedAt         time.Time
+	RecipientDomain       string
+	FailureReason         string
+	SendingMTAIP          string
+	ReceivingMXHostname   string
+	ReceivingIP           string
+	AttemptedAt           time.Time
+	Successful            bool
+	PolicyType            string
+	PolicyString          []string
+	PolicyDomain          string
+	MXHostPattern         []string
+	AdditionalInformation string
+	FailureReasonCode     string
 }
 
 // GetTLSFailuresForReport retrieves aggregated TLS failures for a domain within a time range
 // Returns: list of failure records and count summary
 func (db *DB) GetTLSFailuresForReport(domain string, startTime, endTime time.Time) ([]TLSFailureRecord, error) {
 	rows, err := db.Query(`
-		SELECT recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname, receiving_ip, attempted_at
+		SELECT recipient_domain, failure_reason, sending_mta_ip, receiving_mx_hostname,
+		       receiving_ip, attempted_at, successful, policy_type, policy_string,
+		       policy_domain, mx_host_pattern, additional_information, failure_reason_code
 		FROM tls_failures
 		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL
 		ORDER BY attempted_at DESC
@@ -47,9 +101,24 @@ func (db *DB) GetTLSFailuresForReport(domain string, startTime, endTime time.Tim
 	var failures []TLSFailureRecord
 	for rows.Next() {
 		var record TLSFailureRecord
+		var policyString, mxPattern string
+		var additionalInformation, failureReasonCode sql.NullString
 		if err := rows.Scan(&record.RecipientDomain, &record.FailureReason, &record.SendingMTAIP,
-			&record.ReceivingMXHostname, &record.ReceivingIP, &record.AttemptedAt); err != nil {
+			&record.ReceivingMXHostname, &record.ReceivingIP, &record.AttemptedAt,
+			&record.Successful, &record.PolicyType, &policyString, &record.PolicyDomain,
+			&mxPattern, &additionalInformation, &failureReasonCode); err != nil {
 			return nil, err
+		}
+		record.AdditionalInformation = additionalInformation.String
+		record.FailureReasonCode = failureReasonCode.String
+		if err := json.Unmarshal([]byte(policyString), &record.PolicyString); err != nil {
+			return nil, fmt.Errorf("decoding TLS policy string: %w", err)
+		}
+		if err := json.Unmarshal([]byte(mxPattern), &record.MXHostPattern); err != nil {
+			return nil, fmt.Errorf("decoding TLS MX pattern: %w", err)
+		}
+		if record.PolicyDomain == "" {
+			record.PolicyDomain = record.RecipientDomain
 		}
 		failures = append(failures, record)
 	}

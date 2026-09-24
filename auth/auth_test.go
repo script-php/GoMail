@@ -79,10 +79,120 @@ func TestSPFMechanismSyntax(t *testing.T) {
 			t.Errorf("%s: %v", valid, err)
 		}
 	}
-	for _, invalid := range []string{"wat:example.com", "ip4:999.1.1.1", "ip6:192.0.2.1"} {
+	for _, invalid := range []string{"wat:example.com", "ip4:999.1.1.1", "ip6:192.0.2.1", "a/33", "mx//129", "a:", "include:", "exists:"} {
 		if err := validateSPFMechanism(invalid); err == nil {
 			t.Errorf("accepted %s", invalid)
 		}
+	}
+}
+
+func TestSPFDNSMechanismErrorsAndVoidLimit(t *testing.T) {
+	oldTXT, oldHost := lookupTXT, lookupHost
+	t.Cleanup(func() { lookupTXT, lookupHost = oldTXT, oldHost })
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 a -all"}, nil }
+	lookupHost = func(string) ([]string, error) {
+		return nil, &net.DNSError{IsTimeout: true, IsTemporary: true}
+	}
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFTempError {
+		t.Fatalf("A timeout got %s, want temperror", result)
+	}
+
+	lookupTXT = func(string) ([]string, error) {
+		return []string{"v=spf1 exists:one.invalid exists:two.invalid exists:three.invalid -all"}, nil
+	}
+	lookupHost = func(string) ([]string, error) { return nil, &net.DNSError{IsNotFound: true} }
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPermError {
+		t.Fatalf("third void lookup got %s, want permerror", result)
+	}
+}
+
+func TestSPFMXExpansionDoesNotConsumeTermBudget(t *testing.T) {
+	oldTXT, oldHost, oldMX := lookupTXT, lookupHost, lookupMX
+	t.Cleanup(func() { lookupTXT, lookupHost, lookupMX = oldTXT, oldHost, oldMX })
+	lookupTXT = func(name string) ([]string, error) {
+		if name == "example.com" {
+			return []string{"v=spf1 include:n1.test include:n2.test include:n3.test include:n4.test include:n5.test include:n6.test include:n7.test include:n8.test include:n9.test mx -all"}, nil
+		}
+		return []string{"v=spf1 ?all"}, nil
+	}
+	lookupMX = func(string) ([]*net.MX, error) {
+		return []*net.MX{{Host: "mail.example.com."}}, nil
+	}
+	lookupHost = func(name string) ([]string, error) {
+		if name != "mail.example.com" {
+			t.Fatalf("unexpected host lookup %q", name)
+		}
+		return []string{"192.0.2.1"}, nil
+	}
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPass {
+		t.Fatalf("got %s, want pass at exactly ten DNS terms", result)
+	}
+}
+
+func TestSPFMXAndModifierLimits(t *testing.T) {
+	oldTXT, oldMX := lookupTXT, lookupMX
+	t.Cleanup(func() { lookupTXT, lookupMX = oldTXT, oldMX })
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 mx -all"}, nil }
+	lookupMX = func(string) ([]*net.MX, error) {
+		result := make([]*net.MX, 11)
+		for i := range result {
+			result[i] = &net.MX{Host: fmt.Sprintf("mx%d.example.com.", i)}
+		}
+		return result, nil
+	}
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPermError {
+		t.Fatalf("11 MX records got %s, want permerror", result)
+	}
+
+	lookupTXT = func(string) ([]string, error) {
+		return []string{"v=spf1 redirect=one.test redirect=two.test -all"}, nil
+	}
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPermError {
+		t.Fatalf("duplicate modifier got %s, want permerror", result)
+	}
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 future=value future=again -all"}, nil }
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFFail {
+		t.Fatalf("repeated unknown modifier got %s, want fail from -all", result)
+	}
+}
+
+func TestSPFValidatesCompleteRecordBeforeEvaluation(t *testing.T) {
+	old := lookupTXT
+	t.Cleanup(func() { lookupTXT = old })
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 +all a/33"}, nil }
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPermError {
+		t.Fatalf("malformed mechanism after all got %s, want permerror", result)
+	}
+}
+
+func TestSPFTermsAreCaseInsensitive(t *testing.T) {
+	old := lookupTXT
+	t.Cleanup(func() { lookupTXT = old })
+	lookupTXT = func(string) ([]string, error) { return []string{"V=SPF1 IP4:192.0.2.1 -ALL"}, nil }
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPass {
+		t.Fatalf("uppercase SPF terms got %s, want pass", result)
+	}
+}
+
+func TestSPFExistsRequiresIPv4Address(t *testing.T) {
+	oldTXT, oldHost := lookupTXT, lookupHost
+	t.Cleanup(func() { lookupTXT, lookupHost = oldTXT, oldHost })
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 exists:ipv6.example -all"}, nil }
+	lookupHost = func(string) ([]string, error) { return []string{"2001:db8::1"}, nil }
+	if result, _ := CheckSPF("2001:db8::2", "a@example.com"); result != SPFFail {
+		t.Fatalf("exists with only AAAA got %s, want fail", result)
+	}
+}
+
+func TestSPFPTRDNSErrorIsNoMatch(t *testing.T) {
+	oldTXT, oldAddr := lookupTXT, lookupAddr
+	t.Cleanup(func() { lookupTXT, lookupAddr = oldTXT, oldAddr })
+	lookupTXT = func(string) ([]string, error) { return []string{"v=spf1 ptr -all"}, nil }
+	lookupAddr = func(string) ([]string, error) {
+		return nil, &net.DNSError{IsTimeout: true, IsTemporary: true}
+	}
+	if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFFail {
+		t.Fatalf("PTR DNS error got %s, want no-match followed by fail", result)
 	}
 }
 

@@ -176,6 +176,35 @@ func (h *MessageHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/inbox", http.StatusSeeOther)
 }
 
+// PermanentDelete irreversibly removes a message that is already in Trash.
+func (h *MessageHandler) PermanentDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	idText := strings.TrimPrefix(r.URL.Path, "/message/permanent-delete/")
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || h.db.PermanentlyDeleteMessages(account.ID, []int64{id}) != nil {
+		http.NotFound(w, r)
+		return
+	}
+	trash, _ := h.db.GetFolderByType(account.ID, "trash")
+	if trash != nil {
+		http.Redirect(w, r, fmt.Sprintf("/folder/%d", trash.ID), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+}
+
 // ToggleStar toggles the starred status.
 func (h *MessageHandler) ToggleStar(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -439,7 +468,13 @@ func (h *MessageHandler) BulkAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	if err := h.db.ApplyMessageAction(account.ID, request.IDs, request.Action, request.FolderID); err != nil {
+	var err error
+	if request.Action == "delete" {
+		err = h.db.PermanentlyDeleteMessages(account.ID, request.IDs)
+	} else {
+		err = h.db.ApplyMessageAction(account.ID, request.IDs, request.Action, request.FolderID)
+	}
+	if err != nil {
 		http.Error(w, "Unable to update selection: check messages and destination", http.StatusBadRequest)
 		return
 	}

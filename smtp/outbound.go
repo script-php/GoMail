@@ -69,9 +69,11 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 				// Enforce mode: skip hosts not in policy and require TLS
 				if !hostAllowed {
 					log.Printf("[mta-sts] MX host %s not in policy for %s, skipping", mx.Host, recipientDomain)
+					recordTLSResults(db, tlsReportEvents(recipientDomain, mx.Host, nil, policy, godns.TLSAResult{}), false,
+						"validation-failure", "MX hostname is not permitted by the MTA-STS policy")
 					continue
 				}
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, true, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain, policy)
 				if err == nil {
 					return nil // Success
 				}
@@ -82,7 +84,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 				if !hostAllowed {
 					log.Printf("[mta-sts] TESTING: MX host %s not in policy for %s, but attempting anyway", mx.Host, recipientDomain)
 				}
-				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
+				err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain, policy)
 				if err == nil {
 					log.Printf("[mta-sts] TESTING delivery to %s succeeded", mx.Host)
 					return nil
@@ -92,7 +94,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			}
 		} else {
 			// No policy or mode=none: use normal delivery with original requireTLS setting
-			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain)
+			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, senderDomain, nil)
 			if err == nil {
 				return nil // Success
 			}
@@ -110,7 +112,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 // db: database for recording TLS failures (optional, can be nil)
 // recipientDomain: recipient domain for TLS failure reporting (optional, used only if db != nil)
 // senderDomain: sender domain for DANE/TLS enforcement settings lookup
-func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, senderDomain string) error {
+func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, senderDomain string, stsPolicy *mta_sts.Policy) error {
 	// Connect to port 25
 	addr := host + ":25"
 	conn, err := net.DialTimeout(network, addr, 30*time.Second)
@@ -156,12 +158,15 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 	if daneEnforcement != "disabled" {
 		daneLookup, err = godns.LookupTLSA(host)
 		if err != nil && daneEnforcement == "required" {
+			recordTLSResults(db, tlsReportEvents(recipientDomain, host, conn, stsPolicy, daneLookup), false, "dnssec-invalid", err.Error())
 			return fmt.Errorf("DANE DNSSEC lookup required for %s: %w", host, err)
 		}
 		if err == nil && len(daneLookup.Records) == 0 && daneEnforcement == "required" {
+			recordTLSResults(db, tlsReportEvents(recipientDomain, host, conn, stsPolicy, daneLookup), false, "dane-required", "no authenticated TLSA records")
 			return fmt.Errorf("DANE required but no authenticated TLSA records exist for %s", host)
 		}
 	}
+	reportEvents := tlsReportEvents(recipientDomain, host, conn, stsPolicy, daneLookup)
 
 	// Try STARTTLS if supported
 	if strings.Contains(ehloReply, "STARTTLS") && tlsCfg != nil {
@@ -209,11 +214,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 								failureReason = "certificate-host-mismatch"
 							}
 						}
-						clientIP := "unknown"
-						if conn.LocalAddr() != nil {
-							clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
-						}
-						_ = db.RecordTLSFailure(recipientDomain, failureReason, clientIP, host, strings.Split(addr, ":")[0])
+						recordTLSResults(db, reportEvents, false, failureReason, err.Error())
 					}
 
 					if requireTLS {
@@ -227,11 +228,6 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					// Only query DANE if enforcement is not disabled (avoid unnecessary DNS queries)
 					if daneEnforcement != "disabled" {
 						daneValid, daneDetails, daneErr := tlsconfig.VerifyDANE(host, clientTLS)
-						clientIP := "unknown"
-						if conn.LocalAddr() != nil {
-							clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
-						}
-
 						if daneErr != nil {
 							log.Printf("[dane] DANE verification lookup failed for %s: %v", host, daneErr)
 							if daneEnforcement == "required" {
@@ -246,8 +242,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 							if daneEnforcement == "required" {
 								// Record DANE verification failure for TLS-RPT reporting
 								if db != nil && recipientDomain != "" {
-									_ = db.RecordTLSFailure(recipientDomain, "tlsa-missing", clientIP, host,
-										strings.Split(addr, ":")[0])
+									recordTLSResults(db, reportEvents, false, "dane-required", "no authenticated TLSA records")
 									log.Printf("[dane] DANE enforcement REQUIRED: no TLSA records found, recorded failure for TLS-RPT")
 								}
 								return fmt.Errorf("DANE verification required but no TLSA records found for %s", host)
@@ -258,15 +253,12 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 						} else {
 							// TLSA records exist but certificate doesn't match
 							log.Printf("[dane] WARNING: DANE verification failed for %s: %s", host, daneDetails)
+							recordTLSResults(db, filterTLSReportEvents(reportEvents, "tlsa"), false, "tlsa-invalid", daneDetails)
+							reportEvents = excludeTLSReportEvents(reportEvents, "tlsa")
 
 							// Handle DANE enforcement level
 							if daneEnforcement == "required" {
-								// Record DANE verification failure for TLS-RPT reporting
-								if db != nil && recipientDomain != "" {
-									_ = db.RecordTLSFailure(recipientDomain, "tlsa-invalid-certificate", clientIP, host,
-										strings.Split(addr, ":")[0])
-									log.Printf("[dane] DANE enforcement REQUIRED: recorded failure for TLS-RPT")
-								}
+								log.Printf("[dane] DANE enforcement REQUIRED: recorded failure for TLS-RPT")
 								return fmt.Errorf("DANE verification required but failed for %s: %s", host, daneDetails)
 							} else if daneEnforcement == "optional" {
 								// Log warning but continue - allow fallback to standard TLS
@@ -276,6 +268,7 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 					} else {
 						log.Printf("[dane] DANE verification disabled for %s (skipping TLSA queries)", host)
 					}
+					recordTLSResults(db, reportEvents, true, "", "")
 
 					// Re-EHLO after STARTTLS and update DSN/UTF8 support flags
 					if err := sendCmd(conn, fmt.Sprintf("EHLO %s", myHostname)); err == nil {
@@ -287,16 +280,11 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 				}
 			}
 		}
-	} else if requireTLS && !strings.Contains(ehloReply, "STARTTLS") {
-		// TLS required but server doesn't support STARTTLS
-		if db != nil && recipientDomain != "" {
-			clientIP := "unknown"
-			if conn.LocalAddr() != nil {
-				clientIP = strings.Split(conn.LocalAddr().String(), ":")[0]
-			}
-			_ = db.RecordTLSFailure(recipientDomain, "connection-refused", clientIP, host, strings.Split(addr, ":")[0])
+	} else if !strings.Contains(ehloReply, "STARTTLS") {
+		recordTLSResults(db, reportEvents, false, "starttls-not-supported", "STARTTLS was not advertised")
+		if requireTLS {
+			return fmt.Errorf("TLS required but %s does not support STARTTLS", host)
 		}
-		return fmt.Errorf("TLS required but %s does not support STARTTLS", host)
 	}
 
 	// MAIL FROM with SMTPUTF8 parameter (if supported)
@@ -445,6 +433,84 @@ func matchSTSMX(host, pattern string) bool {
 	suffix := pattern[1:]
 	prefix := strings.TrimSuffix(host, suffix)
 	return strings.HasSuffix(host, suffix) && prefix != "" && !strings.Contains(prefix, ".")
+}
+
+func tlsReportEvents(recipientDomain, host string, conn net.Conn, stsPolicy *mta_sts.Policy, dane godns.TLSAResult) []store.TLSEvent {
+	base := store.TLSEvent{RecipientDomain: recipientDomain, PolicyDomain: recipientDomain,
+		ReceivingMXHostname: strings.TrimSuffix(host, ".")}
+	if conn != nil {
+		base.SendingMTAIP = addressIP(conn.LocalAddr())
+		base.ReceivingIP = addressIP(conn.RemoteAddr())
+	}
+	var events []store.TLSEvent
+	if stsPolicy != nil && stsPolicy.Mode != "none" {
+		event := base
+		event.PolicyType = "sts"
+		event.MXHostPattern = append([]string(nil), stsPolicy.MXHosts...)
+		event.PolicyString = []string{fmt.Sprintf("version: %s", stsPolicy.Version), fmt.Sprintf("mode: %s", stsPolicy.Mode)}
+		for _, mx := range stsPolicy.MXHosts {
+			event.PolicyString = append(event.PolicyString, "mx: "+mx)
+		}
+		event.PolicyString = append(event.PolicyString, fmt.Sprintf("max_age: %d", stsPolicy.MaxAge))
+		events = append(events, event)
+	}
+	if dane.Authenticated && len(dane.Records) > 0 {
+		event := base
+		event.PolicyType = "tlsa"
+		event.PolicyDomain = strings.TrimSuffix(host, ".")
+		for _, record := range dane.Records {
+			event.PolicyString = append(event.PolicyString, fmt.Sprintf("%d %d %d %s", record.Usage, record.Selector, record.MatchingType, record.CertData))
+		}
+		events = append(events, event)
+	}
+	if len(events) == 0 {
+		base.PolicyType = "no-policy-found"
+		events = append(events, base)
+	}
+	return events
+}
+
+func recordTLSResults(db *store.DB, events []store.TLSEvent, successful bool, resultType, reason string) {
+	if db == nil {
+		return
+	}
+	for _, event := range events {
+		event.Successful = successful
+		event.FailureReason = resultType
+		event.FailureReasonCode = reason
+		_ = db.RecordTLSEvent(event)
+	}
+}
+
+func filterTLSReportEvents(events []store.TLSEvent, policyType string) []store.TLSEvent {
+	var filtered []store.TLSEvent
+	for _, event := range events {
+		if event.PolicyType == policyType {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
+func excludeTLSReportEvents(events []store.TLSEvent, policyType string) []store.TLSEvent {
+	var filtered []store.TLSEvent
+	for _, event := range events {
+		if event.PolicyType != policyType {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
+func addressIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 func has8Bit(data []byte) bool {

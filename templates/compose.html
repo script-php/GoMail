@@ -12,6 +12,7 @@
         <form method="POST" action="/send" enctype="multipart/form-data" id="compose-form">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 			<input type="hidden" id="draft_id" name="draft_id" value="{{.DraftID}}">
+            <input type="hidden" name="reply_message_id" value="{{.ReplyMessageID}}">
             <div class="compose-body">
                 <div class="compose-field">
                     <label for="from">From</label>
@@ -67,6 +68,7 @@
             <div class="compose-actions">
 				<span id="draft-status" role="status" aria-live="polite"></span>
 				<button type="button" class="btn btn-secondary" id="save-draft">Save draft</button>
+                {{if .DraftID}}<button type="submit" class="btn btn-danger" formaction="/draft/delete/{{.DraftID}}" formmethod="POST" formnovalidate data-confirm-delete="Permanently delete this draft? This cannot be undone.">Delete draft</button>{{end}}
                 <button type="submit" class="btn btn-primary">Send</button>
                 <a href="/inbox" class="btn btn-ghost">Discard</a>
             </div>

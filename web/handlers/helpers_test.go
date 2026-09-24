@@ -17,3 +17,10 @@ func TestOriginatingHeadersPrivacySetting(t *testing.T) {
 		t.Fatalf("privacy setting leaked client address: %q", stripped)
 	}
 }
+
+func TestEncodeHeaderValuePreventsHeaderInjection(t *testing.T) {
+	got := encodeHeaderValue("hello\r\nBcc: attacker@example.net")
+	if strings.ContainsAny(got, "\r\n") || !strings.Contains(got, "Bcc: attacker@example.net") {
+		t.Fatalf("unsafe or unexpected header value: %q", got)
+	}
+}

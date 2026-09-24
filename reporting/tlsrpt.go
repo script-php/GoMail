@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,50 +76,78 @@ func GenerateTLSReport(db *store.DB, ourHostname string, domain string, startTim
 	}
 
 	if len(failures) == 0 {
-		return nil, fmt.Errorf("no TLS failures found for %s", domain)
+		return nil, fmt.Errorf("no TLS events found for %s", domain)
 	}
 
-	// Group failures by reason
-	reasonCounts := make(map[string]int)
-	reasonDetails := make(map[string][]TLSFailure)
-
-	for _, failure := range failures {
-		reasonCounts[failure.FailureReason]++
-		reasonDetails[failure.FailureReason] = append(reasonDetails[failure.FailureReason], TLSFailure{
-			ResultType:          failure.FailureReason,
-			SendingMTAIP:        failure.SendingMTAIP,
-			ReceivingMXHostname: failure.ReceivingMXHostname,
-			ReceivingIP:         failure.ReceivingIP,
-			FailedSessionCount:  1,
-		})
+	type policyGroup struct {
+		policy   TLSPolicy
+		failures map[string]*TLSFailure
+		mx       map[string]bool
 	}
-
-	// Build policy entry
-	policy := TLSPolicy{
-		Policy: TLSPolicyDesc{
-			PolicyType:   "tlsa", // DANE policy type
-			PolicyDomain: domain,
-			PolicyString: []string{"tlsa"}, // Indicate that failures are TLSA-related
-		},
-		Summary: TLSPolicySummary{
-			TotalSuccessfulSessionCount: 0, // We only track failures
-			TotalFailureSessionCount:    len(failures),
-		},
-	}
-
-	// Aggregate failure details by reason
-	for reason, details := range reasonDetails {
-		aggregatedFailure := TLSFailure{
-			ResultType:         reason,
-			FailedSessionCount: len(details),
+	groups := make(map[string]*policyGroup)
+	for _, event := range failures {
+		desc := TLSPolicyDesc{PolicyType: event.PolicyType, PolicyString: event.PolicyString,
+			PolicyDomain: event.PolicyDomain, MXHost: event.MXHostPattern}
+		if desc.PolicyType == "" {
+			desc.PolicyType = "no-policy-found"
 		}
-		// Use first detail's info if available
-		if len(details) > 0 {
-			aggregatedFailure.SendingMTAIP = details[0].SendingMTAIP
-			aggregatedFailure.ReceivingMXHostname = details[0].ReceivingMXHostname
-			aggregatedFailure.ReceivingIP = details[0].ReceivingIP
+		if desc.PolicyDomain == "" {
+			desc.PolicyDomain = domain
 		}
-		policy.FailureDetails = append(policy.FailureDetails, aggregatedFailure)
+		keyBytes, _ := json.Marshal(struct {
+			Type   string
+			Text   []string
+			Domain string
+		}{desc.PolicyType, desc.PolicyString, desc.PolicyDomain})
+		key := string(keyBytes)
+		group := groups[key]
+		if group == nil {
+			group = &policyGroup{policy: TLSPolicy{Policy: desc}, failures: make(map[string]*TLSFailure), mx: make(map[string]bool)}
+			groups[key] = group
+		}
+		for _, mx := range event.MXHostPattern {
+			group.mx[mx] = true
+		}
+		if event.Successful {
+			group.policy.Summary.TotalSuccessfulSessionCount++
+			continue
+		}
+		group.policy.Summary.TotalFailureSessionCount++
+		detail := TLSFailure{ResultType: event.FailureReason, SendingMTAIP: event.SendingMTAIP,
+			ReceivingMXHostname: event.ReceivingMXHostname, ReceivingIP: event.ReceivingIP,
+			AdditionalInformation: event.AdditionalInformation, FailureReasonCode: event.FailureReasonCode}
+		detailKeyBytes, _ := json.Marshal(detail)
+		detailKey := string(detailKeyBytes)
+		if existing := group.failures[detailKey]; existing != nil {
+			existing.FailedSessionCount++
+		} else {
+			detail.FailedSessionCount = 1
+			group.failures[detailKey] = &detail
+		}
+	}
+
+	groupKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		groupKeys = append(groupKeys, key)
+	}
+	sort.Strings(groupKeys)
+	policies := make([]TLSPolicy, 0, len(groupKeys))
+	for _, key := range groupKeys {
+		group := groups[key]
+		group.policy.Policy.MXHost = group.policy.Policy.MXHost[:0]
+		for mx := range group.mx {
+			group.policy.Policy.MXHost = append(group.policy.Policy.MXHost, mx)
+		}
+		sort.Strings(group.policy.Policy.MXHost)
+		failureKeys := make([]string, 0, len(group.failures))
+		for failureKey := range group.failures {
+			failureKeys = append(failureKeys, failureKey)
+		}
+		sort.Strings(failureKeys)
+		for _, failureKey := range failureKeys {
+			group.policy.FailureDetails = append(group.policy.FailureDetails, *group.failures[failureKey])
+		}
+		policies = append(policies, group.policy)
 	}
 
 	// Build report
@@ -131,7 +160,7 @@ func GenerateTLSReport(db *store.DB, ourHostname string, domain string, startTim
 		},
 		ContactInfo: fmt.Sprintf("postmaster@%s", ourHostname),
 		ReportID:    reportID,
-		Policies:    []TLSPolicy{policy},
+		Policies:    policies,
 	}
 
 	return report, nil
@@ -204,18 +233,31 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 	gzipWriter.Close()
 
 	// Base64 encode the compressed data
-	encodedReport := base64.StdEncoding.EncodeToString(compressedBuf.Bytes())
+	encodedReport := foldBase64(base64.StdEncoding.EncodeToString(compressedBuf.Bytes()))
+	policyDomain := "unknown"
+	totalFailures := 0
+	if len(report.Policies) > 0 {
+		policyDomain = report.Policies[0].Policy.PolicyDomain
+	}
+	for _, policy := range report.Policies {
+		totalFailures += policy.Summary.TotalFailureSessionCount
+	}
+	start, _ := time.Parse(time.RFC3339, report.DateRange.StartDatetime)
+	end, _ := time.Parse(time.RFC3339, report.DateRange.EndDatetime)
+	filename := fmt.Sprintf("%s!%s!%d!%d.json.gz", ourHostname, policyDomain, start.Unix(), end.Unix())
 
 	// Build multipart email with gzip-compressed JSON report as attachment
 	boundary := "boundary_tlsrpt"
 	message := fmt.Sprintf(
 		"From: %s\r\n"+
 			"To: %s\r\n"+
-			"Subject: TLS Report for %s\r\n"+
+			"Subject: Report Domain: %s Submitter: %s Report-ID: <%s>\r\n"+
 			"Date: %s\r\n"+
 			"Message-ID: <%s@%s>\r\n"+
+			"TLS-Report-Domain: %s\r\n"+
+			"TLS-Report-Submitter: %s\r\n"+
 			"MIME-Version: 1.0\r\n"+
-			"Content-Type: multipart/mixed; boundary=\"%s\"\r\n"+
+			"Content-Type: multipart/report; report-type=\"tlsrpt\"; boundary=\"%s\"\r\n"+
 			"\r\n"+
 			"--%s\r\n"+
 			"Content-Type: text/plain; charset=UTF-8\r\n"+
@@ -225,28 +267,44 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 			"Failures recorded: %d\r\n"+
 			"\r\n"+
 			"--%s\r\n"+
-			"Content-Type: application/gzip; name=\"report.json.gz\"\r\n"+
+			"Content-Type: application/tlsrpt+gzip\r\n"+
 			"Content-Transfer-Encoding: base64\r\n"+
-			"Content-Disposition: attachment; filename=\"report.json.gz\"\r\n"+
+			"Content-Disposition: attachment; filename=\"%s\"\r\n"+
 			"\r\n"+
 			"%s\r\n"+
 			"--%s--\r\n",
 		senderEmail,
 		recipientEmail,
-		report.Policies[0].Policy.PolicyDomain,
+		policyDomain,
+		ourHostname,
+		report.ReportID,
 		time.Now().Format(time.RFC1123Z),
 		report.ReportID,
 		ourHostname,
+		policyDomain,
+		ourHostname,
 		boundary,
 		boundary,
-		report.Policies[0].Policy.PolicyDomain,
+		policyDomain,
 		report.DateRange.StartDatetime,
 		report.DateRange.EndDatetime,
-		report.Policies[0].Summary.TotalFailureSessionCount,
+		totalFailures,
 		boundary,
+		filename,
 		encodedReport,
 		boundary,
 	)
 
 	return message
+}
+
+func foldBase64(value string) string {
+	var result strings.Builder
+	for len(value) > 76 {
+		result.WriteString(value[:76])
+		result.WriteString("\r\n")
+		value = value[76:]
+	}
+	result.WriteString(value)
+	return result.String()
 }

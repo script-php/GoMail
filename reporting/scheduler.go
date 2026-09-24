@@ -518,11 +518,10 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 
 	// Use our organization's domain as sender
 	senderEmail := fmt.Sprintf("postmaster@%s", cfg.Server.Domain)
-	messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, recipientEmails[0])
-
 	// Send to each recipient address
 	sentCount := 0
 	for _, recipientEmail := range recipientEmails {
+		messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, recipientEmail)
 		if err := enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
 			logging.Error(fmt.Sprintf("[tls-rpt] failed to enqueue report for %s -> %s: %v", domain, recipientEmail, err))
 		} else {
@@ -542,7 +541,11 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 		// Non-fatal error, report was sent successfully
 	}
 
+	totalFailures := 0
+	for _, policy := range report.Policies {
+		totalFailures += policy.Summary.TotalFailureSessionCount
+	}
 	logging.Info(fmt.Sprintf("[tls-rpt] generated and queued TLS-RPT report for %s (%d recipients, %d failures)",
-		domain, len(recipientEmails), report.Policies[0].Summary.TotalFailureSessionCount))
+		domain, len(recipientEmails), totalFailures))
 	return true
 }
