@@ -1,29 +1,64 @@
 {{define "content"}}
 <div class="settings-container">
-    <div class="settings-card">
-        <h1>Account settings</h1>
-        <p class="settings-email">{{.Account.Email}}</p>
-        {{if .Error}}<div class="error-notification" role="alert">{{.Error}}</div>{{end}}
-        {{if .Success}}<div class="success-notification" role="status">{{.Success}}</div>{{end}}
+    <header class="settings-page-heading">
+        <h1>Account settings</h1><p>{{.Account.Email}}</p>
+        <p class="settings-usage"><strong>Mailbox usage</strong><span>{{formatSize .Account.MailboxUsedBytes}} of {{if .Account.QuotaBytes}}{{formatSize .Account.QuotaBytes}}{{else}}unlimited{{end}}</span></p>
+    </header>
+    {{if .Error}}<div class="error-notification" role="alert">{{.Error}}</div>{{end}}
+    {{if .Success}}<div class="success-notification" role="status">{{.Success}}</div>{{end}}
+    <section class="settings-card" aria-labelledby="profile-title">
+        <div class="settings-section-heading"><h2 id="profile-title">Profile &amp; password</h2><p>Update your display name or change the password you use to sign in.</p></div>
         <form method="POST" action="/settings" class="settings-form">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-            <fieldset>
-                <legend>Profile</legend>
-                <label for="display_name">Display name</label>
-                <input id="display_name" name="display_name" type="text" maxlength="100" value="{{.Account.DisplayName}}" autocomplete="name">
+            <div class="settings-field"><label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" maxlength="100" value="{{.Account.DisplayName}}" autocomplete="name"></div>
+            <fieldset class="settings-group"><legend>Change password</legend><p class="settings-help">Leave all three fields empty to keep your current password.</p>
+                <div class="settings-field"><label for="current_password">Current password</label><input id="current_password" name="current_password" type="password" autocomplete="current-password"></div>
+                <div class="settings-field"><label for="new_password">New password</label><input id="new_password" name="new_password" type="password" minlength="12" autocomplete="new-password"></div>
+                <div class="settings-field"><label for="confirm_password">Confirm new password</label><input id="confirm_password" name="confirm_password" type="password" minlength="12" autocomplete="new-password"></div>
             </fieldset>
-            <fieldset>
-                <legend>Change password</legend>
-                <p>Leave these fields empty to keep your current password.</p>
-                <label for="current_password">Current password</label>
-                <input id="current_password" name="current_password" type="password" autocomplete="current-password">
-                <label for="new_password">New password</label>
-                <input id="new_password" name="new_password" type="password" minlength="12" autocomplete="new-password">
-                <label for="confirm_password">Confirm new password</label>
-                <input id="confirm_password" name="confirm_password" type="password" minlength="12" autocomplete="new-password">
-            </fieldset>
-            <button type="submit" class="btn btn-primary">Save settings</button>
+            <div class="settings-actions"><button type="submit" class="btn btn-primary">Save settings</button></div>
         </form>
-    </div>
+    </section>
+    <section class="settings-card" aria-labelledby="smtp-title">
+        <div class="settings-section-heading"><h2 id="smtp-title">SMTP client login</h2><p>Control how mail apps send messages through GoMail. This does not affect webmail, IMAP, or POP3.</p></div>
+        <p class="settings-policy-note">Administrator policy: <strong>{{.SMTPAdminMode}}</strong>. Only permitted methods appear below.</p>
+        <form method="POST" action="/settings" class="settings-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="smtp-policy">
+            <fieldset class="settings-group settings-choice-group"><legend>Allowed login methods for my account</legend>
+                {{if and .SMTPPasswordAllowed .SMTPAppAllowed}}<label class="settings-choice"><input type="radio" name="mode" value="both" {{if eq .SMTPSelectedMode "both"}}checked{{end}}><span><strong>Account password and app credentials</strong><small>Either method can sign in to SMTP.</small></span></label>{{end}}
+                {{if .SMTPPasswordAllowed}}<label class="settings-choice"><input type="radio" name="mode" value="password" {{if eq .SMTPSelectedMode "password"}}checked{{end}}><span><strong>Account password only</strong><small>Mail apps use your normal account password.</small></span></label>{{end}}
+                {{if .SMTPAppAllowed}}<label class="settings-choice"><input type="radio" name="mode" value="app" {{if eq .SMTPSelectedMode "app"}}checked{{end}}><span><strong>App credentials only</strong><small>Use a separate credential for each mail app.</small></span></label>{{end}}
+                <label class="settings-choice"><input type="radio" name="mode" value="disabled" {{if eq .SMTPSelectedMode "disabled"}}checked{{end}}><span><strong>Disable SMTP login</strong><small>Mail apps cannot send using this account.</small></span></label>
+            </fieldset>
+            <div class="settings-field"><label for="smtp-policy-password">Confirm with current account password</label><input id="smtp-policy-password" name="current_password" type="password" required autocomplete="current-password"></div>
+            <div class="settings-actions"><button type="submit" class="btn btn-primary">Save SMTP preference</button></div>
+        </form>
+    </section>
+    {{if .SMTPAppAllowed}}
+    <section class="settings-card" aria-labelledby="credentials-title">
+        <div class="settings-section-heading"><h2 id="credentials-title">App credentials</h2><p>Create a separate SMTP password for each mail app. You can revoke one without changing your account password.</p></div>
+        {{if .NewSMTPSecret}}<div class="success-notification settings-secret" role="status"><strong>Copy this credential now</strong><code>{{.NewSMTPSecret}}</code><p>It is shown only once. Enter it as the SMTP password in your mail app.</p></div>{{end}}
+        <form method="POST" action="/settings" class="settings-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="smtp-app-create">
+            <div class="settings-field"><label for="smtp-app-name">Name this app</label><input id="smtp-app-name" name="name" type="text" maxlength="100" required placeholder="For example: Thunderbird on laptop"><small>This label is for you; GoMail cannot verify which app uses a credential.</small></div>
+            <div class="settings-field"><label for="smtp-app-password">Confirm with current account password</label><input id="smtp-app-password" name="current_password" type="password" required autocomplete="current-password"></div>
+            <div class="settings-actions"><button type="submit" class="btn btn-primary">Create app credential</button></div>
+        </form>
+        <div class="settings-list-section"><h3>Existing credentials</h3>
+            {{if .SMTPAppCredentials}}<ul class="settings-item-list">{{range .SMTPAppCredentials}}<li class="settings-item"><div class="settings-item-details"><strong>{{.Name}}</strong><small>Created {{.CreatedAt.Format "02 Jan 2006"}} · Last used {{if .LastUsedAt.Valid}}{{.LastUsedAt.Time.Format "02 Jan 2006, 15:04 UTC"}}{{else}}never{{end}}</small></div><form method="POST" action="/settings" class="settings-revoke-form"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="smtp-app-revoke"><input type="hidden" name="id" value="{{.ID}}"><label>Current password to revoke {{.Name}}<input name="current_password" type="password" required autocomplete="current-password"></label><button type="submit" class="btn">Revoke</button></form></li>{{end}}</ul>
+            {{else}}<p class="settings-empty">No app credentials yet.</p>{{end}}
+        </div>
+    </section>
+    {{end}}
+    {{if .Account.AllowAliases}}
+    <section class="settings-card" aria-labelledby="aliases-title">
+        <div class="settings-section-heading"><h2 id="aliases-title">My aliases</h2><p>Extra addresses that deliver to this mailbox. Aliases have no separate password or storage; you can create up to 20 on {{.Account.DomainName}}.</p></div>
+        <form method="POST" action="/settings" class="settings-form"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="alias-create">
+            <div class="settings-field"><label for="alias-address">New alias address</label><input id="alias-address" name="address" type="email" placeholder="shopping@{{.Account.DomainName}}" maxlength="254" required></div>
+            <div class="settings-actions"><button type="submit" class="btn btn-primary">Create alias</button></div>
+        </form>
+        <div class="settings-list-section"><h3>Existing aliases</h3>{{if .Aliases}}<ul class="settings-item-list">{{range .Aliases}}<li class="settings-item"><strong>{{.Address}}</strong><form method="POST" action="/settings" onsubmit="return confirm('Delete this alias?');"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="alias-delete"><input type="hidden" name="address" value="{{.Address}}"><button type="submit" class="btn">Delete</button></form></li>{{end}}</ul>{{else}}<p class="settings-empty">No aliases yet.</p>{{end}}</div>
+    </section>
+    {{end}}
 </div>
 {{end}}

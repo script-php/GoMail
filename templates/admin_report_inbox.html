@@ -1,0 +1,52 @@
+{{define "content"}}
+<div class="admin-panel report-inbox-page">
+  <header class="report-inbox-header">
+    <div><h2>Received Reports</h2><p>DMARC and TLS-RPT reports delivered to a GoMail mailbox.</p></div>
+    <span class="report-inbox-state">{{if .Settings.Enabled}}Analyzer on{{else}}Analyzer off{{end}}</span>
+  </header>
+  {{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
+  {{if .Saved}}<div class="alert alert-success" role="status">Report mailbox settings saved.</div>{{end}}
+  {{if .Scanned}}<div class="alert alert-success" role="status">Mailbox scan completed.</div>{{end}}
+
+  <section class="report-inbox-card" aria-labelledby="report-settings-heading">
+    <div class="report-inbox-card-heading"><h3 id="report-settings-heading">Mailbox access</h3><p>Select an active local mailbox that receives the addresses published in your DMARC and TLS-RPT DNS records.</p></div>
+    <form method="POST" action="/admin/received-reports" class="report-inbox-settings-form">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="action" value="save">
+      <label class="report-inbox-toggle" for="report-inbox-enabled"><input id="report-inbox-enabled" type="checkbox" name="enabled" value="on" {{if .Settings.Enabled}}checked{{end}}><span><strong>Analyze received reports</strong><small>Off by default. GoMail reads incoming reports without moving or deleting the original messages.</small></span></label>
+      <div class="report-inbox-field"><label for="report-inbox-account">Report mailbox</label><select id="report-inbox-account" name="account_id"><option value="0">Select a mailbox</option>{{range .Accounts}}<option value="{{.ID}}" {{if eq .ID $.Settings.AccountID}}selected{{end}}>{{.Email}}{{if not .IsActive}} (inactive){{end}}</option>{{end}}</select><small>No mailbox password is stored. Choose the account that actually receives the reports.</small></div>
+      <div class="report-inbox-actions"><button type="submit" class="btn btn-primary">Save settings</button></div>
+    </form>
+    {{if .Settings.Enabled}}
+    <form method="POST" action="/admin/received-reports" class="report-inbox-scan">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="scan">
+      <button type="submit" class="btn">Rescan mailbox history</button>
+      <span>Existing reports are deduplicated. Large mailboxes continue in the background; new mail is checked about once a minute.</span>
+    </form>
+    {{end}}
+  </section>
+
+  <div class="report-inbox-summary-heading"><h3>Report overview</h3><p class="report-inbox-note"><strong>External data:</strong> Report claims are not independently authenticated. Verify unexpected results against mail logs and DNS.</p></div>
+  <div class="report-inbox-metrics" aria-label="All imported report summaries">
+    <div><strong>{{.DMARCCount}}</strong><span>DMARC reports</span></div>
+    <div><strong>{{.TLSCount}}</strong><span>TLS-RPT reports</span></div>
+    <div><strong>{{.Successes}}</strong><span>Passes / successful sessions</span></div>
+    <div><strong>{{.Failures}}</strong><span>Failures / failed sessions</span></div>
+  </div>
+
+  <section class="report-inbox-card" aria-labelledby="report-history-heading">
+    <h3 id="report-history-heading">History <small>(page {{.Page}}, newest first)</small></h3>
+    {{if .Reports}}
+    <div class="report-inbox-table-wrap"><table class="admin-table">
+      <thead><tr><th>Received</th><th>Type</th><th>Report domain</th><th>Submitter</th><th>Period</th><th>Passes</th><th>Failures</th><th>Details</th></tr></thead>
+      <tbody>{{range .Reports}}<tr>
+        <td>{{.ReceivedAt}}</td><td>{{.Kind}}</td><td>{{.ReportDomain}}</td><td>{{.Submitter}}</td>
+        <td>{{.PeriodStart}}<br>to {{.PeriodEnd}}</td><td>{{.Successes}}</td><td>{{.Failures}}</td>
+        <td><details><summary>Preview</summary><p>Report ID: {{.ReportID}}</p><pre>{{.PayloadJSON}}</pre><small>First 4 KB shown. The complete original is in the selected mailbox.</small></details></td>
+      </tr>{{end}}</tbody>
+    </table></div>
+    <nav class="report-inbox-pages" aria-label="Report history pages">{{if .HasPrevious}}<a href="/admin/received-reports?page={{.PreviousPage}}">Previous</a>{{end}}{{if .HasNext}}<a href="/admin/received-reports?page={{.NextPage}}">Next</a>{{end}}</nav>
+    {{else}}<p>No reports imported yet. Enable the analyzer and send a test report to the selected mailbox.</p>{{end}}
+  </section>
+</div>
+{{end}}

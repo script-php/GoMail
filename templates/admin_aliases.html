@@ -1,0 +1,32 @@
+{{define "content"}}
+<div class="admin-panel admin-aliases-page">
+  <header class="admin-aliases-header"><h2>Local aliases</h2><p>Route an extra address on a hosted domain to an existing mailbox. Aliases receive mail but cannot sign in.</p></header>
+  {{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
+  {{if .Saved}}<div class="alert alert-success" role="status">Alias settings saved.</div>{{end}}
+  <section class="admin-aliases-card" aria-labelledby="alias-create-heading">
+    <div class="admin-aliases-card-heading"><h3 id="alias-create-heading">Create an alias</h3><p>Choose the address people will mail and the account that should receive it. Both must be on active hosted domains.</p></div>
+    <form method="POST" action="/admin/aliases" class="admin-aliases-form">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="create">
+      <div class="admin-aliases-fields">
+        <div class="admin-aliases-field"><label for="alias-address">Alias address</label><input id="alias-address" name="address" type="email" placeholder="postmaster@example.com" required maxlength="254"><small>Mail sent to this address will be forwarded locally.</small></div>
+        <div class="admin-aliases-field"><label for="alias-target">Destination mailbox</label><select id="alias-target" name="target_account_id" required><option value="">Select an account</option>{{range .Accounts}}{{if .IsActive}}<option value="{{.ID}}">{{.Email}}</option>{{end}}{{end}}</select><small>The active account that will receive the messages.</small></div>
+      </div>
+      <p class="admin-aliases-note">The original recipient address remains visible on delivered messages.</p>
+      <div class="admin-aliases-actions"><button type="submit" class="btn btn-primary">Create alias</button></div>
+    </form>
+  </section>
+  <section class="admin-aliases-card" aria-labelledby="alias-list-heading">
+    <div class="admin-aliases-card-heading"><h3 id="alias-list-heading">Existing aliases</h3><p>Review where each address delivers. Deleting an alias stops delivery to that virtual address.</p></div>
+    {{if .Aliases}}
+    <div class="admin-aliases-table-wrap"><table class="admin-table admin-aliases-table"><thead><tr><th>Alias address</th><th>Delivers to</th><th>Action</th></tr></thead><tbody>
+    {{range .Aliases}}<tr><td><strong>{{.Address}}</strong></td><td>{{.TargetEmail}}</td><td>
+      <form method="POST" action="/admin/aliases" onsubmit="return confirm('Delete this alias?');">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="address" value="{{.Address}}">
+        <button class="btn admin-aliases-delete" type="submit" aria-label="Delete alias {{.Address}}">Delete</button>
+      </form>
+    </td></tr>{{end}}
+    </tbody></table></div>
+    {{else}}<p class="admin-aliases-empty">No aliases configured yet. Create one above to start routing an extra address.</p>{{end}}
+  </section>
+</div>
+{{end}}

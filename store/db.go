@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 
+	"gomail/config"
 	"gomail/logging"
 )
 
@@ -20,8 +22,16 @@ var schemaSQL string
 // DB wraps a SQLite or MySQL database connection.
 type DB struct {
 	*sql.DB
-	attachmentsPath string
-	driver          string
+	attachmentsPath  string
+	driver           string
+	imapEventsMu     sync.Mutex
+	imapEventsNext   uint64
+	imapEvents       map[uint64]imapEventSubscription
+	diskWarningFree  int64
+	diskMinimumFree  int64
+	diskPaths        []string
+	outboundLimitsMu sync.RWMutex
+	outboundLimits   config.OutboundLimitsConfig
 }
 
 // Open opens (or creates) the SQLite database and runs migrations.
@@ -175,6 +185,18 @@ type ColumnChange struct {
 func (db *DB) RegisteredMigrations() []Migration {
 	return []Migration{
 		{Name: "mailbox_folders_v1", Run: func(db *DB) error { return db.migrateExistingAccounts() }},
+		{Name: "mailbox_usage_v1", Run: func(db *DB) error {
+			_, err := db.Exec(`UPDATE accounts SET mailbox_used_bytes = COALESCE((SELECT SUM(size) FROM messages WHERE messages.account_id = accounts.id), 0)`)
+			return err
+		}},
+		{Name: "imap_state_v1", Run: func(db *DB) error { return db.initializeIMAPState() }},
+		{Name: "outbound_origin_v1", Run: func(db *DB) error {
+			_, err := db.Exec(`UPDATE outbound_queue SET origin_account_id = (
+				SELECT m.account_id FROM messages m WHERE m.id = outbound_queue.message_id)
+				WHERE origin_account_id = -1 AND message_id IS NOT NULL`)
+			return err
+		}},
+		{Name: "received_report_domain_unique_v1", Run: func(db *DB) error { return db.migrateReceivedReportDomainUnique() }},
 		// Example: Data migrations (not schema changes)
 		// {
 		//     Name: "migrate_user_data",

@@ -51,6 +51,7 @@
                         Request read receipt
                     </label>
                 </div>
+                <label class="sr-only" for="body">Message body</label>
                 <textarea id="body" name="body" class="compose-textarea" required
                           placeholder="Write your message...">{{if .Prefill}}{{index .Prefill "body"}}{{end}}</textarea>
                 <div class="compose-attachments">

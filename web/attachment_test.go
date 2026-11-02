@@ -79,6 +79,37 @@ func TestAttachmentDownloadRequiresMessageOwnership(t *testing.T) {
 	if strings.Contains(response.Body.String(), secret) {
 		t.Fatal("cross-account response exposed attachment bytes")
 	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("authenticated attachment response may be cached")
+	}
+	bobLogin := httptest.NewRecorder()
+	if err := server.sessionMgr.CreateSession(bobLogin, "bob@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	bobRequest := httptest.NewRequest(http.MethodGet, "/attachment/"+formatID(attachmentID), nil)
+	bobRequest.AddCookie(bobLogin.Result().Cookies()[0])
+	bobResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(bobResponse, bobRequest)
+	if bobResponse.Code != http.StatusOK || bobResponse.Body.String() != secret || bobResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("owned attachment status=%d cache=%q body=%q", bobResponse.Code, bobResponse.Header().Get("Cache-Control"), bobResponse.Body.String())
+	}
+	outside := filepath.Join(root, "outside-secret.txt")
+	if err := os.WriteFile(outside, []byte("outside-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(attachmentsRoot, "bob-secret.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(attachmentsRoot, "bob-secret.txt")); err != nil {
+		t.Fatal(err)
+	}
+	symlinkRequest := httptest.NewRequest(http.MethodGet, "/attachment/"+formatID(attachmentID), nil)
+	symlinkRequest.AddCookie(bobLogin.Result().Cookies()[0])
+	symlinkResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(symlinkResponse, symlinkRequest)
+	if symlinkResponse.Code != http.StatusNotFound || strings.Contains(symlinkResponse.Body.String(), "outside-secret") {
+		t.Fatalf("symlink escaped attachment root: status=%d body=%q", symlinkResponse.Code, symlinkResponse.Body.String())
+	}
 
 	if attachment, err := db.GetAttachmentForAccount(attachmentID, aliceID); err != nil || attachment != nil {
 		t.Fatalf("scoped lookup exposed Bob attachment: attachment=%+v err=%v", attachment, err)

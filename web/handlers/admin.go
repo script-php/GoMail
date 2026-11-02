@@ -5,6 +5,9 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/mail"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +15,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"gomail/auth"
+	backupops "gomail/backup"
 	"gomail/config"
+	"gomail/logging"
 	"gomail/reporting"
 	"gomail/security"
 	"gomail/store"
@@ -21,24 +26,31 @@ import (
 
 // AdminHandler handles the admin panel for domains and accounts.
 type AdminHandler struct {
-	cfg               *config.Config
-	db                *store.DB
-	sessionMgr        *security.SessionManager
-	tmplDashboard     *template.Template
-	tmplDomains       *template.Template
-	tmplDomainEdit    *template.Template
-	tmplAccounts      *template.Template
-	tmplAccountEdit   *template.Template
-	tmplDMARCFeedback *template.Template
-	tmplTLSRPT        *template.Template
-	tmplGreylisting   *template.Template
-	tmplTarpitting    *template.Template
-	tmplVERPBounces   *template.Template
-	enqueueFunc       reporting.EnqueueFunc
+	cfg                *config.Config
+	db                 *store.DB
+	sessionMgr         *security.SessionManager
+	tmplDashboard      *template.Template
+	tmplDomains        *template.Template
+	tmplDomainEdit     *template.Template
+	tmplAccounts       *template.Template
+	tmplAccountEdit    *template.Template
+	tmplDMARCFeedback  *template.Template
+	tmplTLSRPT         *template.Template
+	tmplGreylisting    *template.Template
+	tmplTarpitting     *template.Template
+	tmplVERPBounces    *template.Template
+	tmplBackups        *template.Template
+	tmplConfiguration  *template.Template
+	tmplOutboundLimits *template.Template
+	tmplOutboundQueue  *template.Template
+	tmplReportInbox    *template.Template
+	tmplAliases        *template.Template
+	enqueueFunc        reporting.EnqueueFunc
+	backupManager      *backupops.Manager
 }
 
 // NewAdminHandler creates an admin handler.
-func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager, enqueueFunc reporting.EnqueueFunc) *AdminHandler {
+func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager, enqueueFunc reporting.EnqueueFunc, backupManager *backupops.Manager) *AdminHandler {
 	funcMap := template.FuncMap{
 		"formatSize": func(size int64) string {
 			switch {
@@ -70,22 +82,519 @@ func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManag
 	tmplGreylisting := templates.LoadTemplate(funcMap, "base", "admin_greylisting", "welcome")
 	tmplTarpitting := templates.LoadTemplate(funcMap, "base", "admin_tarpitting", "welcome")
 	tmplVERPBounces := templates.LoadTemplate(funcMap, "base", "admin_verp_bounces", "welcome")
+	tmplBackups := templates.LoadTemplate(funcMap, "base", "admin_backups", "welcome")
+	tmplConfiguration := templates.LoadTemplate(funcMap, "base", "admin_configuration", "welcome")
+	tmplOutboundLimits := templates.LoadTemplate(funcMap, "base", "admin_outbound_limits", "welcome")
+	tmplOutboundQueue := templates.LoadTemplate(funcMap, "base", "admin_outbound_queue", "welcome")
+	tmplReportInbox := templates.LoadTemplate(funcMap, "base", "admin_report_inbox", "welcome")
+	tmplAliases := templates.LoadTemplate(funcMap, "base", "admin_aliases", "welcome")
 
 	return &AdminHandler{
-		cfg:               cfg,
-		db:                db,
-		sessionMgr:        sm,
-		tmplDashboard:     tmplDashboard,
-		tmplDomains:       tmplDomains,
-		tmplDomainEdit:    tmplDomainEdit,
-		tmplAccounts:      tmplAccounts,
-		tmplAccountEdit:   tmplAccountEdit,
-		tmplDMARCFeedback: tmplDMARCFeedback,
-		tmplTLSRPT:        tmplTLSRPT,
-		tmplGreylisting:   tmplGreylisting,
-		tmplTarpitting:    tmplTarpitting,
-		tmplVERPBounces:   tmplVERPBounces,
-		enqueueFunc:       enqueueFunc,
+		cfg:                cfg,
+		db:                 db,
+		sessionMgr:         sm,
+		tmplDashboard:      tmplDashboard,
+		tmplDomains:        tmplDomains,
+		tmplDomainEdit:     tmplDomainEdit,
+		tmplAccounts:       tmplAccounts,
+		tmplAccountEdit:    tmplAccountEdit,
+		tmplDMARCFeedback:  tmplDMARCFeedback,
+		tmplTLSRPT:         tmplTLSRPT,
+		tmplGreylisting:    tmplGreylisting,
+		tmplTarpitting:     tmplTarpitting,
+		tmplVERPBounces:    tmplVERPBounces,
+		tmplBackups:        tmplBackups,
+		tmplConfiguration:  tmplConfiguration,
+		tmplOutboundLimits: tmplOutboundLimits,
+		tmplOutboundQueue:  tmplOutboundQueue,
+		tmplReportInbox:    tmplReportInbox,
+		tmplAliases:        tmplAliases,
+		enqueueFunc:        enqueueFunc,
+		backupManager:      backupManager,
+	}
+}
+
+// OutboundQueue exposes delivery metadata and race-safe operational controls.
+// It deliberately never loads or renders raw queued messages.
+func (h *AdminHandler) OutboundQueue(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	errorMessage := ""
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Invalid form", http.StatusBadRequest)
+			return
+		}
+		if !h.sessionMgr.ValidateCSRF(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return
+		}
+		ids := r.Form["queue_id"]
+		action := r.FormValue("action")
+		if action == "retention_save" {
+			days, parseErr := strconv.Atoi(strings.TrimSpace(r.FormValue("retention_days")))
+			if parseErr != nil || days < 0 || days > 3650 {
+				errorMessage = "Retention must be between 0 and 3650 days."
+			} else if saveErr := h.db.SetQueueRetentionDays(days); saveErr != nil {
+				errorMessage = "Unable to save queue retention."
+			} else {
+				logging.Info(fmt.Sprintf("[admin] queue retention days=%d by_account_id=%d", days, account.ID))
+				http.Redirect(w, r, "/admin/queue?updated=retention", http.StatusSeeOther)
+				return
+			}
+		} else if action == "retention_run" {
+			days, settingsErr := h.db.QueueRetentionDays()
+			if settingsErr != nil || days == 0 {
+				errorMessage = "Enable retention before running cleanup."
+			} else if removed, runErr := h.db.PruneCompletedQueueEntries(days, time.Now().UTC(), 500); runErr != nil {
+				errorMessage = "Queue cleanup failed."
+			} else {
+				logging.Info(fmt.Sprintf("[admin] queue cleanup removed=%d by_account_id=%d", removed, account.ID))
+				http.Redirect(w, r, fmt.Sprintf("/admin/queue?updated=%d", removed), http.StatusSeeOther)
+				return
+			}
+		} else if action == "verp_retention_save" {
+			days, parseErr := strconv.Atoi(strings.TrimSpace(r.FormValue("verp_retention_days")))
+			if parseErr != nil || days < 0 || days > 3650 {
+				errorMessage = "VERP retention must be between 0 and 3650 days."
+			} else if saveErr := h.db.SetVERPRetentionDays(days); saveErr != nil {
+				errorMessage = "Unable to save VERP retention."
+			} else {
+				logging.Info(fmt.Sprintf("[admin] VERP retention days=%d by_account_id=%d", days, account.ID))
+				http.Redirect(w, r, "/admin/queue?updated=verp_retention", http.StatusSeeOther)
+				return
+			}
+		} else if action == "verp_retention_run" {
+			days, settingsErr := h.db.VERPRetentionDays()
+			if settingsErr != nil || days == 0 {
+				errorMessage = "Enable VERP retention before running cleanup."
+			} else if removed, runErr := h.db.PruneIssuedVERP(days, time.Now().UTC(), 500); runErr != nil {
+				errorMessage = "VERP cleanup failed."
+			} else {
+				logging.Info(fmt.Sprintf("[admin] VERP cleanup removed=%d by_account_id=%d", removed, account.ID))
+				http.Redirect(w, r, "/admin/queue?updated=verp_cleanup", http.StatusSeeOther)
+				return
+			}
+		}
+		if single := strings.TrimSpace(r.FormValue("single")); single != "" {
+			parts := strings.SplitN(single, ":", 2)
+			if len(parts) == 2 {
+				action, ids = parts[0], []string{parts[1]}
+			} else {
+				ids = nil
+			}
+		}
+		if action == "retention_save" || action == "retention_run" || action == "verp_retention_save" || action == "verp_retention_run" {
+			// Render the settings error below.
+		} else if len(ids) == 0 || len(ids) > 100 {
+			errorMessage = "Select between 1 and 100 queue entries."
+		} else {
+			updated := 0
+			for _, rawID := range ids {
+				id, err := strconv.ParseInt(rawID, 10, 64)
+				if err != nil || id <= 0 {
+					errorMessage = "Invalid queue entry."
+					break
+				}
+				var changed bool
+				switch action {
+				case "retry":
+					changed, err = h.db.RetryQueueEntry(id)
+				case "cancel":
+					changed, err = h.db.CancelQueueEntry(id)
+				case "recover":
+					changed, err = h.db.RecoverStaleQueueEntry(id)
+				case "retry_uncertain":
+					changed, err = h.db.ResolveUncertainQueueEntry(id, "retry")
+				case "delivered_uncertain":
+					changed, err = h.db.ResolveUncertainQueueEntry(id, "delivered")
+				case "cancel_uncertain":
+					changed, err = h.db.ResolveUncertainQueueEntry(id, "cancel")
+				default:
+					err = fmt.Errorf("unknown queue action")
+				}
+				if err != nil {
+					errorMessage = "Unable to update the selected queue entry."
+					log.Printf("[admin] outbound queue action error: %v", err)
+					break
+				}
+				if changed {
+					updated++
+					logging.Info(fmt.Sprintf("[admin] queue_id=%d action=%s by_account_id=%d", id, action, account.ID))
+				}
+			}
+			if errorMessage == "" {
+				logging.Info(fmt.Sprintf("[admin] outbound queue action=%s selected=%d updated=%d by_account_id=%d", action, len(ids), updated, account.ID))
+				if updated == 0 {
+					errorMessage = "No entries changed; their state may have changed while the page was open."
+				} else {
+					http.Redirect(w, r, fmt.Sprintf("/admin/queue?updated=%d", updated), http.StatusSeeOther)
+					return
+				}
+			}
+		}
+	}
+
+	status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	queuePage, err := h.db.ListQueueAdmin(status, query, page)
+	if err != nil {
+		if errorMessage == "" {
+			errorMessage = "Unable to load the outbound queue."
+		}
+		log.Printf("[admin] outbound queue list error: %v", err)
+	}
+	retentionDays, retentionErr := h.db.QueueRetentionDays()
+	if retentionErr != nil && errorMessage == "" {
+		errorMessage = "Unable to load queue retention settings."
+	}
+	verpRetentionDays, verpRetentionErr := h.db.VERPRetentionDays()
+	if verpRetentionErr != nil && errorMessage == "" {
+		errorMessage = "Unable to load VERP retention settings."
+	}
+	var history []store.QueueEvent
+	var historyID int64
+	if requested := r.URL.Query().Get("history"); requested != "" {
+		historyID, err = strconv.ParseInt(requested, 10, 64)
+		if err != nil || historyID <= 0 {
+			http.Error(w, "Invalid queue entry", http.StatusBadRequest)
+			return
+		}
+		entryStatus, lookupErr := h.db.QueueEntryStatus(historyID)
+		if lookupErr != nil || entryStatus == "" {
+			http.Error(w, "Queue entry not found", http.StatusNotFound)
+			return
+		}
+		history, err = h.db.ListQueueEvents(historyID, 50)
+		if err != nil {
+			http.Error(w, "Unable to load delivery history", http.StatusInternalServerError)
+			return
+		}
+	}
+	pageURL := func(number int) string {
+		values := url.Values{}
+		if status != "" && status != "all" {
+			values.Set("status", status)
+		}
+		if query != "" {
+			values.Set("q", query)
+		}
+		values.Set("page", strconv.Itoa(number))
+		return "/admin/queue?" + values.Encode()
+	}
+	prevURL, nextURL := "", ""
+	if queuePage.Page > 1 {
+		prevURL = pageURL(queuePage.Page - 1)
+	}
+	if queuePage.Page < queuePage.TotalPages {
+		nextURL = pageURL(queuePage.Page + 1)
+	}
+	data := map[string]interface{}{
+		"Title": "Outbound Queue", "Section": "admin", "AdminPanel": "queue", "Account": account,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r), "Queue": queuePage, "Status": status, "Query": query,
+		"Error": errorMessage, "Updated": r.URL.Query().Get("updated"), "PrevURL": prevURL, "NextURL": nextURL,
+		"HistoryID": historyID, "History": history,
+		"RetentionDays":     retentionDays,
+		"VERPRetentionDays": verpRetentionDays,
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplOutboundQueue.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] outbound queue template error: %v", err)
+	}
+}
+
+func (h *AdminHandler) OutboundLimits(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if h.backupManager == nil || strings.TrimSpace(h.backupManager.ConfigPath()) == "" {
+		http.Error(w, "Configuration manager unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	path := h.backupManager.ConfigPath()
+	current, err := config.Load(path)
+	if err != nil {
+		http.Error(w, "Unable to load configuration", http.StatusInternalServerError)
+		return
+	}
+	errorMessage := ""
+	if r.Method == http.MethodPost {
+		if !h.sessionMgr.ValidateCSRF(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Invalid form", http.StatusBadRequest)
+			return
+		}
+		action := r.FormValue("action")
+		if action == "save" {
+			parse := func(name string) (int, error) {
+				value, parseErr := strconv.Atoi(strings.TrimSpace(r.FormValue(name)))
+				if parseErr != nil || value <= 0 {
+					return 0, fmt.Errorf("%s must be a positive number", strings.ReplaceAll(name, "_", " "))
+				}
+				return value, nil
+			}
+			limits := config.OutboundLimitsConfig{Enabled: r.FormValue("enabled") == "on"}
+			var parseErr error
+			if limits.MessagesPerHour, parseErr = parse("messages_per_hour"); parseErr == nil {
+				limits.MessagesPerDay, parseErr = parse("messages_per_day")
+			}
+			if parseErr == nil {
+				limits.RecipientsPerHour, parseErr = parse("recipients_per_hour")
+			}
+			if parseErr == nil {
+				limits.RecipientsPerDay, parseErr = parse("recipients_per_day")
+			}
+			if parseErr == nil {
+				limits.MaxRecipientsPerMessage, parseErr = parse("max_recipients_per_message")
+			}
+			if parseErr == nil {
+				limits.SuspensionMinutes, parseErr = parse("suspension_minutes")
+			}
+			if parseErr != nil {
+				errorMessage = parseErr.Error()
+			} else {
+				current.OutboundLimits = limits
+				if validateErr := current.Validate(); validateErr != nil {
+					errorMessage = validateErr.Error()
+				} else if _, saveErr := config.SaveAtomic(path, current); saveErr != nil {
+					errorMessage = saveErr.Error()
+				} else {
+					h.db.ConfigureOutboundLimits(current.OutboundLimits)
+					logging.Info(fmt.Sprintf("[admin] outbound limits changed by account_id=%d", account.ID))
+					http.Redirect(w, r, "/admin/outbound-limits?saved=1", http.StatusSeeOther)
+					return
+				}
+			}
+		} else {
+			accountID, parseErr := strconv.ParseInt(r.FormValue("account_id"), 10, 64)
+			if parseErr != nil || accountID <= 0 {
+				errorMessage = "Invalid account"
+			} else {
+				switch action {
+				case "reset", "unlock":
+					parseErr = h.db.ResetOutboundAccountUsage(accountID)
+				case "suspend":
+					until := time.Now().UTC().Add(time.Duration(current.OutboundLimits.SuspensionMinutes) * time.Minute)
+					parseErr = h.db.SetOutboundAccountSuspension(accountID, &until)
+				default:
+					parseErr = fmt.Errorf("unknown action")
+				}
+				if parseErr != nil {
+					errorMessage = "Unable to update account outbound state"
+				} else {
+					logging.Info(fmt.Sprintf("[admin] outbound account action=%s target_account_id=%d by_account_id=%d", action, accountID, account.ID))
+					http.Redirect(w, r, "/admin/outbound-limits?updated=1", http.StatusSeeOther)
+					return
+				}
+			}
+		}
+	}
+	usage, usageErr := h.db.ListOutboundAccountUsage(time.Now())
+	if usageErr != nil && errorMessage == "" {
+		errorMessage = "Unable to load outbound usage"
+	}
+	data := map[string]interface{}{
+		"Title": "Outbound Limits", "Section": "admin", "AdminPanel": "outbound-limits", "Account": account,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r), "Limits": current.OutboundLimits, "Usage": usage,
+		"Error": errorMessage, "Saved": r.URL.Query().Get("saved") == "1", "Updated": r.URL.Query().Get("updated") == "1",
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplOutboundLimits.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] outbound limits template error: %v", err)
+	}
+}
+
+// Configuration edits the complete persisted configuration. Only logging is
+// applied live; components constructed at startup are explicitly restart-bound.
+func (h *AdminHandler) Configuration(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if h.backupManager == nil || strings.TrimSpace(h.backupManager.ConfigPath()) == "" {
+		http.Error(w, "Configuration manager unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	path := h.backupManager.ConfigPath()
+	current, err := config.Load(path)
+	if err != nil {
+		http.Error(w, "Unable to load configuration", http.StatusInternalServerError)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if !h.sessionMgr.ValidateCSRF(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Configuration form is too large or invalid", http.StatusBadRequest)
+			return
+		}
+		view := "form"
+		if r.FormValue("view") == "json" {
+			view = "json"
+		}
+		var candidate *config.Config
+		var parseErr error
+		if view == "json" {
+			candidate, parseErr = config.ParseEditableJSON([]byte(r.FormValue("configuration")), current)
+		} else {
+			candidate, parseErr = config.ParseEditableForm(r.PostForm, current)
+		}
+		if parseErr != nil {
+			currentEditable, _ := config.EditableJSON(current)
+			h.renderConfiguration(w, r, account, string(currentEditable), parseErr.Error()+" The editor was reset to the last saved configuration so secret values are not reflected in the response.", "", false, config.RestartRequired(h.cfg, current))
+			return
+		}
+		candidateEditable, _ := config.EditableJSON(candidate)
+		if r.FormValue("action") == "validate" {
+			h.renderConfiguration(w, r, account, string(candidateEditable), "", "Configuration is valid. Nothing was saved. Re-enter any new secret values before saving.", false, config.RestartRequired(h.cfg, candidate))
+			return
+		}
+		if r.FormValue("action") != "save" {
+			http.Error(w, "Unknown action", http.StatusBadRequest)
+			return
+		}
+		changed := config.ChangedSections(current, candidate)
+		if len(changed) == 0 {
+			h.renderConfiguration(w, r, account, string(candidateEditable), "", "No configuration values changed.", false, config.RestartRequired(h.cfg, current))
+			return
+		}
+		backupPath, saveErr := config.SaveAtomic(path, candidate)
+		if saveErr != nil {
+			h.renderConfiguration(w, r, account, string(candidateEditable), saveErr.Error(), "", false, config.RestartRequired(h.cfg, current))
+			return
+		}
+		logging.Configure(candidate.Logging.Level, candidate.Logging.Format)
+		h.db.ConfigureOutboundLimits(candidate.OutboundLimits)
+		restartRequired := config.RestartRequired(h.cfg, candidate)
+		logging.Info(fmt.Sprintf("[admin] configuration changed by account_id=%d sections=%s backup=%s restart_required=%t", account.ID, strings.Join(changed, ","), filepath.Base(backupPath), restartRequired))
+		http.Redirect(w, r, "/admin/configuration?saved=1&view="+view, http.StatusSeeOther)
+		return
+	}
+	editable, err := config.EditableJSON(current)
+	if err != nil {
+		http.Error(w, "Unable to prepare configuration", http.StatusInternalServerError)
+		return
+	}
+	h.renderConfiguration(w, r, account, string(editable), "", "", r.URL.Query().Get("saved") == "1", config.RestartRequired(h.cfg, current))
+}
+
+func (h *AdminHandler) renderConfiguration(w http.ResponseWriter, r *http.Request, account *store.Account, editable, errorMessage, notice string, saved, restartRequired bool) {
+	view := "form"
+	if r.FormValue("view") == "json" {
+		view = "json"
+	}
+	sections, err := config.EditableFormSections([]byte(editable))
+	if err != nil {
+		http.Error(w, "Unable to prepare configuration form", http.StatusInternalServerError)
+		return
+	}
+	data := map[string]interface{}{
+		"Title": "Server Configuration", "Section": "admin", "AdminPanel": "configuration", "Account": account,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r), "Configuration": editable, "Error": errorMessage,
+		"Notice": notice, "Saved": saved, "RestartRequired": restartRequired, "ViewMode": view, "FormSections": sections,
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplConfiguration.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] configuration template error: %v", err)
+	}
+}
+
+func (h *AdminHandler) Backups(w http.ResponseWriter, r *http.Request) {
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if h.backupManager == nil {
+		http.Error(w, "Backup manager unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if !h.sessionMgr.ValidateCSRF(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return
+		}
+		switch r.FormValue("action") {
+		case "save":
+			current, err := h.backupManager.Settings()
+			if err != nil {
+				http.Error(w, "Unable to load backup settings", http.StatusInternalServerError)
+				return
+			}
+			interval, err := strconv.Atoi(r.FormValue("interval_hours"))
+			if err != nil {
+				h.renderBackups(w, r, account, current, "Interval must be a whole number", "")
+				return
+			}
+			retention, err := strconv.Atoi(r.FormValue("retention_count"))
+			if err != nil {
+				h.renderBackups(w, r, account, current, "Archives to retain must be a whole number", "")
+				return
+			}
+			current.Enabled = r.FormValue("enabled") == "1"
+			current.Directory = r.FormValue("directory")
+			current.IntervalHours = interval
+			current.RetentionCount = retention
+			if err := h.backupManager.SaveSettings(current); err != nil {
+				h.renderBackups(w, r, account, current, err.Error(), "")
+				return
+			}
+			http.Redirect(w, r, "/admin/backups?saved=1", http.StatusSeeOther)
+			return
+		case "run":
+			_, path, err := h.backupManager.RunNow()
+			if err != nil {
+				settings, settingsErr := h.backupManager.Settings()
+				if settingsErr != nil {
+					http.Error(w, "Unable to load backup settings", http.StatusInternalServerError)
+					return
+				}
+				h.renderBackups(w, r, account, settings, err.Error(), "")
+				return
+			}
+			http.Redirect(w, r, "/admin/backups?created="+url.QueryEscape(filepath.Base(path)), http.StatusSeeOther)
+			return
+		default:
+			http.Error(w, "Unknown action", http.StatusBadRequest)
+			return
+		}
+	}
+	settings, err := h.backupManager.Settings()
+	if err != nil {
+		http.Error(w, "Unable to load backup settings", http.StatusInternalServerError)
+		return
+	}
+	h.renderBackups(w, r, account, settings, "", r.URL.Query().Get("created"))
+}
+
+func (h *AdminHandler) renderBackups(w http.ResponseWriter, r *http.Request, account *store.Account, settings store.BackupSettings, errorMessage, created string) {
+	data := map[string]interface{}{
+		"Title": "Backups", "Section": "admin", "AdminPanel": "backups", "Account": account,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r), "Settings": settings,
+		"Error": errorMessage, "Created": created, "Saved": r.URL.Query().Get("saved") == "1",
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.tmplBackups.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[admin] backup template error: %v", err)
 	}
 }
 
@@ -115,6 +624,7 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	accountCount := len(accounts)
 
 	unread, _ := h.db.CountUnread(account.ID)
+	diskStatus, _ := h.db.DiskPressureStatus()
 
 	data := map[string]interface{}{
 		"Title":        "Admin Dashboard",
@@ -127,6 +637,7 @@ func (h *AdminHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		"Section":      "admin",
 		"AdminPanel":   "dashboard",
 		"Account":      account,
+		"DiskStatus":   diskStatus,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -221,7 +732,12 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		domain.Domain = strings.ToLower(strings.TrimSpace(r.FormValue("domain")))
+		submittedDomain := strings.ToLower(strings.TrimSpace(r.FormValue("domain")))
+		if isNew {
+			domain.Domain = submittedDomain
+		} else if !strings.EqualFold(submittedDomain, domain.Domain) {
+			errMsg = "Domain name cannot be changed after creation"
+		}
 		domain.IsActive = r.FormValue("is_active") == "1"
 		domain.RequireTLS = r.FormValue("require_tls") == "1"
 		domain.DANEEnforcement = r.FormValue("dane_enforcement")
@@ -255,49 +771,110 @@ func (h *AdminHandler) DomainEdit(w http.ResponseWriter, r *http.Request) {
 		domain.DKIMSelector = r.FormValue("dkim_selector")
 		domain.DKIMAlgorithm = r.FormValue("dkim_algorithm")
 
-		if domain.Domain == "" {
-			errMsg = "Domain name is required"
-		} else if isNew {
-			id, err := h.db.CreateDomain(domain)
-			if err != nil {
-				errMsg = fmt.Sprintf("Error creating domain: %v", err)
-			} else {
-				domain.ID = id
-				http.Redirect(w, r, fmt.Sprintf("/admin/domain/edit/%d", id), http.StatusSeeOther)
-				return
+		if errMsg == "" {
+			if err := store.ValidateMailDomain(domain.Domain); err != nil {
+				errMsg = err.Error()
 			}
-		} else {
-			if err := h.db.UpdateDomain(domain); err != nil {
-				errMsg = fmt.Sprintf("Error updating domain: %v", err)
+		}
+		if errMsg == "" {
+			if isNew {
+				id, err := h.db.CreateDomain(domain)
+				if err != nil {
+					errMsg = fmt.Sprintf("Error creating domain: %v", err)
+				} else {
+					domain.ID = id
+					http.Redirect(w, r, fmt.Sprintf("/admin/domain/edit/%d", id), http.StatusSeeOther)
+					return
+				}
 			} else {
-				message = "Domain updated successfully"
+				if err := h.db.UpdateDomain(domain); err != nil {
+					errMsg = fmt.Sprintf("Error updating domain: %v", err)
+				} else {
+					message = "Domain updated successfully"
+				}
 			}
 		}
 	}
 
 	// Build DNS records info
 	dnsRecords := h.buildDNSRecords(domain)
+	var reportAccounts []*store.Account
+	var reportRecipientID int64
+	if !isNew {
+		var err error
+		reportAccounts, err = h.db.ListAccounts(domain.ID)
+		if err != nil {
+			http.Error(w, "Unable to list report mailboxes", http.StatusInternalServerError)
+			return
+		}
+		reportRecipientID, _, err = h.db.DomainReportRecipient(domain.ID)
+		if err != nil {
+			http.Error(w, "Unable to load report recipient", http.StatusInternalServerError)
+			return
+		}
+	}
 
 	unread, _ := h.db.CountUnread(account.ID)
 
 	data := map[string]interface{}{
-		"Title":      fmt.Sprintf("Edit Domain - %s", domain.Domain),
-		"Domain":     domain,
-		"IsNew":      isNew,
-		"Message":    message,
-		"Error":      errMsg,
-		"DNSRecords": dnsRecords,
-		"Unread":     unread,
-		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
-		"Section":    "admin",
-		"Account":    account,
-		"Hostname":   h.cfg.Server.Hostname,
+		"Title":             fmt.Sprintf("Edit Domain - %s", domain.Domain),
+		"Domain":            domain,
+		"IsNew":             isNew,
+		"Message":           message,
+		"Error":             errMsg,
+		"DNSRecords":        dnsRecords,
+		"ReportAccounts":    reportAccounts,
+		"ReportRecipientID": reportRecipientID,
+		"Unread":            unread,
+		"CSRFToken":         h.sessionMgr.GenerateCSRFToken(r),
+		"Section":           "admin",
+		"AdminPanel":        "domains",
+		"Account":           account,
+		"Hostname":          h.cfg.Server.Hostname,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmplDomainEdit.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[admin] template error: %v", err)
 	}
+}
+
+// DomainReportRecipient selects a deliverable local mailbox for this domain's
+// DMARC and TLS-RPT DNS suggestions. It does not provision external DNS.
+func (h *AdminHandler) DomainReportRecipient(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	account := h.getAdmin(r)
+	if account == nil {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	domainID, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/admin/domain/report-recipient/"), 10, 64)
+	if err != nil || domainID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	domain, err := h.db.GetDomain(domainID)
+	if err != nil || domain == nil {
+		http.NotFound(w, r)
+		return
+	}
+	accountID, err := strconv.ParseInt(r.FormValue("report_account_id"), 10, 64)
+	if err != nil || accountID < 0 {
+		http.Error(w, "Invalid report mailbox", http.StatusBadRequest)
+		return
+	}
+	if err := h.db.SetDomainReportRecipient(domainID, accountID); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/admin/domain/edit/%d", domainID), http.StatusSeeOther)
 }
 
 // DomainGenerateDKIM generates DKIM keys for a domain.
@@ -384,7 +961,11 @@ func (h *AdminHandler) DomainDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.DeleteDomain(id)
+	if err := h.db.DeleteDomain(id); err != nil {
+		log.Printf("[admin] delete domain %d: %v", id, err)
+		http.Error(w, "Unable to delete domain", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/admin/domains", http.StatusSeeOther)
 }
 
@@ -475,21 +1056,41 @@ func (h *AdminHandler) AccountEdit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		acct.DomainID, _ = strconv.ParseInt(r.FormValue("domain_id"), 10, 64)
+		domainID, domainIDErr := strconv.ParseInt(r.FormValue("domain_id"), 10, 64)
+		acct.DomainID = domainID
 		acct.Email = strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 		acct.DisplayName = strings.TrimSpace(r.FormValue("display_name"))
 		acct.IsAdmin = r.FormValue("is_admin") == "1"
 		acct.IsActive = r.FormValue("is_active") == "1"
-		quotaMB, _ := strconv.ParseInt(r.FormValue("quota_mb"), 10, 64)
-		acct.QuotaBytes = quotaMB * 1048576
+		acct.AllowAliases = r.FormValue("allow_aliases") == "1"
+		quotaMB, quotaErr := strconv.ParseInt(r.FormValue("quota_mb"), 10, 64)
+		if quotaErr == nil && quotaMB >= 0 && quotaMB <= int64(^uint64(0)>>1)/1048576 {
+			acct.QuotaBytes = quotaMB * 1048576
+		}
 
 		password := r.FormValue("password")
 
-		if acct.Email == "" {
+		if domainIDErr != nil || domainID <= 0 {
+			errMsg = "A valid domain is required"
+		} else if quotaErr != nil {
+			errMsg = "Quota must be a whole number"
+		} else if quotaMB < 0 {
+			errMsg = "Quota cannot be negative"
+		} else if quotaMB > int64(^uint64(0)>>1)/1048576 {
+			errMsg = "Quota is too large"
+		} else if acct.Email == "" {
 			errMsg = "Email is required"
-		} else if acct.DomainID == 0 {
-			errMsg = "Domain is required"
-		} else if isNew {
+		} else {
+			domain, err := h.db.GetDomain(acct.DomainID)
+			if err != nil || domain == nil {
+				errMsg = "Selected domain does not exist"
+			} else if err := validateAccountEmail(acct.Email, domain.Domain); err != nil {
+				errMsg = err.Error()
+			} else if password != "" && len(password) < 12 {
+				errMsg = "Password must be at least 12 characters"
+			}
+		}
+		if errMsg == "" && isNew {
 			if password == "" {
 				errMsg = "Password is required for new accounts"
 			} else {
@@ -508,23 +1109,28 @@ func (h *AdminHandler) AccountEdit(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-		} else {
-			if err := h.db.UpdateAccount(acct); err != nil {
-				errMsg = fmt.Sprintf("Error updating account: %v", err)
-			} else {
-				message = "Account updated successfully"
-			}
-
-			// Update password if provided
+		} else if errMsg == "" {
+			passwordHash := ""
 			if password != "" {
 				hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 				if err != nil {
 					errMsg = "Error hashing password"
 				} else {
-					h.db.UpdateAccountPassword(acct.ID, string(hash))
-					if message != "" {
-						message += ". Password updated."
+					passwordHash = string(hash)
+				}
+			}
+			if errMsg == "" {
+				if err := h.db.UpdateAccountWithPassword(acct, passwordHash); err != nil {
+					errMsg = fmt.Sprintf("Error updating account: %v", err)
+				} else if passwordHash != "" {
+					if admin.ID == acct.ID {
+						h.sessionMgr.DestroySession(w, r)
+						http.Redirect(w, r, "/login", http.StatusSeeOther)
+						return
 					}
+					message = "Account and password updated successfully"
+				} else {
+					message = "Account updated successfully"
 				}
 			}
 		}
@@ -534,22 +1140,35 @@ func (h *AdminHandler) AccountEdit(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(admin.ID)
 
 	data := map[string]interface{}{
-		"Title":     fmt.Sprintf("Edit Account - %s", acct.Email),
-		"Acct":      acct,
-		"IsNew":     isNew,
-		"Domains":   domains,
-		"Message":   message,
-		"Error":     errMsg,
-		"Unread":    unread,
-		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
-		"Section":   "admin",
-		"Account":   admin,
+		"Title":      fmt.Sprintf("Edit Account - %s", acct.Email),
+		"Acct":       acct,
+		"IsNew":      isNew,
+		"Domains":    domains,
+		"Message":    message,
+		"Error":      errMsg,
+		"Unread":     unread,
+		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
+		"Section":    "admin",
+		"AdminPanel": "accounts",
+		"Account":    admin,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmplAccountEdit.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[admin] template error: %v", err)
 	}
+}
+
+func validateAccountEmail(address, domain string) error {
+	parsed, err := mail.ParseAddress(address)
+	if err != nil || parsed.Address != address {
+		return fmt.Errorf("Enter a valid email address without a display name")
+	}
+	parts := strings.Split(address, "@")
+	if len(parts) != 2 || parts[0] == "" || !strings.EqualFold(strings.TrimSuffix(parts[1], "."), strings.TrimSuffix(domain, ".")) {
+		return fmt.Errorf("Email address must belong to the selected domain")
+	}
+	return nil
 }
 
 // AccountDelete deletes an account.
@@ -583,7 +1202,11 @@ func (h *AdminHandler) AccountDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.DeleteAccount(id)
+	if err := h.db.DeleteAccount(id); err != nil {
+		log.Printf("[admin] delete account %d: %v", id, err)
+		http.Error(w, "Unable to delete account", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/admin/accounts", http.StatusSeeOther)
 }
 
@@ -654,12 +1277,31 @@ func (h *AdminHandler) buildDNSRecords(domain *store.Domain) []dnsRecord {
 		})
 	}
 
+	reportAddress := fmt.Sprintf("postmaster@%s", domain.Domain)
+	selectionValid := true
+	if domain.ID != 0 {
+		if selectedID, selected, err := h.db.DomainReportRecipient(domain.ID); err == nil && selectedID != 0 {
+			reportAddress = selected
+			mailbox, lookupErr := h.db.GetAccount(selectedID)
+			selectionValid = lookupErr == nil && mailbox != nil && mailbox.IsActive && mailbox.DomainID == domain.ID
+		} else if err != nil {
+			selectionValid = false
+		}
+	}
+	reportDestination, lookupErr := h.db.GetDeliveryAccount(reportAddress)
+	reportReady := selectionValid && lookupErr == nil && reportDestination != nil
+	dmarcValue := "(configure an active local report destination before publishing rua)"
+	tlsReportValue := "(configure an active local report destination before publishing rua)"
+	if reportReady {
+		dmarcValue = fmt.Sprintf("v=DMARC1; p=quarantine; rua=mailto:%s", reportAddress)
+		tlsReportValue = fmt.Sprintf("v=TLSRPTv1; rua=mailto:%s", reportAddress)
+	}
 	// DMARC Record
 	records = append(records, dnsRecord{
 		Type:    "TXT",
 		Name:    fmt.Sprintf("_dmarc.%s", domain.Domain),
-		Value:   fmt.Sprintf("v=DMARC1; p=quarantine; rua=mailto:postmaster@%s", domain.Domain),
-		Comment: "DMARC policy for email authentication",
+		Value:   dmarcValue,
+		Comment: "DMARC policy; publish only when the report destination delivers",
 	})
 
 	// MTA-STS Record
@@ -674,8 +1316,8 @@ func (h *AdminHandler) buildDNSRecords(domain *store.Domain) []dnsRecord {
 	records = append(records, dnsRecord{
 		Type:    "TXT",
 		Name:    fmt.Sprintf("_smtp._tls.%s", domain.Domain),
-		Value:   fmt.Sprintf("v=TLSRPTv1; rua=mailto:postmaster@%s", domain.Domain),
-		Comment: "TLS reporting endpoint",
+		Value:   tlsReportValue,
+		Comment: "TLS reporting endpoint; publish only when the destination delivers",
 	})
 
 	// PTR Record
@@ -920,7 +1562,7 @@ func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Reque
 		}
 
 		// Use our organization's domain as sender
-		senderEmail := fmt.Sprintf("postmaster@%s", h.cfg.Server.Domain)
+		senderEmail := h.cfg.Server.TLSReportSenderAddress()
 		messageBody := reporting.BuildTLSRPTEmail(h.cfg.Server.Domain, senderEmail, report, recipientEmail)
 
 		if err := h.enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
@@ -948,6 +1590,10 @@ func (h *AdminHandler) GreylistingEntries(w http.ResponseWriter, r *http.Request
 	account := h.getAdmin(r)
 	if account == nil {
 		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if r.Method == http.MethodPost && !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
 
@@ -1032,6 +1678,10 @@ func (h *AdminHandler) TarpittingEntries(w http.ResponseWriter, r *http.Request)
 	account := h.getAdmin(r)
 	if account == nil {
 		http.Redirect(w, r, "/inbox", http.StatusSeeOther)
+		return
+	}
+	if r.Method == http.MethodPost && !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
 

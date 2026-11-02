@@ -1,11 +1,11 @@
-.PHONY: build test clean run help
+.PHONY: build test test-e2e test-e2e-install clean run help
 
 # Build variables
 BINARY_NAME=gomail
 RELEASE_DIR=release
 BUILD_DIR=build
 # Keep runtime data and release artifacts out of source-package discovery.
-GO_PACKAGES=. ./auth ./config ./delivery ./dns ./logging ./mailclient ./mdn ./mta_sts ./parser ./reporting ./security ./smtp ./store ./templates ./tls ./web ./web/handlers
+GO_PACKAGES=. ./auth ./backup ./config ./delivery ./dns ./logging ./mailclient ./mdn ./metrics ./mta_sts ./parser ./reporting ./security ./smtp ./store ./templates ./tls ./web ./web/handlers
 
 # Default target
 help:
@@ -14,6 +14,8 @@ help:
 	@echo "  make clean       - Remove build artifacts"
 	@echo "  make run         - Run with config.dev.json"
 	@echo "  make hash        - Hash a password (usage: make hash PASSWORD=test)"
+	@echo "  make test-e2e    - Run Playwright browser/accessibility tests"
+	@echo "  Backup/restore commands are provided by release/gomail; see docs/deployment.md"
 
 # Build target
 build:
@@ -67,3 +69,10 @@ deps:
 # Run regression tests
 test:
 	go test $(GO_PACKAGES)
+
+# Browser dependencies are intentionally separate from normal Go builds.
+test-e2e-install:
+	cd e2e && pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium firefox webkit
+
+test-e2e:
+	cd e2e && pnpm test

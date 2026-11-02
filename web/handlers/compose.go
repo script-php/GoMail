@@ -3,10 +3,12 @@ package handlers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 
 	"gomail/config"
 	"gomail/delivery"
+	"gomail/metrics"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
@@ -61,6 +64,15 @@ func (h *ComposeHandler) ComposePage(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Sscan(raw, &draftID); err == nil {
 			draft, _ := h.db.GetMessage(draftID, account.ID)
 			if draft != nil && draft.Direction == "draft" {
+				draftsFolder, err := h.db.GetFolderByType(account.ID, "drafts")
+				if err != nil || draftsFolder == nil {
+					http.Error(w, "Drafts folder unavailable", http.StatusInternalServerError)
+					return
+				}
+				if draft.IsDeleted || draft.FolderID == nil || *draft.FolderID != draftsFolder.ID {
+					http.Redirect(w, r, fmt.Sprintf("/message/%d", draft.ID), http.StatusSeeOther)
+					return
+				}
 				prefill = map[string]string{"to": draft.ToAddr, "cc": draft.CcAddr, "subject": draft.Subject, "body": draft.TextBody, "priority": "3"}
 			} else {
 				draftID = 0
@@ -129,6 +141,9 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("File too large or invalid form: %v", err), http.StatusBadRequest)
 		return
 	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 
 	to := r.FormValue("to")
 	cc := r.FormValue("cc")
@@ -148,13 +163,26 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse recipients
-	recipients := parseRecipients(to)
+	recipients, err := parseRecipients(to)
+	if err != nil {
+		http.Error(w, "Invalid To address: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	if cc != "" {
-		recipients = append(recipients, parseRecipients(cc)...)
+		ccRecipients, err := parseRecipients(cc)
+		if err != nil {
+			http.Error(w, "Invalid Cc address: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		recipients = append(recipients, ccRecipients...)
 	}
 
 	if len(recipients) == 0 {
 		http.Error(w, "No valid recipients", http.StatusBadRequest)
+		return
+	}
+	if limits := h.db.OutboundLimits(); limits.Enabled && len(recipients) > limits.MaxRecipientsPerMessage {
+		http.Error(w, fmt.Sprintf("A message can have at most %d recipients", limits.MaxRecipientsPerMessage), http.StatusUnprocessableEntity)
 		return
 	}
 
@@ -176,7 +204,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if isLocal {
-			acct, err := h.db.GetAccountByEmail(rcpt)
+			acct, err := h.db.GetDeliveryAccount(rcpt)
 			if err != nil || acct == nil || !acct.IsActive {
 				validationErrors = append(validationErrors, fmt.Sprintf("Recipient not found: %s", rcpt))
 			}
@@ -301,9 +329,8 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	var msg strings.Builder
 
-	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID, to, time.Now()))
+	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID, strings.Join(recipients, ", "), time.Now()))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
-	msg.WriteString(fmt.Sprintf("Return-Path: <%s>\r\n", from))
 
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
 	if cc != "" {
@@ -381,6 +408,20 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	enqueueErr := h.queue.Enqueue(from, recipients, []byte(msg.String()), account.ID)
 	if enqueueErr != nil {
 		log.Printf("[web] enqueue error: %v", enqueueErr)
+		if errors.Is(enqueueErr, store.ErrOutboundLimit) {
+			metrics.IncOutboundLimit("webmail")
+			http.Error(w, "Your outbound sending limit was reached. Try again later or contact an administrator.", http.StatusTooManyRequests)
+			return
+		}
+		if errors.Is(enqueueErr, store.ErrDiskPressure) {
+			http.Error(w, "The server is temporarily low on storage. Please try again later.", http.StatusInsufficientStorage)
+			return
+		}
+		if errors.Is(enqueueErr, store.ErrQuotaExceeded) {
+			metrics.IncQuota("webmail")
+			http.Error(w, "Mailbox quota exceeded. Permanently delete messages or ask an administrator to increase the quota.", http.StatusInsufficientStorage)
+			return
+		}
 		http.Error(w, "Failed to send message", http.StatusInternalServerError)
 		return
 	}
@@ -435,6 +476,15 @@ func (h *ComposeHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.FormValue("draft_id"), 10, 64)
 	id, err := h.db.SaveDraft(account.ID, id, account.Email, r.FormValue("to"), r.FormValue("cc"), r.FormValue("subject"), r.FormValue("body"))
 	if err != nil {
+		if errors.Is(err, store.ErrDiskPressure) {
+			http.Error(w, "Server storage is temporarily low", http.StatusInsufficientStorage)
+			return
+		}
+		if errors.Is(err, store.ErrQuotaExceeded) {
+			metrics.IncQuota("draft")
+			http.Error(w, "Mailbox quota exceeded", http.StatusInsufficientStorage)
+			return
+		}
 		http.Error(w, "Unable to save draft", http.StatusBadRequest)
 		return
 	}
@@ -471,24 +521,24 @@ func (h *ComposeHandler) DeleteDraft(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseRecipients splits a comma/semicolon-separated list of email addresses.
-func parseRecipients(s string) []string {
-	s = strings.ReplaceAll(s, ";", ",")
-	parts := strings.Split(s, ",")
-	var result []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		// Extract from "Name <email>" format
-		if idx := strings.LastIndex(p, "<"); idx >= 0 {
-			end := strings.Index(p[idx:], ">")
-			if end > 0 {
-				p = p[idx+1 : idx+end]
-			}
-		}
-		if p != "" && strings.Contains(p, "@") {
-			result = append(result, p)
-		}
+func parseRecipients(s string) ([]string, error) {
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, fmt.Errorf("recipient list contains a line break")
 	}
-	return result
+	s = strings.ReplaceAll(s, ";", ",")
+	addresses, err := mail.ParseAddressList(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid mailbox syntax")
+	}
+	result := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		value := strings.TrimSpace(address.Address)
+		if strings.ContainsAny(value, "\r\n<>") || !strings.Contains(value, "@") {
+			return nil, fmt.Errorf("invalid mailbox syntax")
+		}
+		result = append(result, value)
+	}
+	return result, nil
 }
 
 // priorityToText converts X-Priority numeric value to RFC 2156 Priority text value

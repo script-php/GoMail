@@ -42,13 +42,16 @@ Keep mail-client access off until public SMTP/webmail are stable:
 ```json
 "mail_clients": {
   "enabled": false,
+  "imap": { "enabled": false, "listen_addr": ":993" },
   "pop3": { "enabled": true, "listen_addr": ":995" },
   "submission": { "enabled": true, "listen_addr": ":587" }
 }
 ```
 
-When TLS and firewall rules are ready, changing only the master flag enables the
-two subservices unless either child `enabled` value is false.
+When TLS and firewall rules are ready, changing the master flag enables POP3
+and submission unless either child switch is false. IMAP always requires its
+own explicit switch and should remain off until its compatibility testing is
+complete.
 
 ## DNS rollout
 
@@ -92,10 +95,12 @@ Only after enabling mail-client services:
 ```bash
 sudo ufw allow 587/tcp
 sudo ufw allow 995/tcp
+# Experimental IMAP only when explicitly enabled:
+sudo ufw allow 993/tcp
 ```
 
-Port 993 is not needed because IMAP is not implemented. Port 587 is authenticated
-submission, not the public server-to-server SMTP listener.
+Port 993 is used only by explicitly enabled experimental IMAP. Port 587 is
+authenticated submission, not the public server-to-server SMTP listener.
 
 ## Reverse proxy
 
@@ -117,6 +122,13 @@ openssl s_client -starttls smtp -connect mail.example.com:25 -servername mail.ex
 ```
 
 When mail clients are enabled:
+
+```bash
+curl -fsS 'https://mail.example.com/mail/config-v1.1.xml?emailaddress=user@example.com'
+curl -fsS -X POST -H 'Content-Type: application/xml' \
+  --data '<Autodiscover><Request><EMailAddress>user@example.com</EMailAddress></Request></Autodiscover>' \
+  https://mail.example.com/autodiscover/autodiscover.xml
+```
 
 ```bash
 openssl s_client -connect mail.example.com:995 -servername mail.example.com
@@ -144,15 +156,87 @@ Health endpoints do not replace a functional send/receive probe.
 
 ## Backup and restore
 
-Back up the database and attachment directory from the same recovery point.
+For MySQL, an opt-in isolated round-trip test is available:
 
-- SQLite: pause ingestion or use the SQLite online backup command/snapshot, then
-  capture attachments consistently. Do not blindly copy a live WAL database
-  without its WAL/SHM state or a database-aware backup.
-- MySQL: use a consistent dump/snapshot and capture attachments corresponding to
-  that point.
-- Also preserve configuration and ACME state, protect private keys, encrypt
-  backups and keep at least one off-host copy.
+```sh
+GOMAIL_TEST_MYSQL_CONFIG=/absolute/path/to/config.local.json \
+  go test ./backup -run TestMySQLBackupRestoreIsolatedRoundTrip -count=1
+```
+
+It creates two uniquely named disposable databases, restores into the second,
+compares restored data, then drops both. Run it only with a test MySQL account
+that can create and drop those databases; the configured production database is
+not used as either target. Normal application accounts usually lack those
+privileges. This does not replace a separately observed operator restore drill.
+
+GoMail provides a versioned `tar.gz` backup containing a consistent SQLite
+snapshot or MySQL dump, attachments, configuration, ACME state and manual TLS
+key/certificate files. Its manifest records GoMail/format versions, database
+row counts, sizes and SHA-256 hashes.
+
+The running server and backup/restore commands use the same exclusive instance
+lock. Stop GoMail before creating or restoring an archive; the command refuses
+to proceed if another new-version GoMail process owns the instance.
+
+```bash
+sudo systemctl stop gomail
+./gomail -config ./config.local.json -backup /secure/gomail-2026-10-14.tar.gz
+./gomail -verify-backup /secure/gomail-2026-10-14.tar.gz
+sudo systemctl start gomail
+```
+
+For MySQL, `mysqldump` must be installed. GoMail invokes it with
+`--single-transaction`; the configured password is supplied through the child
+process environment rather than command arguments.
+
+Restore is deliberately destructive and requires both a stopped instance and
+explicit confirmation:
+
+```bash
+sudo systemctl stop gomail
+./gomail -config ./config.local.json \
+  -restore-backup /secure/gomail-2026-10-14.tar.gz -force-restore
+sudo systemctl start gomail
+```
+
+Restore verifies every archive hash, requires the configuration and matching
+database snapshot, and rejects duplicate archive paths before replacing
+configured state. SQLite restores stage all filesystem replacements before
+removing the old WAL/SHM sidecars. Restore refuses filesystem-root,
+current-directory, or overlapping destinations (for example, a configuration
+file inside the attachment directory). MySQL restore requires the `mysql`
+command. Before importing into MySQL, GoMail creates and verifies a
+`gomail-pre-restore-*.tar.gz` safety archive next to the configuration file; if
+that fails, restore does not begin. Keep that archive until the restored server
+has been checked. For MySQL, attachment and ACME trees are also fully staged
+on their destination filesystems before the dump import starts. The restored
+configuration and any manual TLS certificate/key are likewise staged as sibling
+files before import; staging failure leaves the live database untouched. MySQL
+dump imports and the later filesystem swaps are not atomic together: if restore
+fails partway through, stop the server and recover
+from the safety archive before accepting mail. The restored configuration is
+the configuration preserved inside the requested archive.
+
+Attachment and certificate directory restores are copied into a sibling staging
+directory and swapped only after the full tree succeeds. A staging failure
+therefore leaves the live tree untouched.
+
+Archives contain passwords, private keys and message data. GoMail restricts the
+archive to mode `0600`, but it does not manage encryption or retention. Encrypt
+the archive, keep at least one off-host copy and protect its encryption key
+separately. The backup command refuses to overwrite an existing archive.
+
+Administrators can also open **Admin → Backups** to create an online verified
+backup or configure an interval and retention count. Online archives use a
+database snapshot/dump and immutable attachment files, then verify every hash;
+a concurrent file change fails the backup instead of publishing an inconsistent
+archive. The page writes archives only to the configured server directory and
+never offers secret-bearing archives as browser downloads. Automatic retention
+deletes only files matching GoMail's `gomail-*.tar.gz` naming pattern.
+
+The admin scheduler is convenient, but the stopped-service CLI procedure above
+remains the strongest recovery-point boundary. Use the CLI for upgrades and
+before high-risk maintenance.
 
 Restore into an isolated host and verify schema startup, account/message counts,
 attachment hashes, login, draft access, inbound SMTP, local delivery, queued
@@ -168,9 +252,26 @@ until a restore drill succeeds.
 5. Keep the previous binary and backup. Schema synchronization is additive, but
    a binary rollback may still be incompatible with newly written data.
 
+## Admin configuration editor
+
+The admin-only `/admin/configuration` page offers a sectioned form and a raw
+JSON view. Both can test and atomically save the full configuration. Existing
+database passwords, session/CSRF secrets, bootstrap password hashes and metrics
+bearer tokens are write-only: blank form fields or unchanged JSON placeholders
+keep the saved value. Every successful save leaves a mode-0600,
+timestamped `config.json.backup-*` copy beside the configured file and writes a
+redacted audit log containing only the administrator account ID and changed
+top-level sections.
+
+Logging level/format and outbound-limit changes are applied live. Other changes deliberately do
+not rebuild active listeners or security middleware; the page displays a
+restart-required warning until GoMail starts with the saved file. Protect the
+configuration directory because both the current file and previous copies may
+contain secrets.
+
 ## Scale boundary
 
 Current queue claiming is coordinated inside one process. Do not run multiple
-GoMail application instances against one database. Large mailboxes still use
-offset pagination, and full high-volume/provider-scale operation has not been
-validated.
+GoMail application instances against one database. Mailbox, folder and search
+views use indexed keyset pagination, but full high-volume/provider-scale
+operation has not been validated.

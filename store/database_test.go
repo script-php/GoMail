@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gomail/config"
 )
@@ -29,6 +30,15 @@ func TestSQLiteStartupAndAdditiveMigration(t *testing.T) {
 	if _, err = db.Exec(`ALTER TABLE domains DROP COLUMN greylisting_delay_minutes`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = db.Exec(`ALTER TABLE outbound_queue DROP COLUMN dsn_attempts`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`ALTER TABLE outbound_queue DROP COLUMN dsn_retry_at`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`ALTER TABLE outbound_queue_retention DROP COLUMN verp_days`); err != nil {
+		t.Fatal(err)
+	}
 	db.Close()
 	db, err = OpenConfig(cfg)
 	if err != nil {
@@ -42,9 +52,21 @@ func TestSQLiteStartupAndAdditiveMigration(t *testing.T) {
 	if note != "preserve me" || delay != 15 {
 		t.Fatalf("migration lost data or default: %q %d", note, delay)
 	}
+	queueID, err := db.EnqueueMessage(&QueueEntry{MailFrom: "user@example.com", RcptTo: "remote@example.net", RawMessage: []byte("Subject: fixture\r\n\r\nbody"), MaxAttempts: 1, NextRetry: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts int
+	var retryAt string
+	if err = db.QueryRow(`SELECT dsn_attempts, dsn_retry_at FROM outbound_queue WHERE id = ?`, queueID).Scan(&attempts, &retryAt); err != nil || attempts != 0 || retryAt == "" {
+		t.Fatalf("DSN retry columns not migrated: attempts=%d at=%q err=%v", attempts, retryAt, err)
+	}
 	var count int
 	if err = db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = 'mailbox_folders_v1'`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("migration history: %d %v", count, err)
+	}
+	if days, err := db.VERPRetentionDays(); err != nil || days != 0 {
+		t.Fatalf("VERP retention column not migrated: %d %v", days, err)
 	}
 }
 

@@ -19,3 +19,15 @@ func TestSanitizeHTMLAllowlist(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteImagesBlockedUnlessExplicitlyAllowed(t *testing.T) {
+	input := `<img src="https://tracker.example/pixel"><img src="cid:part1"><img src="data:image/png;base64,iVBORw0KGgo="><img src="data:text/html;base64,PHNjcmlwdD4=">`
+	blocked := sanitizeHTML(input)
+	if strings.Contains(blocked, "tracker.example") || strings.Contains(blocked, "data:text/html") || !strings.Contains(blocked, "cid:part1") || !strings.Contains(blocked, "data:image/png") {
+		t.Fatalf("default image policy: %s", blocked)
+	}
+	allowed := sanitizeHTMLWithRemoteImages(input, true)
+	if !strings.Contains(allowed, "https://tracker.example/pixel") || strings.Contains(allowed, "data:text/html") {
+		t.Fatalf("explicit image policy: %s", allowed)
+	}
+}

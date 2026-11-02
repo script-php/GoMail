@@ -138,6 +138,18 @@ v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4...
 
 Specifies how receivers handle emails failing DKIM/SPF.
 
+Before publishing `rua=`, create the destination as an active mailbox or an
+Admin → Aliases virtual address pointing to an active local mailbox (or
+otherwise verify it accepts mail). The Admin → Received Reports page can
+analyze a selected local mailbox, but enabling that page does not create an
+address or change DNS. Admin → Domains → Edit lets you select a local active
+mailbox as the report recipient for each domain. By default, DNS suggestions
+use `postmaster@your-domain`. An explicit mailbox or admin alias takes priority;
+otherwise GoMail routes postmaster mail to an active administrator. If the
+selected recipient becomes inactive or no fallback administrator is available,
+the DNS page withholds copy-ready report records. Publish and verify DNS and
+external report delivery separately.
+
 ```
 _dmarc.example.com     TXT     "v=DMARC1; p=quarantine; rua=mailto:admin@example.com"
 ```
@@ -252,9 +264,10 @@ _smtp._tls.example.com     TXT     "v=TLSRPTv1; rua=mailto:admin@example.com"
 | Value | `v=TLSRPTv1; rua=mailto:admin@example.com` |
 | TTL | 3600 |
 
-GoMail's TLS-RPT pipeline currently records failures, but complete success
-counts and policy grouping remain under development. Keep independent transport
-monitoring even when this record is published.
+GoMail records outbound TLS successes and failures and groups policy results
+for its own reports. Keep independent transport monitoring even when this
+record is published. Incoming TLS-RPT messages can be summarized by Admin →
+Received Reports after selecting the mailbox named in this DNS record.
 
 ### 10. DNSSEC and TLSA/DANE (Optional, Advanced)
 
@@ -282,6 +295,22 @@ dig +dnssec TLSA _25._tcp.mail.example.com
 Check that the resolver used by GoMail returns authenticated data. During
 certificate/key rotation, overlap valid TLSA records so required-mode senders do
 not see a mismatch. See [DANE behavior](dane_implementation.md).
+
+### Mail-client discovery records
+
+After enabling and testing the corresponding listeners, point the conventional
+client-discovery hostnames at the HTTPS host serving GoMail:
+
+```text
+autoconfig.example.com.   CNAME   mail.example.com.
+autodiscover.example.com. CNAME   mail.example.com.
+_imaps._tcp.example.com.  SRV 0 1 993 mail.example.com.
+_submission._tcp.example.com. SRV 0 1 587 mail.example.com.
+```
+
+The HTTPS certificate must cover every discovery hostname clients contact.
+Do not publish a service record for a listener that is disabled or blocked by
+the firewall.
 
 ## Complete Single Domain Example
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -9,17 +10,20 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	backupops "gomail/backup"
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/dns"
 	"gomail/logging"
 	"gomail/mailclient"
+	"gomail/metrics"
 	"gomail/reporting"
 	"gomail/smtp"
 	"gomail/store"
@@ -31,7 +35,19 @@ func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
 	hashPassword := flag.String("hash-password", "", "Generate bcrypt hash for a password")
 	register := flag.Bool("register", false, "Install as systemd service (requires sudo)")
+	backupPath := flag.String("backup", "", "Create a verified offline backup archive at this path")
+	verifyBackupPath := flag.String("verify-backup", "", "Verify a GoMail backup archive")
+	restoreBackupPath := flag.String("restore-backup", "", "Restore a verified offline backup archive")
+	forceRestore := flag.Bool("force-restore", false, "Required destructive confirmation for -restore-backup")
 	flag.Parse()
+	if *verifyBackupPath != "" {
+		manifest, err := backupops.Verify(*verifyBackupPath)
+		if err != nil {
+			log.Fatalf("Backup verification failed: %v", err)
+		}
+		fmt.Printf("Backup verified: version=%d created=%s database=%s files=%d counts=%v\n", manifest.FormatVersion, manifest.CreatedAt.Format(time.RFC3339), manifest.Database, len(manifest.Files), manifest.Counts)
+		return
+	}
 
 	// Check for positional arguments (e.g., "./gomail register")
 	args := flag.Args()
@@ -79,9 +95,30 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	if *backupPath != "" {
+		manifest, err := backupops.Create(cfg, *configPath, *backupPath, config.Version())
+		if err != nil {
+			log.Fatalf("Backup failed: %v", err)
+		}
+		fmt.Printf("Backup created and verified: %s (files=%d counts=%v)\n", *backupPath, len(manifest.Files), manifest.Counts)
+		return
+	}
+	if *restoreBackupPath != "" {
+		manifest, err := backupops.Restore(cfg, *configPath, *restoreBackupPath, *forceRestore)
+		if err != nil {
+			log.Fatalf("Restore failed: %v", err)
+		}
+		fmt.Printf("Backup restored: version=%d created=%s files=%d counts=%v\n", manifest.FormatVersion, manifest.CreatedAt.Format(time.RFC3339), len(manifest.Files), manifest.Counts)
+		return
+	}
+	instanceLock, err := backupops.AcquireInstanceLock(cfg)
+	if err != nil {
+		log.Fatalf("Failed to acquire instance lock: %v", err)
+	}
+	defer instanceLock.Close()
 
 	// Initialize logging from config
-	logging.CurrentLevel = logging.ParseLevel(cfg.Logging.Level)
+	logging.Configure(cfg.Logging.Level, cfg.Logging.Format)
 	logging.Info(fmt.Sprintf("[main] GoMail %s starting (hostname=%s, log_level=%s)", config.Version(), cfg.Server.Hostname, logging.GetLevelName(logging.CurrentLevel)))
 
 	// Initialize DNS cache
@@ -93,6 +130,19 @@ func main() {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
+	databaseDirectory := filepath.Dir(cfg.Store.DBPath)
+	if cfg.Store.Database == "mysql" {
+		databaseDirectory = cfg.Store.AttachmentsPath
+	}
+	db.ConfigureDiskPressure(cfg.StoragePressure.WarningFreeBytes, cfg.StoragePressure.MinimumFreeBytes, databaseDirectory, cfg.Store.AttachmentsPath)
+	db.ConfigureOutboundLimits(cfg.OutboundLimits)
+	if diskStatus, diskErr := db.DiskPressureStatus(); diskErr != nil {
+		log.Fatalf("Failed to check storage pressure: %v", diskErr)
+	} else if diskStatus.RefusingWrites {
+		logging.Error(fmt.Sprintf("[storage] write refusal active: free=%d minimum=%d path=%s", diskStatus.FreeBytes, diskStatus.MinimumFree, diskStatus.Path))
+	} else if diskStatus.Warning {
+		logging.Warn(fmt.Sprintf("[storage] low free space: free=%d warning=%d path=%s", diskStatus.FreeBytes, diskStatus.WarningFree, diskStatus.Path))
+	}
 	logging.Info("[main] database opened")
 
 	// Bootstrap admin: create initial domain + account if no accounts exist
@@ -114,6 +164,21 @@ func main() {
 		}
 	} else {
 		logging.Info("[main] SMTP STARTTLS disabled (tls.mode=none)")
+	}
+
+	var metricsServer *metrics.Server
+	if cfg.Metrics.Enabled {
+		var certificateExpiry *time.Time
+		if expiry, available := certMgr.CertificateExpiry(cfg.Server.Hostname); available {
+			certificateExpiry = &expiry
+		}
+		metricsServer = metrics.NewServer(cfg.Metrics, db, certificateExpiry)
+		go func() {
+			logging.Info(fmt.Sprintf("[metrics] listening on %s", cfg.Metrics.ListenAddr))
+			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logging.Error(fmt.Sprintf("[metrics] server error: %v", err))
+			}
+		}()
 	}
 
 	// Start SMTP inbound server
@@ -156,10 +221,15 @@ func main() {
 		// Use account ID 0 for system-generated reports
 		return queue.Enqueue(from, []string{to}, []byte(message), 0)
 	}
-	reporting.ScheduleWeeklyReports(cfg, db, enqueueFunc)
+	reporting.ScheduleDailyDMARCReports(cfg, db, enqueueFunc)
+	reporting.ScheduleDailyTLSReports(cfg, db, enqueueFunc)
+	stopReportScanner := reporting.RunReceivedReportScanner(db)
+	defer stopReportScanner()
+	backupManager := backupops.NewManager(cfg, db, *configPath, config.Version())
+	backupManager.Start()
 
 	// Start web server
-	webServer := web.NewServer(cfg, db, queue, enqueueFunc)
+	webServer := web.NewServer(cfg, db, queue, enqueueFunc, backupManager)
 
 	if cfg.Web.IsTLSEnabled() {
 		// TLS mode: HTTPS on listen_addr, HTTP redirect + ACME on http_addr
@@ -219,10 +289,18 @@ func main() {
 	<-sigChan
 
 	logging.Info("[main] shutting down...")
+	backupManager.Stop()
 	smtpServer.Stop()
 	clientServer.Stop()
 	deliveryPool.Stop()
 	webServer.Shutdown()
+	if metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metricsServer.Shutdown(ctx); err != nil {
+			logging.Warn(fmt.Sprintf("[metrics] shutdown error: %v", err))
+		}
+	}
 	logging.Info("[main] GoMail stopped.")
 }
 

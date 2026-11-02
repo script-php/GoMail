@@ -160,8 +160,8 @@ func TestMySQLIntegration(t *testing.T) {
 			t.Fatalf("%s: %v", action, err)
 		}
 	}
-	found, total, err := db.SearchMessages(account, "%_!", 50, 0)
-	if err != nil || total != 1 || len(found) != 1 {
+	page, total, err := db.SearchMessagesPage(account, "%_!", 50, nil)
+	if err != nil || total != 1 || len(page.Messages) != 1 {
 		t.Fatalf("search: %d %v", total, err)
 	}
 	for _, value := range []string{"first", "second"} {

@@ -21,13 +21,16 @@ func NewRetrySchedule(intervals []int) *RetrySchedule {
 // based on the last interval.
 func (r *RetrySchedule) NextRetry(attempt int) time.Time {
 	var delaySec int
-
-	if attempt < len(r.Intervals) {
-		delaySec = r.Intervals[attempt]
+	index := attempt - 1 // Attempt 1 is the initial failure and first retry delay.
+	if index < 0 {
+		index = 0
+	}
+	if index < len(r.Intervals) {
+		delaySec = r.Intervals[index]
 	} else {
 		// Exponential backoff from last interval
 		lastInterval := r.Intervals[len(r.Intervals)-1]
-		extra := attempt - len(r.Intervals) + 1
+		extra := index - len(r.Intervals) + 1
 		delaySec = lastInterval * int(math.Pow(2, float64(extra)))
 		// Cap at 48 hours
 		if delaySec > 172800 {

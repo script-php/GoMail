@@ -4,8 +4,8 @@ import "fmt"
 
 // POP3Message is the immutable snapshot exposed during one POP3 maildrop session.
 type POP3Message struct {
-	ID         int64
-	RawMessage []byte
+	ID     int64
+	Octets int
 }
 
 // ListPOP3Messages returns the account's current Inbox maildrop in stable ID order.
@@ -25,12 +25,45 @@ func (db *DB) ListPOP3Messages(accountID int64) ([]POP3Message, error) {
 	var messages []POP3Message
 	for rows.Next() {
 		var message POP3Message
-		if err := rows.Scan(&message.ID, &message.RawMessage); err != nil {
+		var raw []byte
+		if err := rows.Scan(&message.ID, &raw); err != nil {
 			return nil, fmt.Errorf("scanning POP3 maildrop: %w", err)
 		}
+		message.Octets = pop3CanonicalOctets(raw)
 		messages = append(messages, message)
 	}
 	return messages, rows.Err()
+}
+
+// GetPOP3MessageRaw loads one message body when RETR or TOP needs it.
+func (db *DB) GetPOP3MessageRaw(accountID, messageID int64) ([]byte, error) {
+	var raw []byte
+	err := db.QueryRow(`SELECT raw_message FROM messages WHERE id = ? AND account_id = ?`, messageID, accountID).Scan(&raw)
+	return raw, err
+}
+
+func pop3CanonicalOctets(raw []byte) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	n := 0
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '\r':
+			n += 2
+			if i+1 < len(raw) && raw[i+1] == '\n' {
+				i++
+			}
+		case '\n':
+			n += 2
+		default:
+			n++
+		}
+	}
+	if last := raw[len(raw)-1]; last != '\r' && last != '\n' {
+		n += 2
+	}
+	return n
 }
 
 // DeletePOP3Messages atomically validates ownership and moves selected Inbox
@@ -62,11 +95,15 @@ func (db *DB) DeletePOP3Messages(accountID int64, messageIDs []int64) error {
 		if err != nil || changed != 1 {
 			return fmt.Errorf("POP3 message %d is no longer in this maildrop", id)
 		}
+		if err := db.moveIMAPMessageState(tx, id, trashID); err != nil {
+			return fmt.Errorf("updating IMAP state for POP3 message %d: %w", id, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	_ = db.UpdateFolderCounts(inboxID)
 	_ = db.UpdateFolderCounts(trashID)
+	db.NotifyIMAPChanges(accountID)
 	return nil
 }

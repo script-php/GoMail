@@ -25,7 +25,28 @@ function updateSelection() {
     if (master) { master.checked = count > 0 && count === boxes.length; master.indeterminate = count > 0 && count < boxes.length; }
     var label = document.getElementById('selection-count');
     if (label) label.textContent = count ? count + ' selected' : '';
-    document.querySelectorAll('[data-bulk-action], #move-folder').forEach(function(el) { el.disabled = !count; });
+    document.querySelectorAll('[data-bulk-action]').forEach(function(el) { el.disabled = !count; });
+    var move = document.getElementById('move-folder');
+    if (move) {
+        var selected = boxes.filter(function(cb) { return cb.checked; }).map(function(cb) { return cb.closest('.email-row'); });
+        var spam = Array.from(move.options).find(function(option) { return option.dataset.folderType === 'spam'; });
+        var spamID = spam ? spam.value : '';
+        var validSelection = selected.length && selected.every(function(row) { return row.dataset.direction === 'inbound' && row.dataset.deleted !== 'true'; });
+        var available = 0;
+        Array.from(move.options).forEach(function(option) {
+            if (!option.value) return;
+            var allowed = validSelection && selected.every(function(row) {
+                if (row.dataset.folderId === option.value) return false;
+                if (option.dataset.folderType === 'inbox') return row.dataset.folderId === spamID;
+                return option.dataset.folderType === 'spam' || option.dataset.folderType === 'custom';
+            });
+            option.hidden = !allowed;
+            option.disabled = !allowed;
+            if (allowed) available++;
+        });
+        move.value = '';
+        move.disabled = !available;
+    }
 }
 function bulkAction(action, folderID) {
     var ids = Array.from(document.querySelectorAll('.email-row input:checked')).map(function(cb) { return Number(cb.closest('.email-row').dataset.id); });
@@ -76,6 +97,7 @@ function toggleStar(messageId, event) {
         } else {
             btn.classList.remove('starred');
             btn.innerHTML = '&#9734;';
+            if (window.location.pathname === '/starred') window.location.reload();
         }
     })
     .catch(showMailError);
@@ -130,9 +152,36 @@ document.addEventListener('DOMContentLoaded', function() {
 	var composeForm=document.getElementById('compose-form');
 	if(composeForm){
 		var draftStatus=document.getElementById('draft-status'), draftTimer, draftDirty=false;
-		function saveDraft(){if(!draftDirty)return Promise.resolve();var data=new URLSearchParams();['draft_id','to','cc','subject','body'].forEach(function(id){data.set(id,document.getElementById(id).value)});data.set('csrf_token',composeForm.elements.csrf_token.value);draftStatus.textContent='Saving…';return fetch('/api/drafts',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data}).then(function(r){if(!r.ok)throw new Error();return r.json()}).then(function(v){document.getElementById('draft_id').value=v.id;draftDirty=false;draftStatus.textContent='Draft saved';}).catch(function(){draftStatus.textContent='Draft could not be saved';});}
-		['to','cc','subject','body'].forEach(function(id){document.getElementById(id).addEventListener('input',function(){draftDirty=true;clearTimeout(draftTimer);draftTimer=setTimeout(saveDraft,1500)})});
-		document.getElementById('save-draft').addEventListener('click',function(){draftDirty=true;saveDraft()});composeForm.addEventListener('submit',function(){draftDirty=false;clearTimeout(draftTimer)});
+		var draftInFlight=null, draftRevision=0, submitting=false;
+		function saveDraft(){
+			if(submitting || !draftDirty || draftInFlight)return draftInFlight || Promise.resolve();
+			var revision=draftRevision, data=new URLSearchParams();
+			['draft_id','to','cc','subject','body'].forEach(function(id){data.set(id,document.getElementById(id).value)});
+			data.set('csrf_token',composeForm.elements.csrf_token.value);
+			draftDirty=false;
+			draftStatus.textContent='Saving…';
+			var succeeded=false;
+			draftInFlight=fetch('/api/drafts',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data})
+				.then(function(r){if(!r.ok)throw new Error();return r.json()})
+				.then(function(v){document.getElementById('draft_id').value=v.id;succeeded=true;if(draftRevision===revision)draftStatus.textContent='Draft saved'})
+				.catch(function(){draftDirty=true;draftStatus.textContent='Draft could not be saved'})
+				.finally(function(){draftInFlight=null;if(succeeded && draftDirty && !submitting){clearTimeout(draftTimer);saveDraft()}});
+			return draftInFlight;
+		}
+		['to','cc','subject','body'].forEach(function(id){document.getElementById(id).addEventListener('input',function(){draftRevision++;draftDirty=true;clearTimeout(draftTimer);draftTimer=setTimeout(saveDraft,1500)})});
+		document.getElementById('save-draft').addEventListener('click',function(){draftRevision++;draftDirty=true;clearTimeout(draftTimer);saveDraft()});
+		composeForm.addEventListener('submit',function(event){
+			clearTimeout(draftTimer);
+			if(draftInFlight){
+				event.preventDefault();
+				submitting=true;
+				var submitter=event.submitter;
+				draftInFlight.then(function(){if(composeForm.isConnected){if(submitter)composeForm.requestSubmit(submitter);else composeForm.requestSubmit()}});
+				return;
+			}
+			submitting=true;
+			draftDirty=false;
+		});
 	}
     // Menu toggle button
     var menuToggle = document.querySelector('.menu-toggle');

@@ -4,6 +4,14 @@
         <h2>Admin Dashboard</h2>
     </div>
 
+    {{if .DiskStatus.Warning}}
+    <div class="alert alert-warning" role="alert">
+        <strong>Storage warning:</strong> only {{formatSize .DiskStatus.FreeBytes}} remains on
+        <code>{{.DiskStatus.Path}}</code>.
+        {{if .DiskStatus.RefusingWrites}}New messages and backups are temporarily blocked.{{end}}
+    </div>
+    {{end}}
+
     <!-- Overview Cards -->
     <div class="dashboard-stats">
         <div class="stat-card">
@@ -61,6 +69,10 @@
             <a href="/admin/dmarc-feedback" class="btn">View DMARC Reports</a>
             <a href="/admin/tls-rpt" class="btn">View TLS-RPT Reports</a>
             <a href="/admin/verp-bounces" class="btn">View VERP Bounces</a>
+            <a href="/admin/backups" class="btn">Manage Backups</a>
+            <a href="/admin/outbound-limits" class="btn">Outbound Limits</a>
+            <a href="/admin/queue" class="btn">Outbound Queue</a>
+            <a href="/admin/configuration" class="btn">Server Configuration</a>
         </div>
     </div>
 

@@ -2,15 +2,32 @@ package mdn
 
 import (
 	"fmt"
+	"mime"
 	"strings"
 	"time"
 
 	"gomail/config"
 )
 
+func safeHeaderValue(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", " ")
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value))
+}
+
+func mdnSubject(originalSubject string) string {
+	return mime.QEncoding.Encode("utf-8", "Read: "+safeHeaderValue(originalSubject))
+}
+
 // GenerateMDN creates a Message Disposition Notification (RFC 3798) in simple text format
 // Returns: the MDN message as a single text/plain email (not multipart/report for simplicity)
 func GenerateMDN(originalMessageID, originalSubject, recipientEmail, senderEmail, hostname string) string {
+	originalMessageID, recipientEmail, senderEmail, hostname = safeHeaderValue(originalMessageID), safeHeaderValue(recipientEmail), safeHeaderValue(senderEmail), safeHeaderValue(hostname)
+	originalSubject = safeHeaderValue(originalSubject)
 	now := time.Now()
 	mdnMessageID := fmt.Sprintf("<%d.mdn@%s>", now.UnixNano(), hostname)
 
@@ -25,7 +42,7 @@ func GenerateMDN(originalMessageID, originalSubject, recipientEmail, senderEmail
 	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", recipientEmail))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", senderEmail))
-	msg.WriteString(fmt.Sprintf("Subject: Read: %s\r\n", originalSubject))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", mdnSubject(originalSubject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", now.Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", mdnMessageID))
 	msg.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", originalMessageID))
@@ -51,6 +68,8 @@ func GenerateMDN(originalMessageID, originalSubject, recipientEmail, senderEmail
 // GenerateMDNMultipart creates a proper RFC 3798 multipart/report MDN
 // This is a more complete implementation
 func GenerateMDNMultipart(originalMessageID, originalSubject, recipientEmail, senderEmail, hostname string) string {
+	originalMessageID, recipientEmail, senderEmail, hostname = safeHeaderValue(originalMessageID), safeHeaderValue(recipientEmail), safeHeaderValue(senderEmail), safeHeaderValue(hostname)
+	originalSubject = safeHeaderValue(originalSubject)
 	now := time.Now()
 	mdnMessageID := fmt.Sprintf("<%d.mdn@%s>", now.UnixNano(), hostname)
 	boundary := fmt.Sprintf("mdn-boundary-%d", now.UnixNano())
@@ -66,7 +85,7 @@ func GenerateMDNMultipart(originalMessageID, originalSubject, recipientEmail, se
 	))
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", recipientEmail))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", senderEmail))
-	msg.WriteString(fmt.Sprintf("Subject: Read: %s\r\n", originalSubject))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", mdnSubject(originalSubject)))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", now.Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", mdnMessageID))
 	msg.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", originalMessageID))

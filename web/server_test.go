@@ -50,6 +50,10 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 	if own != 1 || other != 2 {
 		t.Fatal("unexpected test IDs")
 	}
+	sentFolder, _ := db.GetFolderByType(1, "sent")
+	if _, err := db.SaveMessage(&store.Message{AccountID: 1, FolderID: &sentFolder.ID, MessageID: "sent", Direction: "outbound", FromAddr: "one@example.com", ToAddr: "recipient@example.net", Subject: "Needle sent", ReceivedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 	cfg := &config.Config{}
 	cfg.Web.SessionMaxAge = 3600
 	cfg.Security.CSRFKey = "test-key"
@@ -79,6 +83,7 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 	}{
 		{"GET", "/search?q=Needle", "", false, 200},
 		{"GET", "/inbox", "", false, 200},
+		{"GET", "/starred", "", false, 200},
 		{"GET", "/message/1", "", false, 200},
 		{"GET", "/settings", "", false, 200},
 		{"POST", "/message/star/1", "", false, 403},
@@ -105,7 +110,7 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 		if tc.method == "GET" && response.Code == 200 && !strings.Contains(response.Body.String(), "</html>") {
 			t.Fatalf("incomplete page: %s", tc.path)
 		}
-		if tc.path == "/search?q=Needle" && (!strings.Contains(response.Body.String(), "Needle") || strings.Contains(response.Body.String(), "Private")) {
+		if tc.path == "/search?q=Needle" && (!strings.Contains(response.Body.String(), "Needle") || strings.Contains(response.Body.String(), "Private") || !strings.Contains(response.Body.String(), "Received") || !strings.Contains(response.Body.String(), "Sent") || !strings.Contains(response.Body.String(), "To: recipient@example.net")) {
 			t.Fatal("bad search rendering")
 		}
 	}
@@ -126,6 +131,14 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 	if err := db.UpdateAccountPassword(1, string(oldHash)); err != nil {
 		t.Fatal(err)
 	}
+	login = httptest.NewRecorder()
+	if err := server.sessionMgr.CreateSession(login, "one@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	cookie = login.Result().Cookies()[0]
+	tokenRequest = httptest.NewRequest("GET", "/", nil)
+	tokenRequest.AddCookie(cookie)
+	csrf = server.sessionMgr.GenerateCSRFToken(tokenRequest)
 	passwordForm := "display_name=Mailbox+Owner&current_password=current-password&new_password=new-password-123&confirm_password=new-password-123"
 	passwordRequest := httptest.NewRequest("POST", "/settings", strings.NewReader(passwordForm))
 	passwordRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -133,7 +146,7 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 	passwordRequest.AddCookie(cookie)
 	passwordResponse := httptest.NewRecorder()
 	server.httpServer.Handler.ServeHTTP(passwordResponse, passwordRequest)
-	if passwordResponse.Code != http.StatusOK {
+	if passwordResponse.Code != http.StatusSeeOther || passwordResponse.Header().Get("Location") != "/login" {
 		t.Fatalf("password update: %d %s", passwordResponse.Code, passwordResponse.Body.String())
 	}
 	updated, _ = db.GetAccount(1)
@@ -149,5 +162,30 @@ func TestWebmailRoutesAndIsolation(t *testing.T) {
 	server.httpServer.Handler.ServeHTTP(response, req)
 	if response.Code != http.StatusSeeOther {
 		t.Fatal("disabled account kept access")
+	}
+}
+
+func TestReadinessFailsUnderDiskPressure(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(root+"/mail.db", root+"/attachments")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.ConfigureDiskPressure(1<<62+1, 1<<62, root)
+	cfg := &config.Config{}
+	cfg.Security.CSRFKey = "test-key"
+	server := NewServer(cfg, db, delivery.NewQueue(db, cfg), nil)
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "storage") {
+		t.Fatalf("readiness status=%d body=%s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	response = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("liveness was incorrectly degraded: %d", response.Code)
 	}
 }

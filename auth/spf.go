@@ -3,7 +3,6 @@ package auth
 import (
 	"fmt"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +84,8 @@ type spfContext struct {
 	lookups        int    // DNS lookup counter (max 10 per RFC 7208)
 	voidLookups    int    // Void lookup counter (max 2 per RFC 7208 §4.6.4)
 	timestamp      int64  // Current timestamp for %{t} macro
+	validatedName  string // Cached forward-confirmed reverse DNS name for %{p}
+	validatedSet   bool
 }
 
 // checkSPFDomainWithContext recursively checks SPF for included/redirected domains with full RFC 7208 support.
@@ -152,12 +153,18 @@ func checkSPFDomainWithContext(clientIP net.IP, domain string, depth int, ctx *s
 					return SPFPermError, "duplicate redirect modifier"
 				}
 				seenModifiers[name] = true
+				if err := validateMacroString(value, false); err != nil {
+					return SPFPermError, fmt.Sprintf("invalid redirect modifier: %v", err)
+				}
 				redirectDomain = value
 			case "exp":
 				if seenModifiers[name] {
 					return SPFPermError, "duplicate exp modifier"
 				}
 				seenModifiers[name] = true
+				if err := validateMacroString(value, false); err != nil {
+					return SPFPermError, fmt.Sprintf("invalid exp modifier: %v", err)
+				}
 				expModifier = value
 			default:
 				// RFC 7208 section 6: unrecognized modifiers are ignored.
@@ -328,6 +335,9 @@ func validateSPFMechanism(mechanism string) error {
 	default:
 		return fmt.Errorf("unknown SPF mechanism %q", mechanism)
 	}
+	if base == "all" && mechanism != "all" {
+		return fmt.Errorf("invalid all mechanism")
+	}
 	if base == "ip4" || base == "ip6" {
 		value := strings.TrimPrefix(mechanism, base+":")
 		if value == "" {
@@ -347,6 +357,17 @@ func validateSPFMechanism(mechanism string) error {
 	if base == "include" || base == "exists" {
 		if !strings.HasPrefix(mechanism, base+":") || len(mechanism) == len(base)+1 {
 			return fmt.Errorf("invalid %s mechanism", base)
+		}
+		if err := validateMacroString(strings.TrimPrefix(mechanism, base+":"), false); err != nil {
+			return fmt.Errorf("invalid %s domain-spec: %w", base, err)
+		}
+	}
+	if base == "ptr" && mechanism != "ptr" {
+		if !strings.HasPrefix(mechanism, "ptr:") || len(mechanism) == len("ptr:") {
+			return fmt.Errorf("invalid ptr mechanism")
+		}
+		if err := validateMacroString(strings.TrimPrefix(mechanism, "ptr:"), false); err != nil {
+			return fmt.Errorf("invalid ptr domain-spec: %w", err)
 		}
 	}
 	if base == "a" || base == "mx" {
@@ -384,6 +405,11 @@ func validateAMXMechanism(mechanism, prefix string) error {
 	}
 	if strings.Contains(rest, "/") {
 		return fmt.Errorf("invalid %s mechanism", prefix)
+	}
+	if rest != "" {
+		if err := validateMacroString(rest, false); err != nil {
+			return fmt.Errorf("invalid %s domain-spec: %w", prefix, err)
+		}
 	}
 	return nil
 }
@@ -516,8 +542,8 @@ func expandSingleMacro(macro string, ctx *spfContext) string {
 		value = ctx.domain
 	case 'i': // IP address (dotted for IPv4, colon-expanded for IPv6)
 		value = expandIP(ctx.senderIP)
-	case 'p': // validated domain name of IP (deprecated, use "unknown")
-		value = "unknown"
+	case 'p': // validated domain name of the client IP
+		value = validatedDomainName(ctx)
 	case 'v': // "in-addr" for IPv4, "ip6" for IPv6
 		if strings.Contains(ctx.senderIP, ":") {
 			value = "ip6"
@@ -594,10 +620,140 @@ func expandSingleMacro(macro string, ctx *spfContext) string {
 	value = strings.Join(parts, ".")
 
 	if shouldURLEncode {
-		value = url.QueryEscape(value)
+		value = spfURLEncode(value)
 	}
 
 	return value
+}
+
+// validateMacroString enforces RFC 7208 section 7's macro grammar before any
+// DNS query is attempted. c, r and t are permitted only in exp= TXT content.
+func validateMacroString(input string, allowExplanationOnly bool) error {
+	for i := 0; i < len(input); {
+		if input[i] != '%' {
+			i++
+			continue
+		}
+		if i+1 >= len(input) {
+			return fmt.Errorf("trailing %%")
+		}
+		switch input[i+1] {
+		case '%', '_', '-':
+			i += 2
+			continue
+		case '{':
+			endOffset := strings.IndexByte(input[i+2:], '}')
+			if endOffset < 0 {
+				return fmt.Errorf("unterminated macro")
+			}
+			macro := input[i+2 : i+2+endOffset]
+			if err := validateSingleMacro(macro, allowExplanationOnly); err != nil {
+				return err
+			}
+			i += endOffset + 3
+		default:
+			return fmt.Errorf("invalid escape %%%c", input[i+1])
+		}
+	}
+	return nil
+}
+
+func validateSingleMacro(macro string, allowExplanationOnly bool) error {
+	if macro == "" {
+		return fmt.Errorf("empty macro")
+	}
+	letter := byte(strings.ToLower(string(macro[0]))[0])
+	if !strings.ContainsRune("slodipvh", rune(letter)) &&
+		!(allowExplanationOnly && strings.ContainsRune("crt", rune(letter))) {
+		return fmt.Errorf("unsupported macro letter %q", macro[0])
+	}
+	rest := macro[1:]
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i > 0 {
+		if _, err := strconv.ParseUint(rest[:i], 10, 31); err != nil {
+			return fmt.Errorf("invalid transformer count in %%{%s}", macro)
+		}
+	}
+	if i < len(rest) && (rest[i] == 'r' || rest[i] == 'R') {
+		i++
+	}
+	for ; i < len(rest); i++ {
+		if !strings.ContainsRune(".-+,/_=", rune(rest[i])) {
+			return fmt.Errorf("invalid transformer in %%{%s}", macro)
+		}
+	}
+	return nil
+}
+
+// validatedDomainName implements the %{p} macro using forward-confirmed
+// reverse DNS. RFC 7208 limits validation to the first ten PTR names.
+func validatedDomainName(ctx *spfContext) string {
+	if ctx.validatedSet {
+		return ctx.validatedName
+	}
+	ctx.validatedSet = true
+	ctx.validatedName = "unknown"
+	clientIP := net.ParseIP(ctx.senderIP)
+	if clientIP == nil {
+		return ctx.validatedName
+	}
+	names, err := lookupAddr(ctx.senderIP)
+	if err != nil {
+		return ctx.validatedName
+	}
+	if len(names) > 10 {
+		names = names[:10]
+	}
+	var fallback string
+	for _, rawName := range names {
+		name := strings.TrimSuffix(strings.ToLower(rawName), ".")
+		addresses, err := lookupHost(name)
+		if err != nil {
+			continue
+		}
+		confirmed := false
+		for _, address := range addresses {
+			if parsed := net.ParseIP(address); parsed != nil && parsed.Equal(clientIP) {
+				confirmed = true
+				break
+			}
+		}
+		if !confirmed {
+			continue
+		}
+		if fallback == "" {
+			fallback = name
+		}
+		domain := strings.TrimSuffix(strings.ToLower(ctx.domain), ".")
+		if name == domain || strings.HasSuffix(name, "."+domain) {
+			ctx.validatedName = name
+			return ctx.validatedName
+		}
+	}
+	if fallback != "" {
+		ctx.validatedName = fallback
+	}
+	return ctx.validatedName
+}
+
+func spfURLEncode(value string) string {
+	const hex = "0123456789ABCDEF"
+	var encoded strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || strings.ContainsRune("-._~", rune(c)) {
+			encoded.WriteByte(c)
+			continue
+		}
+		encoded.WriteByte('%')
+		encoded.WriteByte(hex[c>>4])
+		encoded.WriteByte(hex[c&0x0f])
+	}
+	return encoded.String()
 }
 
 // splitByAny splits a string by any character in the delimiters string.

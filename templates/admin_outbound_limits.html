@@ -1,0 +1,55 @@
+{{define "content"}}
+<div class="admin-page outbound-limits-page">
+    <div class="admin-header outbound-limits-header"><div><h2>Outbound account limits</h2><p>Protect local accounts from excessive outbound sending.</p></div><a href="/admin" class="btn">&larr; Back to Admin</a></div>
+    {{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
+    {{if .Saved}}<div class="alert alert-success" role="status">Outbound limits saved and applied immediately.</div>{{end}}
+    {{if .Updated}}<div class="alert alert-success" role="status">Account outbound state updated.</div>{{end}}
+    <section class="settings-card outbound-limits-card" aria-labelledby="outbound-policy-title">
+        <div class="outbound-limits-card-heading"><h3 id="outbound-policy-title">Global sending policy</h3><p>Applies to webmail and authenticated SMTP submission. System DSNs and scheduled reports are exempt.</p></div>
+        <form method="POST" action="/admin/outbound-limits" class="outbound-limits-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <label class="outbound-limits-toggle"><input type="checkbox" name="enabled" {{if .Limits.Enabled}}checked{{end}}><span><strong>Enable outbound abuse protection</strong><small>When off, the values below are saved but not enforced.</small></span></label>
+            <div class="outbound-limits-groups">
+                <fieldset class="outbound-limits-group"><legend>Message limits</legend><p>Maximum number of messages an account may send.</p><div class="outbound-limits-fields">
+                    <div class="outbound-limits-field"><label for="messages_per_hour">Per hour</label><input id="messages_per_hour" name="messages_per_hour" type="number" min="1" value="{{.Limits.MessagesPerHour}}" required></div>
+                    <div class="outbound-limits-field"><label for="messages_per_day">Per day</label><input id="messages_per_day" name="messages_per_day" type="number" min="1" value="{{.Limits.MessagesPerDay}}" required></div>
+                </div></fieldset>
+                <fieldset class="outbound-limits-group"><legend>Recipient limits</legend><p>Count all recipient addresses across sent messages.</p><div class="outbound-limits-fields">
+                    <div class="outbound-limits-field"><label for="recipients_per_hour">Per hour</label><input id="recipients_per_hour" name="recipients_per_hour" type="number" min="1" value="{{.Limits.RecipientsPerHour}}" required></div>
+                    <div class="outbound-limits-field"><label for="recipients_per_day">Per day</label><input id="recipients_per_day" name="recipients_per_day" type="number" min="1" value="{{.Limits.RecipientsPerDay}}" required></div>
+                </div></fieldset>
+                <fieldset class="outbound-limits-group"><legend>Per-message and suspension</legend><p>Restrict a single send and set how long an account stays suspended.</p><div class="outbound-limits-fields">
+                    <div class="outbound-limits-field"><label for="max_recipients_per_message">Recipients per message</label><input id="max_recipients_per_message" name="max_recipients_per_message" type="number" min="1" value="{{.Limits.MaxRecipientsPerMessage}}" required></div>
+                    <div class="outbound-limits-field"><label for="suspension_minutes">Suspension duration (minutes)</label><input id="suspension_minutes" name="suspension_minutes" type="number" min="1" value="{{.Limits.SuspensionMinutes}}" required></div>
+                </div></fieldset>
+            </div>
+            <div class="outbound-limits-actions"><button class="btn btn-primary" type="submit" name="action" value="save">Save and apply</button></div>
+        </form>
+    </section>
+    <section class="settings-card outbound-limits-card" aria-labelledby="outbound-usage-title">
+        <div class="outbound-limits-card-heading"><h3 id="outbound-usage-title">Current account usage</h3><p>Review hourly and daily activity or intervene on a specific account.</p></div>
+        <div class="outbound-limits-table-wrap">
+        <table class="admin-table compact">
+            <thead><tr><th>Account</th><th>Hour</th><th>Day</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody>
+            {{range .Usage}}
+            <tr>
+                <td><strong>{{.Email}}</strong></td>
+                <td>{{.HourMessages}} messages / {{.HourRecipients}} recipients</td>
+                <td>{{.DayMessages}} messages / {{.DayRecipients}} recipients</td>
+                <td>{{if .IsSuspended}}<span class="badge badge-danger">Suspended until {{.SuspendedUntil}}</span>{{else}}<span class="badge badge-success">Active</span>{{end}}</td>
+                <td>
+                    <form method="POST" action="/admin/outbound-limits" class="outbound-limits-row-actions">
+                        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="account_id" value="{{.AccountID}}">
+                        <button class="btn" type="submit" name="action" value="reset">Reset counters / unlock</button>
+                        <button class="btn" type="submit" name="action" value="suspend">Suspend</button>
+                    </form>
+                </td>
+            </tr>
+            {{else}}<tr><td colspan="5">No active accounts.</td></tr>{{end}}
+            </tbody>
+        </table>
+        </div>
+    </section>
+</div>
+{{end}}

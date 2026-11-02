@@ -20,6 +20,10 @@ type Folder struct {
 
 // DefaultFolders creates the standard set of folders for a new account.
 func (db *DB) DefaultFolders(accountID int64) error {
+	return db.defaultFolders(db, accountID)
+}
+
+func (db *DB) defaultFolders(executor sqlExecutor, accountID int64) error {
 	folders := []struct {
 		name  string
 		fType string
@@ -32,14 +36,28 @@ func (db *DB) DefaultFolders(accountID int64) error {
 	}
 
 	for _, f := range folders {
-		_, err := db.ExecuteUpsert(
-			`INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON CONFLICT(account_id, name) DO NOTHING`,
-			`INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON DUPLICATE KEY UPDATE id = id`,
-			accountID, f.name, f.fType,
-		)
+		query := `INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON CONFLICT(account_id, name) DO NOTHING`
+		if db.IsMySQL() {
+			query = `INSERT INTO folders (account_id, name, folder_type, is_default) VALUES (?, ?, ?, 1) ON DUPLICATE KEY UPDATE id = id`
+		}
+		_, err := executor.Exec(query, accountID, f.name, f.fType)
 		if err != nil {
 			logging.Error(fmt.Sprintf("[store] failed to create default folder %s for account %d: %v", f.name, accountID, err))
 			return fmt.Errorf("creating default folder %s: %w", f.name, err)
+		}
+		var folderID int64
+		if err := executor.QueryRow(`SELECT id FROM folders WHERE account_id = ? AND name = ?`, accountID, f.name).Scan(&folderID); err != nil {
+			return fmt.Errorf("loading default folder %s: %w", f.name, err)
+		}
+		if err := db.ensureIMAPMailbox(executor, folderID); err != nil {
+			return fmt.Errorf("creating IMAP state for folder %s: %w", f.name, err)
+		}
+		subscribe := `INSERT INTO imap_subscriptions(account_id, folder_id) VALUES(?, ?) ON CONFLICT(account_id, folder_id) DO NOTHING`
+		if db.IsMySQL() {
+			subscribe = `INSERT INTO imap_subscriptions(account_id, folder_id) VALUES(?, ?) ON DUPLICATE KEY UPDATE folder_id = folder_id`
+		}
+		if _, err := executor.Exec(subscribe, accountID, folderID); err != nil {
+			return fmt.Errorf("subscribing default folder %s: %w", f.name, err)
 		}
 	}
 	return nil
@@ -166,40 +184,4 @@ func (db *DB) UpdateFolderCounts(folderID int64) error {
 		}
 	}
 	return nil
-}
-
-// ListMessagesInFolder returns messages in a specific folder.
-func (db *DB) ListMessagesInFolder(folderID int64, limit, offset int) ([]*Message, error) {
-	rows, err := db.Query(`
-		SELECT id, account_id, folder_id, message_id, direction, mail_from, rcpt_to,
-		       from_addr, to_addr, cc_addr, reply_to, subject, text_body, html_body,
-		       raw_headers, size, has_attachments, is_read, is_starred, is_deleted,
-		       spf_result, dkim_result, dmarc_result, auth_results, received_at, created_at
-		FROM messages
-		WHERE folder_id = ?
-		ORDER BY created_at DESC
-		LIMIT ? OFFSET ?
-	`, folderID, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("listing folder messages: %w", err)
-	}
-	defer rows.Close()
-
-	var messages []*Message
-	for rows.Next() {
-		var m Message
-		if err := rows.Scan(
-			&m.ID, &m.AccountID, &m.FolderID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo,
-			&m.FromAddr, &m.ToAddr, &m.CcAddr, &m.ReplyTo, &m.Subject, &m.TextBody, &m.HTMLBody,
-			&m.RawHeaders, &m.Size, &m.HasAttachments, &m.IsRead, &m.IsStarred, &m.IsDeleted,
-			&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.AuthResults, &m.ReceivedAt, &m.CreatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scanning message: %w", err)
-		}
-		messages = append(messages, &m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("folder message query error: %w", err)
-	}
-	return messages, nil
 }

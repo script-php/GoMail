@@ -11,7 +11,7 @@ attachment directory and background delivery/reporting workers.
 | `smtp` | Public inbound SMTP and remote outbound SMTP client |
 | `mailclient` | Optional POP3-over-TLS and authenticated SMTP submission |
 | `delivery` | DKIM signing, queue insertion, retry workers and local delivery |
-| `auth` | SPF, DKIM, DMARC, Authentication-Results and partial ARC support |
+| `auth` | SPF, DKIM, DMARC, Authentication-Results and ARC cryptography |
 | `dns` | MX/PTR lookup, cache and DNSSEC-authenticated TLSA lookup |
 | `mta_sts` | MTA-STS discovery, parsing and cache |
 | `tls` | Certificates, ACME/manual configuration and DANE matching |
@@ -36,9 +36,9 @@ TCP :25
   → persist raw message, parsed fields and attachments
 ```
 
-ARC on received mail is inspected for diagnostics, but ARC failure is not by
-itself used as an independent spam verdict. Ordinary inbound/originated messages
-are not newly ARC-sealed.
+ARC on received mail is structurally and cryptographically validated for
+diagnostics, but ARC failure is not by itself used as an independent spam
+verdict. Ordinary inbound/originated messages are not newly ARC-sealed.
 
 ## Web/submission outbound flow
 
@@ -59,14 +59,27 @@ From to the authenticated account, strips Bcc and uses the same queue as webmail
 ## Mail-client flow
 
 The entire `mailclient` server is disabled unless `mail_clients.enabled` is true.
-POP3 is implicit TLS and exposes a stable snapshot of Inbox. One session locks a
-maildrop; DELE is committed to Trash only on QUIT. Submission listens on 587 and
-upgrades with STARTTLS before advertising AUTH. Both use existing bcrypt account
-credentials and share per-IP authentication throttling.
+IMAP also requires its explicit child switch. IMAP and POP3 use implicit TLS;
+submission listens on 587 and upgrades with STARTTLS before advertising AUTH.
+All three use existing bcrypt account credentials and share connection and
+per-IP authentication throttling.
 
-IMAP is not implemented. The database already models folders and flags, but IMAP
-also needs durable UID/UIDVALIDITY and synchronization/expunge semantics; those
-must be designed rather than inferred from current row IDs.
+Experimental IMAP persists mailbox UIDVALIDITY, UIDNEXT and HIGHESTMODSEQ plus
+folder-scoped UIDs, flags, keywords and subscriptions. Webmail, delivery,
+drafts, POP3 deletion and IMAP mutations update this state. Core IMAP4rev1,
+MIME body structures/sections, the IMAP4rev1 SEARCH grammar, IDLE, MOVE and
+UIDPLUS are present. ENABLE, NAMESPACE, SPECIAL-USE and CONDSTORE provide
+client discovery and modification-sequence synchronization. QRESYNC persists
+expunged UID history transactionally and supplies changed flags plus VANISHED
+state across reconnects. Live-client interoperability remains a release
+blocker.
+POP3 exposes a stable Inbox snapshot; DELE is committed to Trash only on QUIT.
+IMAP APPEND persists its message, UID/flags, quota and attachment metadata in a
+single database transaction, with staged attachment cleanup on rollback.
+IDLE is driven by bounded account-scoped change notifications emitted only
+after durable mutations commit. Signals coalesce during bursts; sessions always
+re-read database state before sending EXISTS, EXPUNGE or FETCH. A slow safety
+refresh covers database changes made by another process.
 
 ## Storage
 
@@ -77,6 +90,12 @@ must be designed rather than inferred from current row IDs.
   migrations. Existing type/default changes require explicit migrations.
 - Raw messages stay in the database; extracted attachment files are stored under
   `attachments_path`.
+- Attachment metadata is committed as a batch. Failed metadata persistence
+  removes the staged files and clears the message's attachment indicator; the
+  raw MIME message remains authoritative.
+- Mailbox, folder and search views use signed, account/view-scoped keyset
+  cursors over the indexed `(received_at, id)` ordering. Cursor tampering or
+  reuse in another account/view is rejected.
 - Sent message plus recipient queue rows are committed together. Attachment file
   persistence is outside that transaction.
 
@@ -84,6 +103,12 @@ Run one application process per database. Queue claiming uses an in-process
 mutex and is not a distributed multi-instance lease.
 
 ## Web security boundary
+
+The admin configuration editor exposes all settings through a generated form
+and a raw JSON view. Both use the same typed validation and substitute
+write-only placeholders for stored secrets. Saves use restrictive permissions,
+an atomic rename and a timestamped prior copy. Logging and outbound limits
+apply live; startup-owned components remain unchanged until restart.
 
 Web HTML templates never insert untrusted email HTML into the application DOM.
 Email markup passes through an allowlist sanitizer and is rendered inside a
@@ -102,6 +127,8 @@ to the correct leaf or chain candidate. See
 
 - `/healthz` reports process liveness.
 - `/readyz` checks readiness, including database access.
+- A separate, disabled-by-default metrics listener exposes aggregate operational
+  gauges at `/metrics`; non-loopback listeners require bearer authentication.
 - SIGINT/SIGTERM stops SMTP, optional client services, workers and web serving.
 - Operators must monitor queue/disk/certificates and perform consistent database
   plus attachment backups.

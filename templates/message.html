@@ -61,6 +61,9 @@
         {{end}}
     </div>
 
+    {{if .AttachmentUnavailable}}
+    <div class="attachment-repair-warning" role="alert">This message has attachments, but they are temporarily unavailable. The original email is preserved; reload this page to retry recovery.</div>
+    {{end}}
     {{if .Attachments}}
     <div class="attachments">
         <div class="attachments-label">Attachments ({{len .Attachments}})</div>
@@ -77,9 +80,10 @@
 
     <div class="message-body">
         {{if .Message.HTMLBody}}
+		{{if .RemoteImages}}<p><a href="/message/{{.Message.ID}}">Block remote images</a></p>{{else}}<p>Remote images are blocked to protect your privacy. <a href="/message/{{.Message.ID}}?remote_images=1&amp;permit={{.RemoteImagePermit}}">Load images for this message</a></p>{{end}}
 			<iframe class="html-body email-frame" title="Email message content"
 				sandbox="" referrerpolicy="no-referrer"
-				src="/message-content/{{.Message.ID}}"></iframe>
+				src="/message-content/{{.Message.ID}}{{if .RemoteImages}}?remote_images=1&amp;permit={{.RemoteImagePermit}}{{end}}"></iframe>
         {{else}}
             <pre class="text-body">{{.Message.TextBody}}</pre>
         {{end}}

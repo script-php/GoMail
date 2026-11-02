@@ -37,6 +37,9 @@ const (
 type DMARCCheckResult struct {
 	Result       DMARCResult
 	Policy       DMARCPolicy
+	PolicyDomain string // DNS owner of the policy applied to the author domain
+	SPFAligned   bool
+	DKIMAligned  bool
 	Details      string
 	ReportMailto []string // rua= aggregate report recipients
 	ForensicMail []string // ruf= forensic report recipients
@@ -46,7 +49,7 @@ type DMARCCheckResult struct {
 // CheckDMARC evaluates DMARC policy for a message given SPF and DKIM results.
 // fromDomain is the domain in the From header (RFC5322.From).
 // spfDomain is the domain from the envelope sender that SPF was checked against.
-func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimResult string, dkimDomain string) DMARCCheckResult {
+func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimResult string, dkimDomain string, otherVerifiedDKIMDomains ...string) DMARCCheckResult {
 	if fromDomain == "" {
 		return DMARCCheckResult{
 			Result:       DMARCNone,
@@ -58,15 +61,17 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 		}
 	}
 
-	// Look up DMARC record
-	dmarcRecord, err := lookupDMARC(fromDomain)
+	// Keep the policy domain: an exact author-domain record uses p=, while a
+	// parent record may apply sp=/np= to a subdomain.
+	dmarcRecord, policyDomain, err := lookupDMARCPolicy(fromDomain)
 	if err != nil || dmarcRecord == "" {
 		result := DMARCNone
 		details := "no DMARC record found"
 		if err != nil && !errors.Is(err, errNoDMARC) {
 			result = DMARCPermError
 			details = err.Error()
-			if dnsErr, ok := err.(*net.DNSError); ok && (dnsErr.IsTimeout || dnsErr.IsTemporary) {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && (dnsErr.IsTimeout || dnsErr.IsTemporary) {
 				result = DMARCTempError
 			}
 		}
@@ -86,9 +91,9 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 		return DMARCCheckResult{Result: DMARCPermError, Policy: PolicyNone, Details: "invalid DMARC policy record", PercentApply: 100}
 	}
 
-	// Determine policy: use sp= for subdomains, p= for organizational domain
+	// Apply subdomain policy only when the record came from a parent.
 	policy := PolicyNone
-	isSubdomain := isSubdomainOfOrg(fromDomain)
+	isSubdomain := !strings.EqualFold(fromDomain, policyDomain)
 
 	var policyTag string
 	if isSubdomain && tags["sp"] != "" {
@@ -120,14 +125,25 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 
 	// Check SPF alignment
 	spfAligned := false
+	var alignmentErr error
 	if spfResult == SPFPass {
-		spfAligned = checkAlignment(fromDomain, spfDomain, aspf)
+		spfAligned, alignmentErr = checkDMARCAlignment(fromDomain, spfDomain, aspf)
 	}
 
 	// Check DKIM alignment
 	dkimAligned := false
 	if dkimResult == "pass" {
-		dkimAligned = checkAlignment(fromDomain, dkimDomain, adkim)
+		for _, domain := range append([]string{dkimDomain}, otherVerifiedDKIMDomains...) {
+			aligned, err := checkDMARCAlignment(fromDomain, domain, adkim)
+			if err != nil {
+				alignmentErr = err
+				continue
+			}
+			if aligned {
+				dkimAligned = true
+				break
+			}
+		}
 	}
 
 	// DMARC passes if either SPF or DKIM is aligned and passes
@@ -135,11 +151,17 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 		return DMARCCheckResult{
 			Result:       DMARCPass,
 			Policy:       policy,
+			PolicyDomain: policyDomain,
+			SPFAligned:   spfAligned,
+			DKIMAligned:  dkimAligned,
 			Details:      "aligned authentication passed",
 			ReportMailto: parseReportAddresses(tags["rua"]),
 			ForensicMail: parseReportAddresses(tags["ruf"]),
 			PercentApply: 100,
 		}
+	}
+	if alignmentErr != nil {
+		return dmarcLookupError(alignmentErr)
 	}
 
 	// Check pct= (percentage sampling) for failures: only apply policy to pct% of messages
@@ -151,6 +173,7 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 			return DMARCCheckResult{
 				Result:       DMARCFail,
 				Policy:       PolicyNone,
+				PolicyDomain: policyDomain,
 				Details:      fmt.Sprintf("failed auth but excluded by pct=%s sampling", tags["pct"]),
 				ReportMailto: parseReportAddresses(tags["rua"]),
 				ForensicMail: parseReportAddresses(tags["ruf"]),
@@ -163,6 +186,7 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 	return DMARCCheckResult{
 		Result:       DMARCFail,
 		Policy:       policy,
+		PolicyDomain: policyDomain,
 		Details:      details,
 		ReportMailto: parseReportAddresses(tags["rua"]),
 		ForensicMail: parseReportAddresses(tags["ruf"]),
@@ -227,33 +251,138 @@ func shouldApplyPolicy(pct int) bool {
 	return rand.Intn(100) < pct
 }
 
-// lookupDMARC looks up the DMARC TXT record for a domain.
-// Checks _dmarc.domain first, then the organizational domain.
-func lookupDMARC(domain string) (string, error) {
-	// Try exact domain
-	record, err := queryDMARC(domain)
-	if err == nil && record != "" {
-		return record, nil
+type dmarcTreeRecord struct {
+	domain string
+	record string
+	psd    string
+}
+
+// dmarcTreeWalk performs at most eight lookups, including the starting name.
+// RFC 9989 skips intermediate labels for an author name deeper than eight.
+func dmarcTreeWalk(domain string) ([]dmarcTreeRecord, error) {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	labels := strings.Split(domain, ".")
+	if domain == "" || len(labels) == 0 {
+		return nil, errNoDMARC
 	}
-	if err != nil && !errors.Is(err, errNoDMARC) {
-		if dnsErr, ok := err.(*net.DNSError); !ok || !dnsErr.IsNotFound {
-			return "", err
+	var records []dmarcTreeRecord
+	index := 0
+	for queries := 0; index < len(labels) && queries < 8; queries++ {
+		name := strings.Join(labels[index:], ".")
+		record, err := queryDMARC(name)
+		if err == nil {
+			psd := parseDMARCTags(record)["psd"]
+			records = append(records, dmarcTreeRecord{name, record, psd})
+			if psd == "n" || psd == "y" {
+				break
+			}
+		} else if !errors.Is(err, errNoDMARC) && !errors.Is(err, errMultipleDMARC) {
+			var dnsErr *net.DNSError
+			if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+				return nil, err
+			}
+		}
+		if index == 0 && len(labels) > 8 {
+			index = len(labels) - 7
+		} else {
+			index++
 		}
 	}
+	return records, nil
+}
 
-	// Try the Public Suffix List organizational domain.
-	orgDomain := getOrgDomain(domain)
-	if !strings.EqualFold(orgDomain, domain) {
-		record, err := queryDMARC(orgDomain)
-		if err == nil && record != "" {
-			return record, nil
+func dmarcOrgDomain(start string, records []dmarcTreeRecord) string {
+	start = strings.ToLower(strings.TrimSuffix(start, "."))
+	for _, record := range records {
+		switch record.psd {
+		case "n":
+			return record.domain
+		case "y":
+			if record.domain == start {
+				return start
+			}
+			labels := strings.Split(start, ".")
+			psdLabels := strings.Split(record.domain, ".")
+			if len(labels) > len(psdLabels) {
+				return strings.Join(labels[len(labels)-len(psdLabels)-1:], ".")
+			}
 		}
 	}
+	if len(records) > 0 {
+		return records[len(records)-1].domain
+	}
+	return start
+}
 
-	return "", fmt.Errorf("%w for %s", errNoDMARC, domain)
+// lookupDMARCPolicy returns the applicable record and its DNS owner.
+func lookupDMARCPolicy(domain string) (string, string, error) {
+	start := strings.ToLower(strings.TrimSuffix(domain, "."))
+	if record, err := queryDMARC(start); err == nil {
+		return record, start, nil
+	} else if !errors.Is(err, errNoDMARC) && !errors.Is(err, errMultipleDMARC) {
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+			return "", "", err
+		}
+	}
+	records, err := dmarcTreeWalk(domain)
+	if err != nil {
+		return "", "", err
+	}
+	if len(records) == 0 {
+		return "", "", fmt.Errorf("%w for %s", errNoDMARC, domain)
+	}
+	if records[0].domain == start {
+		return records[0].record, start, nil
+	}
+	org := dmarcOrgDomain(start, records)
+	for _, record := range records {
+		if record.domain == org {
+			return record.record, record.domain, nil
+		}
+	}
+	for _, record := range records {
+		if record.psd == "y" {
+			return record.record, record.domain, nil
+		}
+	}
+	return "", "", fmt.Errorf("%w for %s", errNoDMARC, domain)
+}
+
+func checkDMARCAlignment(fromDomain, authDomain, mode string) (bool, error) {
+	fromDomain = strings.ToLower(strings.TrimSuffix(fromDomain, "."))
+	authDomain = strings.ToLower(strings.TrimSuffix(authDomain, "."))
+	if authDomain == "" {
+		return false, nil
+	}
+	if fromDomain == authDomain {
+		return true, nil
+	}
+	if mode == "s" {
+		return false, nil
+	}
+	fromRecords, err := dmarcTreeWalk(fromDomain)
+	if err != nil {
+		return false, err
+	}
+	authRecords, err := dmarcTreeWalk(authDomain)
+	if err != nil {
+		return false, err
+	}
+	return dmarcOrgDomain(fromDomain, fromRecords) == dmarcOrgDomain(authDomain, authRecords), nil
+}
+
+func dmarcLookupError(err error) DMARCCheckResult {
+	result := DMARCPermError
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && (dnsErr.IsTimeout || dnsErr.IsTemporary) {
+		result = DMARCTempError
+	}
+	return DMARCCheckResult{Result: result, Policy: PolicyNone, Details: err.Error(), PercentApply: 100}
 }
 
 var errNoDMARC = errors.New("no DMARC record")
+var errMultipleDMARC = errors.New("multiple DMARC records")
 
 func queryDMARC(domain string) (string, error) {
 	dmarcDomain := "_dmarc." + domain
@@ -273,7 +402,7 @@ func queryDMARC(domain string) (string, error) {
 		return "", errNoDMARC
 	}
 	if len(found) > 1 {
-		return "", fmt.Errorf("multiple DMARC records at %s", dmarcDomain)
+		return "", fmt.Errorf("%w at %s", errMultipleDMARC, dmarcDomain)
 	}
 	return found[0], nil
 }

@@ -1,5 +1,11 @@
 # GoMail
 
+Administrators can manage outbound delivery from **Admin → Outbound Queue**
+(`/admin/queue`): inspect delivery status and errors, search envelope addresses,
+retry failed entries, cancel pending/failed entries, and quarantine stale
+sending entries for explicit review. See [queue operations](docs/monitoring.md)
+for uncertain-delivery resolution.
+
 GoMail is a self-hosted mail server written in Go. It receives and delivers SMTP
 mail, stores mailboxes in SQLite or MySQL, provides a webmail/admin interface, and
 can optionally expose POP3 plus authenticated SMTP submission to desktop and
@@ -32,23 +38,53 @@ for the known limits.
 - Trusted-proxy-aware web rate limiting and secure-cookie handling when HTTPS
   is terminated by an explicitly configured proxy.
 - `/healthz` liveness and `/readyz` readiness endpoints.
-- Optional POP3 over TLS and authenticated SMTP submission for mail clients.
-  Both are disabled by default.
+- Configurable disk-pressure reserves that temporarily stop durable writes and
+  backups before a filesystem is exhausted, with metrics and admin warnings.
+- Persistent per-account outbound message/recipient limits with automatic
+  temporary suspension and live administrator controls.
+- Optional IMAP/POP3 over TLS and authenticated SMTP submission for mail
+  clients. All listeners are disabled by the master switch; IMAP additionally
+  requires its explicit service switch.
 
 ## Important boundaries
 
-- IMAP is not implemented. POP3 downloads Inbox mail but does not synchronize
-  folders, flags, drafts or Sent state across devices.
-- ARC parsing/signing/validation code exists, but full multi-hop RFC 8617
-  interoperability is not established. GoMail does not add ARC to ordinary
-  outbound messages; ARC belongs on a real intermediary/forwarding path.
-- TLS-RPT records success/failure events and groups STS/TLSA/no-policy results;
-  daily scheduling, HTTPS report delivery and broader interoperability coverage
-  remain. DMARC aggregate reporting still needs broader event fields.
-- MIME charset/RFC 2231 edge cases, exhaustive SPF macro/grammar fixtures,
-  enhanced status codes and broad live-provider testing remain open work.
-- Quota fields exist, but mailbox quota enforcement is not complete. There is
-  no built-in antivirus engine.
+- IMAP is experimental and disabled by default. Its durable mailbox/UID model,
+  core IMAP4rev1 mailbox hierarchy/rename semantics, MIME body
+  structures/sections, IDLE, MOVE, UIDPLUS, NAMESPACE, SPECIAL-USE, CONDSTORE,
+  QRESYNC and the IMAP4rev1 SEARCH grammar are implemented. Live client
+  matrices remain open. Keep it disabled for production until those tests are
+  complete.
+- ARC has cumulative multi-hop signing/validation, deterministic two-hop
+  coverage, and selected published validation vectors. Live-intermediary
+  interoperability remains open. GoMail does not add ARC to ordinary outbound messages; ARC belongs on a
+  real intermediary/forwarding path.
+- TLS-RPT records success/failure events, groups STS/TLSA/no-policy results,
+  runs on independent daily UTC windows, and delivers to `mailto:` or HTTPS
+  `rua` destinations with bounded retry state. Broader live interoperability
+  coverage remains. DMARC aggregate reports retain DKIM/SPF identities and
+  enforce external destination authorization.
+- Admin **Received Reports** can optionally analyze DMARC XML and TLS-RPT JSON
+  attachments arriving in one selected local mailbox. It is disabled by
+  default, retains the original messages, and keeps a deduplicated history and
+  summary dashboard. Select an existing active mailbox and publish that real
+  address in the domain's reporting DNS records before enabling it. Malformed
+  report messages are retried; a manual history rescan can recover old mail.
+  External
+  report claims are not independently verified by the dashboard.
+- Admin **Aliases** maps virtual addresses on active hosted domains to existing
+  active local accounts. Aliases receive mail without passwords or separate
+  mailboxes; they cannot sign in. Use one for `postmaster@` or a report address
+  before publishing it in DNS. External forwarding is not supported. Admins can
+  optionally grant each account self-service alias creation (off by default);
+  users may create up to 20 aliases on their own domain that deliver only to
+  their own mailbox. Revoking permission removes those user-created aliases,
+  while admin-managed aliases remain available.
+- MIME charset conversion, RFC 2231 filenames and enhanced SMTP status codes
+  are implemented; broad live-provider testing remains open work.
+- Mailbox quotas are enforced transactionally for inbound delivery, Sent
+  copies and drafts. Trash counts toward usage until permanent deletion, and a
+  full mailbox is rejected temporarily without partial multi-recipient
+  delivery. There is no built-in antivirus engine.
 
 ## Build and test
 
@@ -56,10 +92,22 @@ The module currently declares Go 1.26.1 in `go.mod`.
 
 ```bash
 go build -o gomail .
-go test ./auth ./config ./delivery ./dns ./logging ./mailclient ./mdn \
-  ./mta_sts ./parser ./reporting ./security ./smtp ./store ./tls ./web
-go vet ./auth ./config ./delivery ./dns ./logging ./mailclient ./mdn \
-  ./mta_sts ./parser ./reporting ./security ./smtp ./store ./tls ./web
+go test ./auth ./backup ./config ./delivery ./dns ./logging ./mailclient ./mdn \
+  ./metrics ./mta_sts ./parser ./reporting ./security ./smtp ./store ./tls ./web
+go vet ./auth ./backup ./config ./delivery ./dns ./logging ./mailclient ./mdn \
+  ./metrics ./mta_sts ./parser ./reporting ./security ./smtp ./store ./tls ./web
+```
+
+Browser interaction and WCAG accessibility coverage uses Playwright across
+Chromium, Firefox and WebKit with axe-core. It runs against a disposable seeded
+GoMail instance and does not touch production data:
+
+The browser suite uses pnpm and the committed lockfile; install pnpm 11 before
+running the targets below.
+
+```bash
+make test-e2e-install  # first run only
+make test-e2e
 ```
 
 Generate the initial bcrypt password hash with:
@@ -78,6 +126,12 @@ Then configure `web.bootstrap_admin.email` and
 See [Configuration](docs/config.md), [Deployment](docs/deployment.md), and
 [DNS records](docs/dns_records.md) before exposing the server to the internet.
 
+After bootstrap, administrators can test and save the complete configuration
+from `/admin/configuration` using a sectioned form or the raw JSON editor.
+Secrets are write-only; logging and outbound-limit changes apply live, while
+startup-owned settings require a restart. Each save keeps a timestamped
+previous configuration beside the file.
+
 ## Minimal configuration outline
 
 ```json
@@ -90,6 +144,7 @@ See [Configuration](docs/config.md), [Deployment](docs/deployment.md), and
   },
   "mail_clients": {
     "enabled": false,
+    "imap": { "enabled": false, "listen_addr": ":993" },
     "pop3": { "enabled": true, "listen_addr": ":995" },
     "submission": { "enabled": true, "listen_addr": ":587" }
   },
@@ -126,13 +181,19 @@ After explicitly enabling `mail_clients` and opening the ports:
 
 | Purpose | Host | Port | Security | Authentication |
 |---|---|---:|---|---|
+| Incoming IMAP (experimental) | `mail.example.com` | 993 | SSL/TLS | Full email + account password |
 | Incoming POP3 | `mail.example.com` | 995 | SSL/TLS | Full email + account password |
-| Outgoing SMTP | `mail.example.com` | 587 | STARTTLS required | Full email + account password |
+| Outgoing SMTP | `mail.example.com` | 587 | STARTTLS required | Full email + account password or app credential, as allowed by admin/user policy |
 
 Submission supports AUTH PLAIN and AUTH LOGIN only after STARTTLS. It restricts
 the envelope sender and From header to the authenticated account, removes Bcc,
 and sends through the normal DKIM queue. Authentication attempts are rate
 limited per client IP. POP3 deletion is committed to Trash only after QUIT.
+
+When at least one client protocol and certificate-backed TLS are enabled,
+Thunderbird configuration is available at `/mail/config-v1.1.xml` (also under
+`/.well-known/autoconfig/mail/`) and Outlook Autodiscover at
+`/autodiscover/autodiscover.xml`. Disabled protocols are never advertised.
 
 ## DNS and deliverability
 
@@ -169,7 +230,13 @@ See [Architecture](docs/architecture.md) for request and delivery flows.
 
 Monitor process availability, `/readyz`, SMTP/HTTPS/client ports, queue age,
 delivery failures, disk space, certificate expiry and DNSSEC/TLSA failures.
-Back up the database and attachment directory from one consistent recovery point,
-encrypt off-host copies, and regularly test restoration. Detailed guidance is in
+An optional loopback-only Prometheus endpoint exposes bounded aggregate gauges;
+see [docs/monitoring.md](docs/monitoring.md).
+The CLI creates and verifies versioned offline backup archives with database,
+attachment, configuration and certificate state; restores require an explicit
+destructive flag. Encrypt off-host copies and regularly test restoration. Detailed guidance is in
 [docs/config.md](docs/config.md#operations-monitoring-and-recovery) and
 [docs/deployment.md](docs/deployment.md).
+Administrators can also create verified online backups and configure automatic
+interval/retention settings under **Admin → Backups**; archives remain on the
+server and are not downloadable from the web interface.

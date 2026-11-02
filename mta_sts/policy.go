@@ -61,6 +61,9 @@ func ParsePolicy(text string) (*Policy, error) {
 			seen[key] = true
 			policy.Mode = value
 		case "mx":
+			if !validMXPattern(value) {
+				return nil, fmt.Errorf("invalid mx pattern %q", value)
+			}
 			policy.MXHosts = append(policy.MXHosts, value)
 		case "max_age":
 			if seen[key] {
@@ -91,6 +94,27 @@ func ParsePolicy(text string) (*Policy, error) {
 	}
 
 	return policy, nil
+}
+
+func validMXPattern(pattern string) bool {
+	if strings.HasPrefix(pattern, "*.") {
+		pattern = pattern[2:]
+	}
+	if pattern == "" || len(pattern) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(pattern, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !asciiAlphanumeric(c) && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // String renders the policy as the text format served at /.well-known/mta-sts.txt.

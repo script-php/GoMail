@@ -1,0 +1,81 @@
+{{define "content"}}
+<div class="admin-page configuration-page">
+    <div class="admin-header">
+        <h2>Server Configuration</h2>
+        <a href="/admin" class="btn">&larr; Back to Admin</a>
+    </div>
+
+    {{if .Error}}<div class="alert alert-error" role="alert"><strong>Not saved:</strong> {{.Error}}</div>{{end}}
+    {{if .Notice}}<div class="alert alert-info" role="status">{{.Notice}}</div>{{end}}
+    {{if .Saved}}<div class="alert alert-success" role="status">Configuration validated and saved. Logging and outbound-limit settings are active now.{{if .RestartRequired}} Other changes require a server restart.{{end}}</div>{{end}}
+    {{if .RestartRequired}}<div class="alert alert-warning" role="status"><strong>Restart required:</strong> the saved configuration differs from the startup configuration. Listener, storage, TLS, session, proxy, protocol, worker and security changes take effect after restart.</div>{{end}}
+
+    <div class="settings-card configuration-editor">
+        <div class="configuration-editor-heading">
+            <div>
+                <h3>Configuration editor</h3>
+                <p>Choose a section below to view its settings. Every section is part of the same configuration file.</p>
+            </div>
+        <div class="configuration-view-switch" aria-label="Configuration editor view">
+            <a href="/admin/configuration?view=form" class="btn {{if eq .ViewMode "form"}}btn-primary{{end}}" {{if eq .ViewMode "form"}}aria-current="page"{{end}}>Form</a>
+            <a href="/admin/configuration?view=json" class="btn {{if eq .ViewMode "json"}}btn-primary{{end}}" {{if eq .ViewMode "json"}}aria-current="page"{{end}}>View / edit JSON</a>
+        </div>
+        </div>
+        <p>The complete configuration is validated before an atomic save. A timestamped backup of the previous file is retained beside it.</p>
+        <div class="configuration-legend" aria-label="Configuration application behavior">
+            <span class="badge badge-success">Live: logging and outbound_limits</span>
+            <span class="badge badge-warning">Restart: all other settings</span>
+        </div>
+        <form method="POST" action="/admin/configuration" class="settings-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <input type="hidden" name="view" value="{{.ViewMode}}">
+            {{if eq .ViewMode "form"}}
+            <p class="form-help configuration-instructions">Open a section to edit its fields. Leave secret fields blank to keep their saved values. List fields accept JSON arrays, such as <code>[1, 2, 3]</code>.</p>
+            {{range $index, $section := .FormSections}}
+            <details class="configuration-section" {{if eq $index 0}}open{{end}}>
+                <summary><span class="configuration-section-title">{{$section.Label}}</span><span class="configuration-section-count">{{len $section.Fields}} settings</span><span class="configuration-section-chevron" aria-hidden="true">⌄</span></summary>
+                <div class="configuration-fields">
+                    {{range $section.Fields}}
+                    <div class="configuration-field">
+                        <label for="field.{{.Path}}">{{.Label}}</label>
+                        {{if eq .Kind "bool"}}
+                        <select id="field.{{.Path}}" name="field.{{.Path}}">
+                            <option value="true" {{if eq .Value "true"}}selected{{end}}>Enabled</option>
+                            <option value="false" {{if eq .Value "false"}}selected{{end}}>Disabled</option>
+                        </select>
+                        {{else if eq .Kind "nullable_bool"}}
+                        <select id="field.{{.Path}}" name="field.{{.Path}}">
+                            <option value="default" {{if eq .Value "default"}}selected{{end}}>Default</option>
+                            <option value="true" {{if eq .Value "true"}}selected{{end}}>Enabled</option>
+                            <option value="false" {{if eq .Value "false"}}selected{{end}}>Disabled</option>
+                        </select>
+                        {{else if eq .Kind "list"}}
+                        <textarea id="field.{{.Path}}" name="field.{{.Path}}" rows="2" spellcheck="false">{{.Value}}</textarea>
+                        {{else if eq .Kind "number"}}
+                        <input id="field.{{.Path}}" name="field.{{.Path}}" type="number" step="1" value="{{.Value}}" required>
+                        {{else if .Secret}}
+                        <input id="field.{{.Path}}" name="field.{{.Path}}" type="password" value="" placeholder="Leave blank to keep current value" autocomplete="new-password">
+                        {{else}}
+                        <input id="field.{{.Path}}" name="field.{{.Path}}" type="text" value="{{.Value}}">
+                        {{end}}
+                    </div>
+                    {{end}}
+                </div>
+            </details>
+            {{end}}
+            {{else}}
+            <p><strong>Write-only secrets:</strong> values shown as <code>__KEEP_EXISTING_SECRET__</code> are not sent to the browser. Leave the placeholder unchanged to preserve the secret, or replace it to rotate that value.</p>
+            <label for="configuration">Configuration JSON</label>
+            <textarea id="configuration" name="configuration" rows="38" spellcheck="false" autocapitalize="off" autocomplete="off" style="width:100%;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2;white-space:pre;overflow:auto">{{.Configuration}}</textarea>
+            {{end}}
+            <div class="configuration-actions">
+                <p class="form-help">Saving does not restart GoMail. Settings marked “Restart” take effect after you restart the server.</p>
+                <div class="configuration-action-buttons">
+                    <button class="btn" type="submit" name="action" value="validate">Test configuration</button>
+                    <button class="btn btn-primary" type="submit" name="action" value="save">Save configuration</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+{{end}}

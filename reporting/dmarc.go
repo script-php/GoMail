@@ -73,6 +73,7 @@ type DKIMAuthResult struct {
 type SPFAuthResult struct {
 	Domain string `xml:"domain"`
 	Result string `xml:"result"`
+	Scope  string `xml:"scope,omitempty"`
 }
 
 // ParseDMARCReport parses a DMARC aggregate report from XML.

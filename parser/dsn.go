@@ -2,7 +2,12 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	stdmail "net/mail"
 	"regexp"
 	"strings"
 )
@@ -45,7 +50,7 @@ func ParseDSN(body string) (*DSNReport, error) {
 		dsnBody = body // Fall back to original body if extraction fails
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(dsnBody))
+	scanner := bufio.NewScanner(strings.NewReader(unfoldDSNHeaders(dsnBody)))
 
 	// State machine for parsing DSN (RFC 3464):
 	// First: human-readable part (skip)
@@ -87,8 +92,10 @@ func ParseDSN(body string) (*DSNReport, error) {
 			// Start of per-message section (optional)
 		case "original-message-id", "x-original-message-id":
 			report.OriginalMessageID = value
-		case "x-original-recipient":
-			report.OriginalRecipient = value
+		case "original-recipient", "x-original-recipient":
+			if report.OriginalRecipient == "" {
+				report.OriginalRecipient = dsnAddress(value)
+			}
 		case "arrival-date":
 			// Skip, not needed for bounce tracking
 		}
@@ -96,6 +103,10 @@ func ParseDSN(body string) (*DSNReport, error) {
 		// Per-recipient fields (come after "Final-Recipient:" header)
 		switch key {
 		case "final-recipient":
+			if currentRecipient.FinalRecipient != "" {
+				report.RecipientsStatus = append(report.RecipientsStatus, currentRecipient)
+				currentRecipient = RecipientStatus{}
+			}
 			inPerRecipientFields = true
 			// Format: rfc822; user@example.com
 			parts := strings.SplitN(value, ";", 2)
@@ -104,12 +115,19 @@ func ParseDSN(body string) (*DSNReport, error) {
 			}
 		case "action":
 			currentRecipient.Action = value
+			if report.Action == "" {
+				report.Action = value
+			}
 		case "status":
 			currentRecipient.Status = value
-			report.Status = value // Store first one at report level too
+			if report.Status == "" {
+				report.Status = value
+			}
 		case "diagnostic-code":
 			currentRecipient.DiagnosticCode = value
-			report.DiagnosticCode = value
+			if report.DiagnosticCode == "" {
+				report.DiagnosticCode = value
+			}
 		case "remote-mta":
 			// Format: dns; hostname
 			parts := strings.SplitN(value, ";", 2)
@@ -120,8 +138,11 @@ func ParseDSN(body string) (*DSNReport, error) {
 		case "last-attempt-date":
 			currentRecipient.LastAttemptDate = value
 			report.LastAttemptDate = value
-		case "x-original-recipient":
-			currentRecipient.OriginalRecipient = value
+		case "original-recipient", "x-original-recipient":
+			currentRecipient.OriginalRecipient = dsnAddress(value)
+			if report.OriginalRecipient == "" {
+				report.OriginalRecipient = currentRecipient.OriginalRecipient
+			}
 		}
 	}
 
@@ -146,6 +167,8 @@ func ExtractBounceType(statusCode string) string {
 	}
 
 	switch parts[0] {
+	case "2":
+		return "success"
 	case "4":
 		return "temporary"
 	case "5":
@@ -213,21 +236,69 @@ func IsDSNMessage(subject string, headers map[string][]string, body string) bool
 //	...headers...
 //	--boundary--
 func extractDeliveryStatusPart(fullBody string) string {
-	// Find the delivery-status part boundary
-	re := regexp.MustCompile(`(?i)content-type:\s*message/delivery-status.*?\r?\n\r?\n([\s\S]*?)(?:--[\w-]+--|\z)`)
-	matches := re.FindStringSubmatch(fullBody)
-	if len(matches) > 1 {
-		// Extract just the content part (without the trailing boundary)
-		content := matches[1]
-		// Remove trailing boundary markers if present
-		content = strings.TrimRight(content, "\r\n")
-		// Also remove any --boundary at the end
-		lines := strings.Split(content, "\n")
-		if len(lines) > 0 && strings.HasPrefix(strings.Trim(lines[len(lines)-1], "\r\n"), "--") {
-			lines = lines[:len(lines)-1]
-			content = strings.Join(lines, "\n")
-		}
-		return strings.TrimRight(content, "\r\n")
+	message, err := stdmail.ReadMessage(strings.NewReader(fullBody))
+	if err != nil {
+		return ""
 	}
-	return ""
+	content, err := findDeliveryStatusPart(message.Header.Get("Content-Type"), message.Body, 0)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(content), "\r\n")
+}
+
+func findDeliveryStatusPart(contentType string, body io.Reader, depth int) ([]byte, error) {
+	if depth > 10 {
+		return nil, fmt.Errorf("MIME nesting exceeds limit")
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(mediaType, "message/delivery-status") {
+		return io.ReadAll(io.LimitReader(body, 4<<20))
+	}
+	if !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") || params["boundary"] == "" {
+		return nil, fmt.Errorf("delivery-status part not found")
+	}
+	reader := multipart.NewReader(body, params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		data, readErr := io.ReadAll(io.LimitReader(part, 4<<20))
+		part.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if found, err := findDeliveryStatusPart(part.Header.Get("Content-Type"), bytes.NewReader(data), depth+1); err == nil {
+			return found, nil
+		}
+	}
+	return nil, fmt.Errorf("delivery-status part not found")
+}
+
+func unfoldDSNHeaders(body string) string {
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	var unfolded []string
+	for _, line := range lines {
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') && len(unfolded) > 0 && unfolded[len(unfolded)-1] != "" {
+			unfolded[len(unfolded)-1] += " " + strings.TrimSpace(line)
+			continue
+		}
+		unfolded = append(unfolded, strings.TrimSuffix(line, "\r"))
+	}
+	return strings.Join(unfolded, "\n")
+}
+
+func dsnAddress(value string) string {
+	parts := strings.SplitN(value, ";", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return strings.TrimSpace(value)
 }

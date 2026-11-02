@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -23,38 +24,22 @@ func getSessionAccount(db *store.DB, sm *security.SessionManager, r *http.Reques
 }
 
 // getRealClientIP extracts the real client IP address, considering reverse proxies.
-// It checks (in order): X-Forwarded-For, X-Real-IP, CF-Connecting-IP, then falls back to RemoteAddr.
-// X-Forwarded-For can contain multiple IPs (comma-separated), so we take the first (leftmost).
+// Forwarding headers have already been normalized by TrustedProxyMiddleware.
+// Never consult raw provider-specific headers such as CF-Connecting-IP here.
 func getRealClientIP(r *http.Request) string {
-	// Check X-Forwarded-For (most common, used by nginx, Apache, load balancers)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For format: "client, proxy1, proxy2"
-		// The leftmost IP is the client's real IP
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			if ip := strings.TrimSpace(ips[0]); ip != "" {
-				return ip
-			}
+		if ip := net.ParseIP(strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])); ip != nil {
+			return ip.String()
 		}
 	}
-
-	// Check X-Real-IP (used by nginx)
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+		return ip.String()
 	}
-
-	// Check CF-Connecting-IP (Cloudflare)
-	if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
-		return cfip
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-
-	// Fallback to direct connection IP
-	// Remove port if present (e.g., "192.0.2.1:54321" -> "192.0.2.1")
-	clientAddr := r.RemoteAddr
-	if idx := strings.LastIndex(clientAddr, ":"); idx >= 0 {
-		clientAddr = clientAddr[:idx]
-	}
-	return clientAddr
+	return host
 }
 
 // encodeHeaderValue encodes a header value using RFC 2047 if it contains non-ASCII characters
@@ -76,6 +61,10 @@ func encodeHeaderValue(value string) string {
 }
 
 func originatingHeaders(strip bool, clientIP, hostname, messageID, recipient string, date time.Time) string {
+	hostname = singleLineHeaderValue(hostname)
+	messageID = singleLineHeaderValue(messageID)
+	recipient = singleLineHeaderValue(recipient)
+	clientIP = singleLineHeaderValue(clientIP)
 	var headers strings.Builder
 	if strip {
 		fmt.Fprintf(&headers, "Received: from webmail\r\n\tby %s with HTTP (GoMail)\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
@@ -86,4 +75,8 @@ func originatingHeaders(strip bool, clientIP, hostname, messageID, recipient str
 		fmt.Fprintf(&headers, "X-Originating-IP: [%s]\r\n", clientIP)
 	}
 	return headers.String()
+}
+
+func singleLineHeaderValue(value string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(value, "\r", " "), "\n", " ")
 }

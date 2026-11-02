@@ -3,35 +3,84 @@ package reporting
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/http"
 	"net/mail"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"gomail/config"
 	"gomail/logging"
+	"gomail/metrics"
 	"gomail/store"
 )
 
 // EnqueueFunc is a callback to enqueue a message for delivery
 type EnqueueFunc func(from string, to string, message string) error
 
-// ScheduleWeeklyReports starts a background job to generate and send DMARC reports weekly.
+var lookupReportingTXT = net.LookupTXT
+
+// ScheduleDailyDMARCReports sends complete UTC-day reports and catches up after downtime.
 // Reports are only sent if config.dmarc.send_reports is true.
-func ScheduleWeeklyReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
+func ScheduleDailyDMARCReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
 	if !cfg.DMARC.SendReports {
 		logging.Info("[dmarc] report scheduler disabled (set dmarc.send_reports=true in config.json to enable)")
 		return
 	}
-	logging.Info("[dmarc] report scheduler enabled (weekly reports at Sunday 00:00 UTC)")
-	go runWeeklyReportScheduler(cfg, db, enqueueFunc)
+	logging.Info("[dmarc] report scheduler enabled (daily reports at 00:00 UTC)")
+	go runDailyDMARCReportScheduler(cfg, db, enqueueFunc)
+}
+
+// ScheduleDailyTLSReports runs TLS-RPT independently for complete UTC days.
+func ScheduleDailyTLSReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
+	if !cfg.TLSRPT.SendReports {
+		logging.Info("[tls-rpt] daily report scheduler disabled (set tls_rpt.send_reports=true to enable)")
+		return
+	}
+	logging.Info("[tls-rpt] report scheduler enabled (daily at 00:00 UTC)")
+	go runDailyTLSReportScheduler(cfg, db, enqueueFunc)
+}
+
+func nextUTCMidnight(now time.Time) time.Time {
+	now = now.UTC()
+	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+func runDailyTLSReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
+	for {
+		next := nextUTCMidnight(time.Now())
+		logging.Info(fmt.Sprintf("[tls-rpt] next daily report generation: %s", next))
+		time.Sleep(time.Until(next))
+		generateAndSendDailyTLSReports(cfg, db, enqueueFunc, next.AddDate(0, 0, -1), next)
+	}
+}
+
+func generateAndSendDailyTLSReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, startTime, endTime time.Time) {
+	domains, err := db.GetDomainsWithTLSFailures()
+	if err != nil {
+		logging.Error(fmt.Sprintf("[tls-rpt] error getting domains with TLS events: %v", err))
+		return
+	}
+	for _, domain := range domains {
+		reportStart, eligible, startErr := db.GetTLSReportStart(domain, endTime)
+		if startErr != nil {
+			logging.Error(fmt.Sprintf("[tls-rpt] retry state error for %s: %v", domain, startErr))
+			continue
+		}
+		if eligible {
+			sendTLSRPTReportForDomain(cfg, db, enqueueFunc, domain, reportStart, endTime)
+		}
+	}
 }
 
 // SendReportsNow triggers immediate generation and delivery of DMARC reports for all domains.
-// This is useful for testing without waiting for the weekly scheduler.
+// This is useful for testing without waiting for the daily scheduler.
 // Returns (total_domains, successfully_reported, error).
 func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (int, int, error) {
 	logging.Info("[dmarc] manual report generation triggered...")
@@ -49,7 +98,7 @@ func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (
 
 	successCount := 0
 	for _, domain := range domains {
-		if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain) {
+		if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain, time.Now().UTC()) {
 			successCount++
 		}
 	}
@@ -58,19 +107,13 @@ func SendReportsNow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) (
 	return len(domains), successCount, nil
 }
 
-func runWeeklyReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
+func runDailyDMARCReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
+	// Process complete, unsent days left by a restart before the next midnight.
+	generateAndSendReports(cfg, db, enqueueFunc)
 	for {
-		// Calculate time until next Sunday at 00:00 UTC
-		now := time.Now().UTC()
-		nextSunday := now.AddDate(0, 0, 1)
-		for nextSunday.Weekday() != time.Sunday {
-			nextSunday = nextSunday.AddDate(0, 0, 1)
-		}
-		nextSunday = time.Date(nextSunday.Year(), nextSunday.Month(), nextSunday.Day(), 0, 0, 0, 0, time.UTC)
-
-		waitTime := nextSunday.Sub(now)
-		logging.Info(fmt.Sprintf("[dmarc] next weekly report generation: %s (in %v)", nextSunday, waitTime))
-		time.Sleep(waitTime)
+		next := nextUTCMidnight(time.Now())
+		logging.Info(fmt.Sprintf("[dmarc] next daily report generation: %s", next))
+		time.Sleep(time.Until(next))
 
 		// Generate and send reports
 		generateAndSendReports(cfg, db, enqueueFunc)
@@ -78,7 +121,7 @@ func runWeeklyReportScheduler(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 }
 
 func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc) {
-	logging.Info("[reporting] starting weekly report generation...")
+	logging.Info("[reporting] starting daily DMARC report generation...")
 
 	// Generate DMARC reports
 	dmarcDomains, err := db.GetDomainsWithFeedback()
@@ -87,44 +130,59 @@ func generateAndSendReports(cfg *config.Config, db *store.DB, enqueueFunc Enqueu
 	} else if len(dmarcDomains) > 0 {
 		dmarcReportCount := 0
 		for _, domain := range dmarcDomains {
-			if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain) {
+			if sendDMARCReportForDomain(cfg, db, enqueueFunc, domain, time.Now().UTC().Truncate(24*time.Hour)) {
 				dmarcReportCount++
 			}
 		}
-		logging.Info(fmt.Sprintf("[dmarc] weekly report generation complete (%d/%d domains reported)", dmarcReportCount, len(dmarcDomains)))
+		logging.Info(fmt.Sprintf("[dmarc] daily report generation complete (%d/%d domains reported)", dmarcReportCount, len(dmarcDomains)))
 	} else {
 		logging.Info("[dmarc]   no domains with DMARC feedback to report")
 	}
 
-	// Generate TLS-RPT reports
-	tlsRptDomains, err := db.GetDomainsWithTLSFailures()
-	if err != nil {
-		logging.Error(fmt.Sprintf("[tls-rpt] error getting domains with TLS failures: %v", err))
-	} else if len(tlsRptDomains) > 0 {
-		tlsReportCount := 0
-		for _, domain := range tlsRptDomains {
-			if sendTLSRPTReportForDomain(cfg, db, enqueueFunc, domain) {
-				tlsReportCount++
-			}
-		}
-		logging.Info(fmt.Sprintf("[tls-rpt] weekly report generation complete (%d/%d domains reported)", tlsReportCount, len(tlsRptDomains)))
-	} else {
-		logging.Info("[tls-rpt]  no domains with TLS failures to report")
-	}
-
-	logging.Info("[reporting] all weekly reports generated")
+	logging.Info("[dmarc] daily reports generated")
 }
 
-func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain) bool {
-	// Get the time of the last successful report for this domain
-	// If never reported, this returns epoch time (Jan 1, 1970)
-	lastReportTime, err := db.GetLastDMARCReportTime(domain.Domain)
+func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain, cutoff time.Time) bool {
+	days, err := unreportedDMARCDays(db, domain.Domain, cutoff)
 	if err != nil {
-		logging.Error(fmt.Sprintf("[dmarc] %s: error getting last report time: %v", domain.Domain, err))
+		logging.Error(fmt.Sprintf("[dmarc] %s: listing report days: %v", domain.Domain, err))
 		return false
 	}
+	any := false
+	for _, start := range days {
+		end := start.Add(24 * time.Hour)
+		if cutoff.Before(end) {
+			end = cutoff
+		}
+		if sendDMARCReportWindow(cfg, db, enqueueFunc, domain, start, end) {
+			any = true
+		}
+	}
+	return any
+}
 
-	now := time.Now().UTC()
+func unreportedDMARCDays(db *store.DB, domain string, cutoff time.Time) ([]time.Time, error) {
+	rows, err := db.Query(`SELECT DISTINCT SUBSTR(received_at, 1, 10) FROM dmarc_feedback WHERE COALESCE(NULLIF(policy_domain, ''), domain)=? AND sent_at IS NULL AND received_at < ? ORDER BY 1`, domain, cutoff.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var days []time.Time
+	for rows.Next() {
+		var day string
+		if err := rows.Scan(&day); err != nil {
+			return nil, err
+		}
+		start, err := time.Parse("2006-01-02", day)
+		if err != nil {
+			return nil, err
+		}
+		days = append(days, start.UTC())
+	}
+	return days, rows.Err()
+}
+
+func sendDMARCReportWindow(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain *store.Domain, start, end time.Time) bool {
 
 	// Get DMARC policy to extract report addresses
 	dmarcRecord, err := lookupDMARCForReporting(domain.Domain)
@@ -139,15 +197,14 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	}
 
 	// Get feedback since last report until now
-	records, err := getDMARCFeedbackRecords(db, domain.Domain, lastReportTime, now)
+	records, err := getDMARCFeedbackRecords(db, domain.Domain, start, end)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[dmarc] %s: error querying feedback: %v", domain.Domain, err))
 		return false
 	}
 
 	if len(records) == 0 {
-		logging.Info(fmt.Sprintf("[dmarc]  %s: no feedback since last report (%s)",
-			domain.Domain, lastReportTime.Format("2006-01-02 15:04:05 UTC")))
+		logging.Info(fmt.Sprintf("[dmarc]  %s: no unsent feedback for %s", domain.Domain, start.Format("2006-01-02")))
 		return false
 	}
 
@@ -160,8 +217,8 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 		cfg.Server.Hostname,
 		policy,
 		records,
-		lastReportTime,
-		now,
+		start,
+		end,
 	)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[dmarc] %s: error generating report: %v", domain.Domain, err))
@@ -171,29 +228,36 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 	// Send to rua= addresses (aggregate reports)
 	sentCount := 0
 	for _, reportAddr := range dmarcRecord.ReportMailto {
-		if !authorizedDMARCReportDestination(domain.Domain, reportAddr) {
+		targets := resolvedDMARCReportDestinations(domain.Domain, reportAddr)
+		if len(targets) == 0 {
 			logging.Warn(fmt.Sprintf("[dmarc] external report destination %s is not authorized for %s", reportAddr, domain.Domain))
 			continue
 		}
-		if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Domain, reportAddr, reportXML); err != nil {
-			logging.Error(fmt.Sprintf("[dmarc] %s→%s: error sending report: %v", domain.Domain, reportAddr, err))
-		} else {
-			sentCount++
-			logging.Info(fmt.Sprintf("[dmarc] %s→%s: report sent (period %s to %s, %d records)",
-				domain.Domain, reportAddr,
-				lastReportTime.Format("2006-01-02"), now.Format("2006-01-02"),
-				len(records)))
+		for _, target := range targets {
+			if err := sendDMARCReport(cfg, enqueueFunc, domain.Domain, cfg.Server.Domain, target, reportXML); err != nil {
+				logging.Error(fmt.Sprintf("[dmarc] %s→%s: error sending report: %v", domain.Domain, target, err))
+			} else {
+				sentCount++
+				logging.Info(fmt.Sprintf("[dmarc] %s→%s: report sent (period %s to %s, %d records)",
+					domain.Domain, target,
+					start.Format("2006-01-02"), end.Format("2006-01-02"),
+					len(records)))
+			}
 		}
 	}
 
 	// Update last report time and mark feedback as sent if at least one report was sent
 	if sentCount > 0 {
+		metrics.IncReport("dmarc_success")
 		if err := db.UpdateLastDMARCReportTime(domain.Domain); err != nil {
 			logging.Error(fmt.Sprintf("[dmarc] %s: error updating last report time: %v", domain.Domain, err))
 		}
-		if err := db.MarkDMARCFeedbackAsSent(domain.Domain, lastReportTime, now); err != nil {
+		if err := db.MarkDMARCFeedbackAsSent(domain.Domain, start, end); err != nil {
 			logging.Error(fmt.Sprintf("[dmarc] %s: error marking feedback as sent: %v", domain.Domain, err))
 		}
+	}
+	if sentCount == 0 {
+		metrics.IncReport("dmarc_failure")
 	}
 
 	return sentCount > 0
@@ -203,7 +267,7 @@ func sendDMARCReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enqu
 // Similar to auth.CheckDMARC but focused on extracting rua=/ruf= values
 func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 	dmarcDomain := fmt.Sprintf("_dmarc.%s", domain)
-	txtRecords, err := net.LookupTXT(dmarcDomain)
+	txtRecords, err := lookupReportingTXT(dmarcDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -213,28 +277,41 @@ func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 	}
 
 	policy := &DMARCReportPolicy{}
+	var selected string
 	for _, txt := range txtRecords {
-		if len(txt) > 0 && txt[0] == 'v' && txt == "v=DMARC1" || (len(txt) > 8 && txt[:8] == "v=DMARC1") {
-			// Parse rua= and ruf= tags
-			parts := extractDMARCTags(txt)
-			policy.P = parts["p"]
-			policy.SP = parts["sp"]
-			policy.ADKIM = parts["adkim"]
-			policy.ASPF = parts["aspf"]
-			policy.Pct = 100
-			if raw := parts["pct"]; raw != "" {
-				if n, e := strconv.Atoi(raw); e == nil && n >= 0 && n <= 100 {
-					policy.Pct = n
-				}
+		if dmarcVersionRecord(txt) {
+			if selected != "" {
+				return nil, fmt.Errorf("multiple DMARC policy records for %s", domain)
 			}
-			if ruaVal, ok := parts["rua"]; ok {
-				policy.ReportMailto = parseReportAddresses(ruaVal)
-			}
-			if rufVal, ok := parts["ruf"]; ok {
-				policy.ForensicMail = parseReportAddresses(rufVal)
-			}
-			break
+			selected = txt
 		}
+	}
+	if selected == "" {
+		return nil, fmt.Errorf("no DMARC policy record for %s", domain)
+	}
+	// Parse rua= and ruf= tags only after policy uniqueness is established.
+	parts, err := extractDMARCTags(selected)
+	if err != nil {
+		return nil, err
+	}
+	policy.P = parts["p"]
+	if policy.P != "none" && policy.P != "quarantine" && policy.P != "reject" {
+		return nil, fmt.Errorf("invalid DMARC policy for %s", domain)
+	}
+	policy.SP = parts["sp"]
+	policy.ADKIM = parts["adkim"]
+	policy.ASPF = parts["aspf"]
+	policy.Pct = 100
+	if raw := parts["pct"]; raw != "" {
+		if n, e := strconv.Atoi(raw); e == nil && n >= 0 && n <= 100 {
+			policy.Pct = n
+		}
+	}
+	if ruaVal, ok := parts["rua"]; ok {
+		policy.ReportMailto = parseReportAddresses(ruaVal)
+	}
+	if rufVal, ok := parts["ruf"]; ok {
+		policy.ForensicMail = parseReportAddresses(rufVal)
 	}
 
 	return policy, nil
@@ -249,42 +326,97 @@ type DMARCReportPolicy struct {
 }
 
 func authorizedDMARCReportDestination(policyDomain, address string) bool {
+	return len(resolvedDMARCReportDestinations(policyDomain, address)) > 0
+}
+
+func resolvedDMARCReportDestinations(policyDomain, address string) []string {
 	parsed, err := mail.ParseAddress(address)
 	if err != nil {
-		return false
+		return nil
 	}
 	at := strings.LastIndex(parsed.Address, "@")
 	if at < 0 {
-		return false
+		return nil
 	}
 	destination := strings.ToLower(parsed.Address[at+1:])
 	if strings.EqualFold(destination, policyDomain) {
-		return true
+		return []string{parsed.Address}
 	}
-	records, err := net.LookupTXT(policyDomain + "._report._dmarc." + destination)
+	records, err := lookupReportingTXT(policyDomain + "._report._dmarc." + destination)
 	if err != nil {
-		return false
+		return nil
 	}
+	authorized := false
+	var overrideTargets []string
 	for _, record := range records {
-		if strings.HasPrefix(strings.TrimSpace(record), "v=DMARC1") {
-			return true
+		if !dmarcVersionRecord(record) {
+			continue
+		}
+		tags, err := extractDMARCTags(record)
+		if err != nil {
+			continue
+		}
+		authorized = true
+		if override, ok := tags["rua"]; ok {
+			addresses := parseReportAddresses(override)
+			if len(addresses) == 0 {
+				return nil
+			}
+			canonical := make([]string, 0, len(addresses))
+			for _, candidate := range addresses {
+				parsedOverride, err := mail.ParseAddress(candidate)
+				if err != nil {
+					return nil
+				}
+				parts := strings.SplitN(parsedOverride.Address, "@", 2)
+				if len(parts) != 2 || !strings.EqualFold(parts[1], destination) {
+					return nil
+				}
+				canonical = append(canonical, parsedOverride.Address)
+			}
+			if overrideTargets != nil && !slices.Equal(overrideTargets, canonical) {
+				return nil
+			}
+			overrideTargets = canonical
 		}
 	}
-	return false
+	if !authorized {
+		return nil
+	}
+	if overrideTargets != nil {
+		return overrideTargets
+	}
+	return []string{parsed.Address}
 }
 
 // extractDMARCTags parses DMARC record tags from a TXT record value
-func extractDMARCTags(record string) map[string]string {
+func dmarcVersionRecord(record string) bool {
+	const version = "v=DMARC1"
+	if !strings.HasPrefix(record, version) {
+		return false
+	}
+	rest := strings.TrimLeft(record[len(version):], " \t")
+	return rest == "" || strings.HasPrefix(rest, ";")
+}
+
+func extractDMARCTags(record string) (map[string]string, error) {
 	tags := make(map[string]string)
 	parts := parseTagList(record)
 	for _, part := range parts {
-		if idx := firstIndexOf(part, '='); idx >= 0 {
-			key := part[:idx]
-			value := part[idx+1:]
-			tags[key] = value
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("invalid DMARC tag")
 		}
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if _, exists := tags[key]; exists {
+			return nil, fmt.Errorf("duplicate DMARC tag %s", key)
+		}
+		tags[key] = value
 	}
-	return tags
+	if tags["v"] != "DMARC1" {
+		return nil, fmt.Errorf("invalid DMARC version")
+	}
+	return tags, nil
 }
 
 // parseTagList splits DMARC record into tags, handling quoted values
@@ -316,6 +448,9 @@ func parseReportAddresses(value string) []string {
 		part = trim(part)
 		if len(part) > 7 && part[:7] == "mailto:" {
 			addr := trim(part[7:])
+			if bang := strings.LastIndex(addr, "!"); bang > strings.LastIndex(addr, "@") {
+				addr = addr[:bang]
+			}
 			if len(addr) > 0 {
 				addrs = append(addrs, addr)
 			}
@@ -381,13 +516,16 @@ func getLastSunday(t time.Time) time.Time {
 
 func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime time.Time) ([]ReportRecord, error) {
 	rows, err := db.Query(`
-		SELECT source_ip, COUNT(*) as count,
-		       SUM(CASE WHEN dkim_result = 'pass' THEN 1 ELSE 0 END) as dkim_pass,
-		       SUM(CASE WHEN spf_result = 'pass' THEN 1 ELSE 0 END) as spf_pass,
-		       disposition, envelope_from_domain
+		SELECT domain, source_ip, COUNT(*) as count, COALESCE(dkim_result, 'none'),
+		       COALESCE(dkim_domain, ''), COALESCE(dkim_selector, ''),
+		       COALESCE(spf_result, 'none'), COALESCE(spf_domain, envelope_from_domain, ''),
+		       COALESCE(spf_scope, 'mfrom'), COALESCE(disposition, 'none'),
+		       COALESCE(envelope_from_domain, ''), dkim_aligned, spf_aligned
 		FROM dmarc_feedback
-		WHERE domain = ? AND received_at >= ? AND received_at < ? AND sent_at IS NULL
-		GROUP BY source_ip, disposition, envelope_from_domain
+		WHERE COALESCE(NULLIF(policy_domain, ''), domain) = ? AND received_at >= ? AND received_at < ? AND sent_at IS NULL
+		GROUP BY domain, source_ip, dkim_result, dkim_domain, dkim_selector,
+		         spf_result, spf_domain, spf_scope, disposition, envelope_from_domain,
+		         dkim_aligned, spf_aligned
 		ORDER BY count DESC
 	`, domain, startTime.UTC().Format("2006-01-02 15:04:05"), endTime.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
@@ -397,11 +535,15 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 
 	var records []ReportRecord
 	for rows.Next() {
-		var sourceIP string
-		var count, dkimPass, spfPass int
+		var headerFrom, sourceIP string
+		var count int
+		var dkimAligned, spfAligned bool
+		var dkimResult, dkimDomain, dkimSelector string
+		var spfResult, spfDomain, spfScope string
 		var disposition, envelopeDomain string
 
-		if err := rows.Scan(&sourceIP, &count, &dkimPass, &spfPass, &disposition, &envelopeDomain); err != nil {
+		if err := rows.Scan(&headerFrom, &sourceIP, &count, &dkimResult, &dkimDomain, &dkimSelector,
+			&spfResult, &spfDomain, &spfScope, &disposition, &envelopeDomain, &dkimAligned, &spfAligned); err != nil {
 			logging.Error(fmt.Sprintf("[dmarc] error scanning feedback: %v", err))
 			continue
 		}
@@ -412,13 +554,17 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 				Count:    count,
 				PolicyEval: PolicyEvaluated{
 					Disposition: disposition,
-					DKIM:        dkimResultToString(dkimPass, count),
-					SPF:         spfResultToString(spfPass, count),
+					DKIM:        alignmentResult(dkimAligned),
+					SPF:         alignmentResult(spfAligned),
 				},
 			},
 			Identifiers: Identifiers{
-				HeaderFrom:   domain,
+				HeaderFrom:   headerFrom,
 				EnvelopeFrom: envelopeDomain,
+			},
+			AuthResults: AuthResults{
+				DKIM: []DKIMAuthResult{{Domain: dkimDomain, Result: dkimResult, Selector: dkimSelector}},
+				SPF:  []SPFAuthResult{{Domain: spfDomain, Result: spfResult, Scope: spfScope}},
 			},
 		}
 
@@ -426,6 +572,13 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 	}
 
 	return records, rows.Err()
+}
+
+func alignmentResult(aligned bool) string {
+	if aligned {
+		return "pass"
+	}
+	return "fail"
 }
 
 func dkimResultToString(pass, total int) string {
@@ -449,21 +602,39 @@ func spfResultToString(pass, total int) string {
 }
 
 func sendDMARCReport(cfg *config.Config, enqueueFunc EnqueueFunc, reportedDomain, senderDomain, toAddr, reportXML string) error {
-	reportID := fmt.Sprintf("%d@%s", time.Now().Unix(), reportedDomain)
+	report, err := ParseDMARCReport(strings.NewReader(reportXML))
+	if err != nil {
+		return fmt.Errorf("reading generated DMARC report metadata: %w", err)
+	}
+	if report.Metadata.ReportID == "" || report.Metadata.DateRange.Begin >= report.Metadata.DateRange.End {
+		return fmt.Errorf("generated DMARC report has invalid identity or date range")
+	}
+	filename := fmt.Sprintf("%s!%s!%d!%d.xml.gz", cfg.Server.Hostname, reportedDomain,
+		report.Metadata.DateRange.Begin, report.Metadata.DateRange.End)
 
-	// Gzip compress the XML report (RFC 7489 compliant)
+	// RFC 9990: gzip the XML and fold base64 to MIME's 76-character lines.
 	var compressedBuf bytes.Buffer
 	gzipWriter := gzip.NewWriter(&compressedBuf)
-	gzipWriter.Write([]byte(reportXML))
-	gzipWriter.Close()
+	if _, err := gzipWriter.Write([]byte(reportXML)); err != nil {
+		return err
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return err
+	}
 
-	// Base64 encode the compressed XML
 	xmlB64 := base64.StdEncoding.EncodeToString(compressedBuf.Bytes())
+	var folded strings.Builder
+	for len(xmlB64) > 76 {
+		folded.WriteString(xmlB64[:76])
+		folded.WriteString("\r\n")
+		xmlB64 = xmlB64[76:]
+	}
+	folded.WriteString(xmlB64)
 
 	messageBody := fmt.Sprintf(
 		"From: postmaster@%s\r\n"+
 			"To: %s\r\n"+
-			"Subject: DMARC Report for %s\r\n"+
+			"Subject: Report Domain: %s Submitter: %s Report-ID: <%s>\r\n"+
 			"Message-ID: <%s>\r\n"+
 			"Date: %s\r\n"+
 			"Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n"+
@@ -476,30 +647,30 @@ func sendDMARCReport(cfg *config.Config, enqueueFunc EnqueueFunc, reportedDomain
 			"This is the DMARC aggregate report for %s.\r\n"+
 			"\r\n"+
 			"--boundary123\r\n"+
-			"Content-Type: application/gzip; name=\"report.xml.gz\"\r\n"+
+			"Content-Type: application/gzip; name=\"%s\"\r\n"+
 			"Content-Transfer-Encoding: base64\r\n"+
-			"Content-Disposition: attachment; filename=\"report.xml.gz\"\r\n"+
+			"Content-Disposition: attachment; filename=\"%s\"\r\n"+
 			"\r\n"+
 			"%s\r\n"+
 			"--boundary123--\r\n",
 		senderDomain,
 		toAddr,
 		reportedDomain,
-		reportID,
+		cfg.Server.Hostname,
+		report.Metadata.ReportID,
+		report.Metadata.ReportID,
 		time.Now().Format(time.RFC1123Z),
 		reportedDomain,
-		xmlB64,
+		filename,
+		filename,
+		folded.String(),
 	)
 
 	return enqueueFunc(fmt.Sprintf("postmaster@%s", senderDomain), toAddr, messageBody)
 }
 
 // sendTLSRPTReportForDomain generates and sends a TLS-RPT report for a domain
-func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain string) bool {
-	// Calculate time range (last 7 days)
-	endTime := time.Now().UTC()
-	startTime := endTime.AddDate(0, 0, -7)
-
+func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc EnqueueFunc, domain string, startTime, endTime time.Time) bool {
 	// Generate the report
 	report, err := GenerateTLSReport(db, cfg.Server.Domain, domain, startTime, endTime)
 	if err != nil {
@@ -508,32 +679,51 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 	}
 
 	// Extract TLS-RPT report addresses from DNS (may be multiple)
-	recipientEmails, err := ExtractTLSRPTAddresses(domain)
+	destinations, err := ExtractTLSRPTURIs(domain)
 	if err != nil {
 		logging.Error(fmt.Sprintf("[tls-rpt] failed to extract TLS-RPT addresses for %s: %v", domain, err))
-		// Even if we can't send, mark as attempted so we don't retry forever
-		_ = db.MarkTLSFailuresAsReported(domain, startTime, endTime)
+		_ = db.RecordTLSReportFailure(domain, startTime, endTime, err)
 		return false
 	}
 
-	// Use our organization's domain as sender
-	senderEmail := fmt.Sprintf("postmaster@%s", cfg.Server.Domain)
+	// Show a dedicated report sender while routing transport failures to
+	// postmaster (the contact-info address in the JSON report).
+	senderEmail := cfg.Server.TLSReportSenderAddress()
+	envelopeSender := fmt.Sprintf("postmaster@%s", cfg.Server.Domain)
 	// Send to each recipient address
 	sentCount := 0
-	for _, recipientEmail := range recipientEmails {
-		messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, recipientEmail)
-		if err := enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
-			logging.Error(fmt.Sprintf("[tls-rpt] failed to enqueue report for %s -> %s: %v", domain, recipientEmail, err))
-		} else {
-			sentCount++
-			logging.Info(fmt.Sprintf("[tls-rpt] queued TLS-RPT report for %s -> %s", domain, recipientEmail))
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(request *http.Request, via []*http.Request) error {
+		if len(via) >= 5 || request.URL.Scheme != "https" {
+			return fmt.Errorf("unsafe TLS-RPT redirect")
 		}
+		return nil
+	}}
+	for _, destination := range destinations {
+		parsed, _ := url.Parse(destination)
+		var sendErr error
+		if parsed.Scheme == "mailto" {
+			messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, parsed.Opaque)
+			sendErr = enqueueFunc(envelopeSender, parsed.Opaque, messageBody)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			sendErr = PostTLSRPT(ctx, client, destination, report)
+			cancel()
+		}
+		if sendErr != nil {
+			logging.Error(fmt.Sprintf("[tls-rpt] delivery failed for %s -> %s: %v", domain, destination, sendErr))
+			continue
+		}
+		sentCount++
+		logging.Info(fmt.Sprintf("[tls-rpt] report accepted for %s -> %s", domain, destination))
 	}
 
 	if sentCount == 0 {
+		metrics.IncReport("tlsrpt_failure")
 		logging.Warn(fmt.Sprintf("[tls-rpt] failed to queue TLS-RPT report for %s to any recipient", domain))
+		_ = db.RecordTLSReportFailure(domain, startTime, endTime, fmt.Errorf("all TLS-RPT destinations failed"))
 		return false
 	}
+	metrics.IncReport("tlsrpt_success")
 
 	// Mark failures as reported
 	if err := db.MarkTLSFailuresAsReported(domain, startTime, endTime); err != nil {
@@ -546,6 +736,6 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 		totalFailures += policy.Summary.TotalFailureSessionCount
 	}
 	logging.Info(fmt.Sprintf("[tls-rpt] generated and queued TLS-RPT report for %s (%d recipients, %d failures)",
-		domain, len(recipientEmails), totalFailures))
+		domain, sentCount, totalFailures))
 	return true
 }

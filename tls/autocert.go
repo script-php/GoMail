@@ -3,9 +3,11 @@ package tlsconfig
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"gomail/config"
 
@@ -17,6 +19,32 @@ type CertManager struct {
 	AutocertMgr *autocert.Manager
 	TLSConfig   *tls.Config
 	Mode        string
+}
+
+// CertificateExpiry returns the expiry of the certificate currently served for
+// hostname. It uses the same manual/autocert source as SMTP and HTTPS.
+func (cm *CertManager) CertificateExpiry(hostname string) (time.Time, bool) {
+	var cert *tls.Certificate
+	var err error
+	if cm.AutocertMgr != nil {
+		cert, err = cm.AutocertMgr.GetCertificate(&tls.ClientHelloInfo{ServerName: hostname})
+	} else if len(cm.TLSConfig.Certificates) > 0 {
+		cert = &cm.TLSConfig.Certificates[0]
+	}
+	if err != nil || cert == nil {
+		return time.Time{}, false
+	}
+	if cert.Leaf != nil {
+		return cert.Leaf.NotAfter, true
+	}
+	if len(cert.Certificate) == 0 {
+		return time.Time{}, false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return leaf.NotAfter, true
 }
 
 // NewCertManager creates the appropriate certificate manager based on config.

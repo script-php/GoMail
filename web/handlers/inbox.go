@@ -19,10 +19,11 @@ type InboxHandler struct {
 	db         *store.DB
 	sessionMgr *security.SessionManager
 	templates  *template.Template
+	cursors    *cursorSigner
 }
 
 // NewInboxHandler creates an inbox handler.
-func NewInboxHandler(db *store.DB, sm *security.SessionManager) *InboxHandler {
+func NewInboxHandler(db *store.DB, sm *security.SessionManager, secrets ...string) *InboxHandler {
 	funcMap := template.FuncMap{
 		"truncate": func(s string, n int) string {
 			if len(s) > n {
@@ -42,15 +43,47 @@ func NewInboxHandler(db *store.DB, sm *security.SessionManager) *InboxHandler {
 		},
 		"add":      func(a, b int) int { return a + b },
 		"subtract": func(a, b int) int { return a - b },
+		"folderID": func(id *int64) int64 {
+			if id == nil {
+				return 0
+			}
+			return *id
+		},
 	}
 
 	tmpl := templates.LoadTemplate(funcMap, "base", "inbox", "welcome")
 
+	secret := ""
+	if len(secrets) > 0 {
+		secret = secrets[0]
+	}
 	return &InboxHandler{
 		db:         db,
 		sessionMgr: sm,
 		templates:  tmpl,
+		cursors:    newCursorSigner(secret),
 	}
+}
+
+func (h *InboxHandler) cursor(r *http.Request, accountID int64, scope string) (*store.MessageCursor, error) {
+	value := r.URL.Query().Get("cursor")
+	if value == "" {
+		return nil, nil
+	}
+	return h.cursors.decode(value, accountID, scope)
+}
+
+func (h *InboxHandler) pageData(accountID int64, scope string, page store.MessagePage) map[string]interface{} {
+	data := map[string]interface{}{"Messages": page.Messages, "HasOlder": page.HasOlder, "HasNewer": page.HasNewer}
+	if len(page.Messages) > 0 {
+		if page.HasNewer {
+			data["NewerCursor"] = h.cursors.encode(accountID, scope, "newer", page.Messages[0])
+		}
+		if page.HasOlder {
+			data["OlderCursor"] = h.cursors.encode(accountID, scope, "older", page.Messages[len(page.Messages)-1])
+		}
+	}
+	return data
 }
 
 // Inbox shows the inbox (inbound messages).
@@ -61,13 +94,14 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
 	perPage := 50
-
-	messages, err := h.db.ListMessages(account.ID, "inbound", perPage, (page-1)*perPage)
+	scope := directionScope("inbound")
+	cursor, err := h.cursor(r, account.ID, scope)
+	if err != nil {
+		http.Error(w, "Invalid mailbox cursor", http.StatusBadRequest)
+		return
+	}
+	page, err := h.db.ListMessagesPage(account.ID, "inbound", perPage, cursor)
 	if err != nil {
 		log.Printf("[web] inbox list error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -78,19 +112,60 @@ func (h *InboxHandler) Inbox(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 	folders, _ := h.db.ListFolders(account.ID)
 
-	data := map[string]interface{}{
-		"Title":      "Inbox",
-		"Messages":   messages,
-		"Page":       page,
-		"TotalPages": (total + perPage - 1) / perPage,
-		"Total":      total,
-		"Unread":     unread,
-		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
-		"Section":    "inbox",
-		"Account":    account,
-		"Folders":    folders,
+	data := h.pageData(account.ID, scope, page)
+	for key, value := range map[string]interface{}{
+		"Title":     "Inbox",
+		"Total":     total,
+		"Unread":    unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+		"Section":   "inbox",
+		"Account":   account,
+		"Folders":   folders,
+	} {
+		data[key] = value
 	}
 
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Printf("[web] template error: %v", err)
+	}
+}
+
+// Starred shows bookmarked messages from all non-trash folders.
+func (h *InboxHandler) Starred(w http.ResponseWriter, r *http.Request) {
+	account := getSessionAccount(h.db, h.sessionMgr, r)
+	if account == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	const scope = "starred"
+	cursor, err := h.cursor(r, account.ID, scope)
+	if err != nil {
+		http.Error(w, "Invalid mailbox cursor", http.StatusBadRequest)
+		return
+	}
+	page, err := h.db.ListStarredMessagesPage(account.ID, 50, cursor)
+	if err != nil {
+		log.Printf("[web] starred list error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	total, err := h.db.CountStarredMessages(account.ID)
+	if err != nil {
+		log.Printf("[web] starred count error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	unread, _ := h.db.CountUnread(account.ID)
+	folders, _ := h.db.ListFolders(account.ID)
+	data := h.pageData(account.ID, scope, page)
+	for key, value := range map[string]interface{}{
+		"Title": "Starred", "Total": total, "Unread": unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r), "Section": "starred",
+		"Account": account, "Folders": folders,
+	} {
+		data[key] = value
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Printf("[web] template error: %v", err)
@@ -105,13 +180,14 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
 	perPage := 50
-
-	messages, err := h.db.ListMessages(account.ID, "outbound", perPage, (page-1)*perPage)
+	scope := directionScope("outbound")
+	cursor, err := h.cursor(r, account.ID, scope)
+	if err != nil {
+		http.Error(w, "Invalid mailbox cursor", http.StatusBadRequest)
+		return
+	}
+	page, err := h.db.ListMessagesPage(account.ID, "outbound", perPage, cursor)
 	if err != nil {
 		log.Printf("[web] sent list error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -122,17 +198,17 @@ func (h *InboxHandler) Sent(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 	folders, _ := h.db.ListFolders(account.ID)
 
-	data := map[string]interface{}{
-		"Title":      "Sent",
-		"Messages":   messages,
-		"Page":       page,
-		"TotalPages": (total + perPage - 1) / perPage,
-		"Total":      total,
-		"Unread":     unread,
-		"CSRFToken":  h.sessionMgr.GenerateCSRFToken(r),
-		"Section":    "sent",
-		"Account":    account,
-		"Folders":    folders,
+	data := h.pageData(account.ID, scope, page)
+	for key, value := range map[string]interface{}{
+		"Title":     "Sent",
+		"Total":     total,
+		"Unread":    unread,
+		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+		"Section":   "sent",
+		"Account":   account,
+		"Folders":   folders,
+	} {
+		data[key] = value
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -189,14 +265,14 @@ func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
 	perPage := 50
-
-	// List messages in folder
-	messages, err := h.db.ListMessagesInFolder(folderID, perPage, (page-1)*perPage)
+	scope := folderScope(folderID)
+	cursor, err := h.cursor(r, account.ID, scope)
+	if err != nil {
+		http.Error(w, "Invalid mailbox cursor", http.StatusBadRequest)
+		return
+	}
+	page, err := h.db.ListFolderMessagesPage(account.ID, folderID, perPage, cursor)
 	if err != nil {
 		log.Printf("[web] folder view error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -207,11 +283,9 @@ func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
 	unread, _ := h.db.CountUnread(account.ID)
 	folders, _ := h.db.ListFolders(account.ID)
 
-	data := map[string]interface{}{
+	data := h.pageData(account.ID, scope, page)
+	for key, value := range map[string]interface{}{
 		"Title":        folder.Name,
-		"Messages":     messages,
-		"Page":         page,
-		"TotalPages":   (total + perPage - 1) / perPage,
 		"Total":        total,
 		"Unread":       unread,
 		"CSRFToken":    h.sessionMgr.GenerateCSRFToken(r),
@@ -220,6 +294,9 @@ func (h *InboxHandler) FolderView(w http.ResponseWriter, r *http.Request) {
 		"Folders":      folders,
 		"ActiveFolder": folderID,
 		"IsTrash":      folder.FolderType == "trash",
+		"FolderType":   folder.FolderType,
+	} {
+		data[key] = value
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -266,22 +343,27 @@ func (h *InboxHandler) Search(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Search is too long", http.StatusBadRequest)
 		return
 	}
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 || page > 1000000 {
-		page = 1
+	scope := searchScope(query)
+	cursor, err := h.cursor(r, account.ID, scope)
+	if err != nil {
+		http.Error(w, "Invalid search cursor", http.StatusBadRequest)
+		return
 	}
-	messages, total, err := h.db.SearchMessages(account.ID, query, 50, (page-1)*50)
+	page, total, err := h.db.SearchMessagesPage(account.ID, query, 50, cursor)
 	if err != nil {
 		http.Error(w, "Unable to search mail", http.StatusInternalServerError)
 		return
 	}
 	folders, _ := h.db.ListFolders(account.ID)
 	unread, _ := h.db.CountUnread(account.ID)
-	data := map[string]interface{}{
-		"Title": "Search", "Section": "search", "Query": query, "Messages": messages,
-		"Total": total, "Page": page, "TotalPages": (total + 49) / 50,
+	data := h.pageData(account.ID, scope, page)
+	for key, value := range map[string]interface{}{
+		"Title": "Search", "Section": "search", "Query": query,
+		"Total":   total,
 		"Account": account, "Folders": folders, "Unread": unread,
 		"CSRFToken": h.sessionMgr.GenerateCSRFToken(r),
+	} {
+		data[key] = value
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {

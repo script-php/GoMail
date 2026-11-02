@@ -25,6 +25,10 @@
     "write_timeout": 60,
     "max_connections": 50,
     "auth_attempts_per_minute": 10,
+    "imap": {
+      "enabled": false,
+      "listen_addr": ":993"
+    },
     "pop3": {
       "enabled": true,
       "listen_addr": ":995"
@@ -71,8 +75,9 @@
 
   "delivery": {
     "queue_workers": 4,
-    "retry_intervals": [60, 300, 900, 3600, 14400, 86400],
-    "max_retries": 6,
+    "retry_intervals": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 86400, 86400, 86400],
+    "max_retries": 11,
+    "dsn_delay_after_seconds": 14400,
     "network": "tcp",
     "enable_verp": false
   },
@@ -99,6 +104,25 @@
   "logging": {
     "level": "info",
     "format": "text"
+  },
+
+  "metrics": {
+    "enabled": false,
+    "listen_addr": "127.0.0.1:9090",
+    "bearer_token": ""
+  },
+  "storage_pressure": {
+    "warning_free_bytes": 2147483648,
+    "minimum_free_bytes": 1073741824
+  },
+  "outbound_limits": {
+    "enabled": true,
+    "messages_per_hour": 100,
+    "messages_per_day": 500,
+    "recipients_per_hour": 250,
+    "recipients_per_day": 1000,
+    "max_recipients_per_message": 100,
+    "suspension_minutes": 60
   },
 
   "dmarc": {

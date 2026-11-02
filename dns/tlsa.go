@@ -36,10 +36,11 @@ type TLSARecord struct {
 // TLSAResult preserves the security distinction between authenticated absence,
 // insecure data and a lookup failure. DANE callers may only use authenticated data.
 type TLSAResult struct {
-	Records       []TLSARecord
-	Authenticated bool
-	Name          string
-	TTL           time.Duration
+	Records         []TLSARecord
+	Authenticated   bool
+	UnusableRecords bool // secure, nonempty RRset with no supported association
+	Name            string
+	TTL             time.Duration
 }
 
 var (
@@ -55,7 +56,11 @@ func LookupTLSA(host string) (TLSAResult, error) {
 	name := fmt.Sprintf("_25._tcp.%s.", host)
 	cacheKey := "tlsa:v2:" + host
 	if cached, ok := globalCache.Get(cacheKey); ok {
-		return cached.(TLSAResult), nil
+		result := cached.(TLSAResult)
+		if !result.Authenticated {
+			return result, ErrDNSSECInsecure
+		}
+		return result, nil
 	}
 	dnsServersMu.RLock()
 	servers := append([]string(nil), dnsServers...)
@@ -63,8 +68,11 @@ func LookupTLSA(host string) (TLSAResult, error) {
 	var errs []error
 	for _, server := range servers {
 		result, err := queryTLSARecords(name, server)
-		if err == nil || errors.Is(err, ErrNoTLSA) {
+		if err == nil || errors.Is(err, ErrNoTLSA) || errors.Is(err, ErrDNSSECInsecure) {
 			globalCache.SetWithTTL(cacheKey, result, result.TTL)
+			if errors.Is(err, ErrDNSSECInsecure) {
+				return result, err
+			}
 			return result, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", server, err))
@@ -74,59 +82,88 @@ func LookupTLSA(host string) (TLSAResult, error) {
 
 func queryTLSARecords(name, server string) (TLSAResult, error) {
 	endpoint, tlsName, _ := strings.Cut(server, "#")
-	msg := new(mdns.Msg)
-	msg.SetQuestion(name, mdns.TypeTLSA)
-	msg.SetEdns0(1232, true)
 	client := &mdns.Client{Net: "udp", Timeout: 5 * time.Second}
 	if tlsName != "" {
 		client.Net = "tcp-tls"
 		client.TLSConfig = &tls.Config{ServerName: tlsName, MinVersion: tls.VersionTLS12}
 	}
-	resp, _, err := client.Exchange(msg, endpoint)
-	if err != nil {
-		return TLSAResult{Name: name}, fmt.Errorf("DNS query: %w", err)
-	}
-	if resp.Truncated && client.Net == "udp" {
-		client.Net = "tcp"
-		resp, _, err = client.Exchange(msg, endpoint)
-		if err != nil {
-			return TLSAResult{Name: name}, fmt.Errorf("DNS TCP retry: %w", err)
-		}
-	}
-	result := TLSAResult{Name: name, Authenticated: resp.AuthenticatedData, TTL: time.Minute}
-	if !resp.AuthenticatedData {
-		return result, ErrDNSSECInsecure
-	}
-	if resp.Rcode == mdns.RcodeNameError {
-		return result, ErrNoTLSA
-	}
-	if resp.Rcode != mdns.RcodeSuccess {
-		return result, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-	}
+	original := mdns.Fqdn(name)
+	current := original
+	seen := make(map[string]bool)
 	minTTL := uint32(300)
-	for _, answer := range resp.Answer {
-		rr, ok := answer.(*mdns.TLSA)
-		if !ok {
+	for len(seen) < 8 {
+		if seen[strings.ToLower(current)] {
+			return TLSAResult{Name: original}, fmt.Errorf("TLSA CNAME loop at %s", current)
+		}
+		seen[strings.ToLower(current)] = true
+		msg := new(mdns.Msg)
+		msg.SetQuestion(current, mdns.TypeTLSA)
+		msg.SetEdns0(1232, true)
+		resp, _, err := client.Exchange(msg, endpoint)
+		if err != nil {
+			return TLSAResult{Name: original}, fmt.Errorf("DNS query: %w", err)
+		}
+		if resp.Truncated && client.Net == "udp" {
+			client.Net = "tcp"
+			resp, _, err = client.Exchange(msg, endpoint)
+			if err != nil {
+				return TLSAResult{Name: original}, fmt.Errorf("DNS TCP retry: %w", err)
+			}
+		}
+		result := TLSAResult{Name: original, Authenticated: resp.AuthenticatedData, TTL: time.Duration(minTTL) * time.Second}
+		if resp.Rcode != mdns.RcodeSuccess && resp.Rcode != mdns.RcodeNameError {
+			return result, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+		}
+		if !resp.AuthenticatedData {
+			return result, ErrDNSSECInsecure
+		}
+		if resp.Rcode == mdns.RcodeNameError {
+			return result, ErrNoTLSA
+		}
+		var alias string
+		for _, answer := range resp.Answer {
+			if rr, ok := answer.(*mdns.CNAME); ok && strings.EqualFold(rr.Hdr.Name, current) {
+				alias = mdns.Fqdn(rr.Target)
+				if rr.Hdr.Ttl < minTTL {
+					minTTL = rr.Hdr.Ttl
+				}
+			}
+		}
+		if alias != "" {
+			current = alias
 			continue
 		}
-		record, parseErr := validateTLSA(TLSARecord{rr.Usage, rr.Selector, rr.MatchingType, rr.Certificate})
-		if parseErr != nil {
-			log.Printf("[dns] ignoring malformed TLSA record for %s: %v", name, parseErr)
-			continue
+		tlsaRecordsSeen := 0
+		for _, answer := range resp.Answer {
+			rr, ok := answer.(*mdns.TLSA)
+			if !ok || !strings.EqualFold(rr.Hdr.Name, current) {
+				continue
+			}
+			tlsaRecordsSeen++
+			if rr.Hdr.Ttl < minTTL {
+				minTTL = rr.Hdr.Ttl
+			}
+			record, parseErr := validateTLSA(TLSARecord{rr.Usage, rr.Selector, rr.MatchingType, rr.Certificate})
+			if parseErr != nil {
+				log.Printf("[dns] ignoring malformed TLSA record for %s: %v", current, parseErr)
+				continue
+			}
+			result.Records = append(result.Records, record)
 		}
-		if rr.Hdr.Ttl < minTTL {
-			minTTL = rr.Hdr.Ttl
+		result.TTL = time.Duration(minTTL) * time.Second
+		if result.TTL <= 0 || result.TTL > time.Hour {
+			result.TTL = 5 * time.Minute
 		}
-		result.Records = append(result.Records, record)
+		if len(result.Records) == 0 {
+			if tlsaRecordsSeen > 0 {
+				result.UnusableRecords = true
+				return result, nil
+			}
+			return result, ErrNoTLSA
+		}
+		return result, nil
 	}
-	result.TTL = time.Duration(minTTL) * time.Second
-	if result.TTL <= 0 || result.TTL > time.Hour {
-		result.TTL = 5 * time.Minute
-	}
-	if len(result.Records) == 0 {
-		return result, ErrNoTLSA
-	}
-	return result, nil
+	return TLSAResult{Name: original}, fmt.Errorf("TLSA CNAME chain too long for %s", original)
 }
 
 func validateTLSA(record TLSARecord) (TLSARecord, error) {

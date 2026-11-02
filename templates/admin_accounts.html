@@ -31,7 +31,7 @@
                 <th>Domain</th>
                 <th>Role</th>
                 <th>Status</th>
-                <th>Quota</th>
+                <th>Usage / Quota</th>
                 <th>Created</th>
                 <th>Actions</th>
             </tr>
@@ -56,7 +56,7 @@
                     <span class="badge badge-danger">Inactive</span>
                     {{end}}
                 </td>
-                <td>{{formatSize .QuotaBytes}}</td>
+                <td>{{formatSize .MailboxUsedBytes}} / {{if .QuotaBytes}}{{formatSize .QuotaBytes}}{{else}}Unlimited{{end}}</td>
                 <td>{{.CreatedAt.Format "2006-01-02"}}</td>
                 <td class="actions">
                     <a href="/admin/account/edit/{{.ID}}" class="btn btn-sm">Edit</a>

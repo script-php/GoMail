@@ -1,0 +1,19 @@
+ARC-Seal: i=2; cv=pass; a=rsa-sha256; d=example.test; s=arc;
+ t=1792490500;
+ b=PSamSaUIK6+uyaEMEiMtNpWfGLb7xs6XG6MMkcqN1251zLwd6p0HTuvrlEcsSZxjmsPsk
+ AtBhYuSu6livnjVSdplaqQMeLCn/5/accmHaUKv799UiLf+ujHq9AUyvUz0ork2mS7cd9w9
+ Ad3O8mBI9/rLMPfTy7WE1TqBzlyMJjMIACVdMx2pulZ7CccYLuzmMXb/SeV0SeueI0UQMfL
+ 4X9qqSHbCzX55HpMJk534Ikl0371b3vvbplScn9NcNrMXeg36wVpZBsKP8BM/fPl/gAgpMn
+ kBsabzkH1YHL3ZQrIyyCy3gcT4r4cGeBKmuConTgBBfVTlpUD+hWugb9K0dQ==
+ARC-Message-Signature: i=2; a=rsa-sha256; c=relaxed/relaxed;
+ d=example.test; s=arc; t=1792490500; h=from : to : subject : date :
+ message-id; bh=zVqCwY79vaex0HyKVcvbBNMaiBhiGlGtnE03RN1tyjo=;
+ b=Df76XuPcs1b9QuYLhZY4taeaMza+hwIlm2BL5QeWP10E7Y1tK+Ti2QveopkSYS8Gyl1DI
+ yaANyqO2sDdHCqANjv3i0Sk0OpH2v85Adw+ksskyvQPrtRycAFdKtnQ3rcs4CO4nhvmvkr3
+ 6UCLad8B2BMqExyEux/Qu+Zzj6qnaYITfULQNlVM27ZHnLpfzybVjdxgy7FnmIQ6GVvD6tv
+ m26TVYGJC93Y/hw4wwOx2EFWHkE7WFKcNikkZQ1TBucNCeVXkNQh7YggaXys3aL1Xkknax7
+ 5BhCe8IZHC6e+ba/YjrU7XKiWKAbDIHE/3Gj+W8Pi2WYMWiK8e2y3PCJ0/3w==
+ARC-Authentication-Results: i=2; dkimpy.example;
+ arc=pass;
+ spf=pass smtp.mailfrom=relay@example.test;
+ spf=pass smtp.mailfrom=sender@example.test

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -14,6 +15,8 @@ import (
 
 	"gomail/logging"
 )
+
+var ErrDKIMInvalidRecord = errors.New("invalid DKIM public key record")
 
 // DKIMRecord represents a parsed DKIM record from DNS
 type DKIMRecord struct {
@@ -52,7 +55,7 @@ func LookupDKIMPublicKey(selector, domain string) (*DKIMRecord, error) {
 	record := parseDKIMRecord(txts[0])
 	if record == nil {
 		logging.Warn(fmt.Sprintf("[auth] invalid DKIM record at %s", lookupHost))
-		return nil, fmt.Errorf("invalid DKIM record at %s", lookupHost)
+		return nil, fmt.Errorf("%w at %s", ErrDKIMInvalidRecord, lookupHost)
 	}
 
 	return record, nil
@@ -202,23 +205,18 @@ func VerifyARCChainSignature(arcSig string, canonBody, canonHeaders string, reco
 // extractTagValue extracts a tag value from a signature header
 // e.g., extractTagValue("a=rsa-sha256; b=xyz", "b=") returns "xyz"
 func extractTagValue(header, tag string) string {
-	// Find tag position
-	idx := strings.Index(header, tag)
-	if idx == -1 {
-		return ""
+	header = strings.ReplaceAll(header, "\r\n", " ")
+	if colon, equal := strings.IndexByte(header, ':'), strings.IndexByte(header, '='); colon >= 0 && equal > colon {
+		header = header[colon+1:]
 	}
-
-	// Move past tag
-	start := idx + len(tag)
-	value := header[start:]
-
-	// Find semicolon or end of string
-	endIdx := strings.Index(value, ";")
-	if endIdx == -1 {
-		return strings.TrimSpace(value)
+	want := strings.TrimSuffix(tag, "=")
+	for _, field := range strings.Split(header, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), want) {
+			return strings.TrimSpace(value)
+		}
 	}
-
-	return strings.TrimSpace(value[:endIdx])
+	return ""
 }
 
 // sha256Sum computes SHA256 hash

@@ -102,6 +102,19 @@
     </form>
 
     {{if not .IsNew}}
+    <div class="admin-section">
+        <h3>Report recipient for this domain</h3>
+        <p>DMARC and TLS-RPT DNS suggestions will point to this active local mailbox. Leave the default to use <code>postmaster@{{.Domain.Domain}}</code>. Publishing DNS remains your responsibility.</p>
+        <form method="POST" action="/admin/domain/report-recipient/{{.Domain.ID}}" class="admin-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <label for="report_account_id">Mailbox</label>
+            <select id="report_account_id" name="report_account_id">
+                <option value="0" {{if eq .ReportRecipientID 0}}selected{{end}}>Default postmaster address</option>
+                {{range .ReportAccounts}}<option value="{{.ID}}" {{if eq .ID $.ReportRecipientID}}selected{{end}} {{if not .IsActive}}disabled{{end}}>{{.Email}}{{if not .IsActive}} (inactive){{end}}</option>{{end}}
+            </select>
+            <button type="submit" class="btn btn-primary">Save report recipient</button>
+        </form>
+    </div>
     <!-- DKIM Key Management -->
     <div class="admin-section">
         <h3>DKIM Keys</h3>

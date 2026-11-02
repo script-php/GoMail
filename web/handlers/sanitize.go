@@ -27,26 +27,28 @@ var allowedEmailAttrs = map[string]bool{
 
 // sanitizeHTML is a parser-based allowlist sanitizer. Unknown elements are
 // unwrapped, active-content elements and their contents are dropped.
-func sanitizeHTML(input string) string {
+func sanitizeHTML(input string) string { return sanitizeHTMLWithRemoteImages(input, false) }
+
+func sanitizeHTMLWithRemoteImages(input string, allowRemoteImages bool) string {
 	root, err := xhtml.Parse(strings.NewReader(input))
 	if err != nil {
 		return ""
 	}
 	var out bytes.Buffer
 	for child := root.FirstChild; child != nil; child = child.NextSibling {
-		renderSafeEmailNode(&out, child)
+		renderSafeEmailNode(&out, child, allowRemoteImages)
 	}
 	return strings.TrimSpace(out.String())
 }
 
-func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node) {
+func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node, allowRemoteImages bool) {
 	if n.Type == xhtml.TextNode {
 		out.WriteString(stdhtml.EscapeString(n.Data))
 		return
 	}
 	if n.Type != xhtml.ElementNode {
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			renderSafeEmailNode(out, c)
+			renderSafeEmailNode(out, c, allowRemoteImages)
 		}
 		return
 	}
@@ -56,7 +58,7 @@ func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node) {
 	}
 	if !allowedEmailElements[tag] {
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			renderSafeEmailNode(out, c)
+			renderSafeEmailNode(out, c, allowRemoteImages)
 		}
 		return
 	}
@@ -69,7 +71,7 @@ func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node) {
 		}
 		value := a.Val
 		if key == "href" || key == "src" {
-			if !safeEmailURL(value, key == "src") {
+			if !safeEmailURL(value, key == "src", allowRemoteImages) {
 				continue
 			}
 		}
@@ -93,7 +95,7 @@ func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node) {
 	}
 	out.WriteByte('>')
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		renderSafeEmailNode(out, c)
+		renderSafeEmailNode(out, c, allowRemoteImages)
 	}
 	if tag != "br" && tag != "hr" && tag != "img" && tag != "col" {
 		out.WriteString("</")
@@ -102,7 +104,7 @@ func renderSafeEmailNode(out *bytes.Buffer, n *xhtml.Node) {
 	}
 }
 
-func safeEmailURL(raw string, image bool) bool {
+func safeEmailURL(raw string, image, allowRemoteImages bool) bool {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return false
@@ -112,7 +114,17 @@ func safeEmailURL(raw string, image bool) bool {
 		return false
 	}
 	if image {
-		return scheme == "http" || scheme == "https" || scheme == "cid" || scheme == "data"
+		if scheme == "http" || scheme == "https" {
+			return allowRemoteImages && u.Host != ""
+		}
+		if scheme == "cid" {
+			return len(raw) <= 512 && u.Opaque != ""
+		}
+		if scheme == "data" {
+			lower := strings.ToLower(raw)
+			return len(raw) <= 64*1024 && (strings.HasPrefix(lower, "data:image/png;base64,") || strings.HasPrefix(lower, "data:image/jpeg;base64,") || strings.HasPrefix(lower, "data:image/gif;base64,") || strings.HasPrefix(lower, "data:image/webp;base64,"))
+		}
+		return false
 	}
 	return scheme == "http" || scheme == "https" || scheme == "mailto"
 }

@@ -62,6 +62,35 @@ func (q *Queue) getDKIMSigner(from string) (*auth.DKIMSigner, error) {
 // Enqueue adds a new outbound message to the delivery queue.
 // It DKIM-signs the message (per-domain), stores it, and creates queue entries.
 func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID int64) error {
+	return q.enqueue(from, to, nil, rawMessage, accountID, 0)
+}
+
+// SubmissionDSN carries authenticated clients' DSN options into the durable queue.
+type SubmissionDSN struct {
+	Notify            []string
+	OriginalRecipient []string
+	Return            string
+	EnvelopeID        string
+}
+
+// EnqueueSubmission preserves per-recipient DSN requests from authenticated SMTP clients.
+func (q *Queue) EnqueueSubmission(from string, to []string, dsn SubmissionDSN, rawMessage []byte, accountID int64) error {
+	if len(to) != len(dsn.Notify) || len(to) != len(dsn.OriginalRecipient) {
+		return fmt.Errorf("recipient and DSN option counts differ")
+	}
+	return q.enqueue(from, to, &dsn, rawMessage, accountID, 0)
+}
+
+// EnqueueMDN commits the receipt and its source-message marker together.
+func (q *Queue) EnqueueMDN(from string, to []string, rawMessage []byte, accountID, sourceMessageID int64) error {
+	return q.enqueue(from, to, nil, rawMessage, accountID, sourceMessageID)
+}
+
+func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage []byte, accountID, mdnSourceID int64) error {
+	// Normalize eligible MIME bodies before DKIM signs them. A DKIM-signed
+	// seven-bit representation can be delivered to both modern and legacy
+	// SMTP peers without changing the queued signature at delivery time.
+	rawMessage = sevenBitMIME(rawMessage)
 	// Per-domain DKIM signing
 	signer, signerErr := q.getDKIMSigner(from)
 	if signerErr != nil {
@@ -79,20 +108,24 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 	}
 
 	// Store the outbound message in the messages table
-	rcptJSON, _ := json.Marshal(to)
+	rcptJSON, err := json.Marshal(to)
+	if err != nil {
+		return fmt.Errorf("encoding recipients: %w", err)
+	}
 
 	// Parse the SIGNED message to extract subject, body, headers for the sent view
 	// (includes DKIM-Signature header if signing succeeded)
-	parsed, _ := parser.Parse(signedMessage)
-	var subject, textBody, htmlBody, rawHeaders, toAddr, ccAddr string
-	if parsed != nil {
-		subject = parsed.Subject
-		textBody = parsed.TextBody
-		htmlBody = parsed.HTMLBody
-		rawHeaders = parsed.RawHeaders
-		toAddr = parsed.To
-		ccAddr = parsed.Cc
+	parsed, err := parser.Parse(signedMessage)
+	if err != nil {
+		return fmt.Errorf("parsing signed message before queueing: %w", err)
 	}
+	var subject, textBody, htmlBody, rawHeaders, toAddr, ccAddr string
+	subject = parsed.Subject
+	textBody = parsed.TextBody
+	htmlBody = parsed.HTMLBody
+	rawHeaders = parsed.RawHeaders
+	toAddr = parsed.To
+	ccAddr = parsed.Cc
 	if toAddr == "" {
 		toAddr = joinAddrs(to)
 	}
@@ -112,20 +145,27 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 		RawHeaders:     rawHeaders,
 		RawMessage:     signedMessage,
 		Size:           int64(len(signedMessage)),
-		HasAttachments: parsed != nil && len(parsed.Attachments) > 0,
+		HasAttachments: len(parsed.Attachments) > 0,
 		IsRead:         true, // Outbound messages are already "read"
 		ReceivedAt:     time.Now(),
 	}
 
-	// Assign outbound message to Sent folder
-	sentFolder, err := q.db.GetFolderByType(accountID, "sent")
-	if err == nil && sentFolder != nil {
+	// System-generated reports have no mailbox or Sent folder; their queued
+	// raw MIME remains the durable copy until delivery completes.
+	if accountID != 0 {
+		sentFolder, err := q.db.GetFolderByType(accountID, "sent")
+		if err != nil {
+			return fmt.Errorf("loading sent folder: %w", err)
+		}
+		if sentFolder == nil {
+			return fmt.Errorf("account %d has no sent folder", accountID)
+		}
 		msg.FolderID = &sentFolder.ID
 	}
 
 	var entries []*store.QueueEntry
 	// Create a queue entry for each recipient
-	for _, rcpt := range to {
+	for index, rcpt := range to {
 		// Generate VERP bounce address for automatic bounce tracking (if enabled)
 		var verpAddr string
 		if q.cfg.Delivery.IsVERPEnabled() {
@@ -133,10 +173,28 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 			verpAddr, err = q.db.EncodeVERP(from, rcpt)
 			if err != nil {
 				logging.Info(fmt.Sprintf("[delivery] VERP encoding failed for %s -> %s: %v (using regular address)", from, rcpt, err))
-				verpAddr = from // Fallback to normal address if VERP fails
+				verpAddr = "" // Empty means the worker uses the ordinary sender address.
 			}
 		}
 
+		dsnNotify := "FAILURE"
+		dsnRet := "FULL"
+		dsnEnvID := msg.MessageID
+		originalRecipient := rcpt
+		if dsn != nil {
+			// Preserve absence of DSN parameters from submission when relaying.
+			dsnRet, dsnEnvID = "", ""
+			dsnNotify = dsn.Notify[index]
+			if dsn.Return != "" {
+				dsnRet = dsn.Return
+			}
+			if dsn.EnvelopeID != "" {
+				dsnEnvID = dsn.EnvelopeID
+			}
+			if dsn.OriginalRecipient[index] != "" {
+				originalRecipient = dsn.OriginalRecipient[index]
+			}
+		}
 		entry := &store.QueueEntry{
 
 			MailFrom:          from,
@@ -144,33 +202,33 @@ func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID i
 			RawMessage:        signedMessage,
 			MaxAttempts:       q.cfg.Delivery.MaxRetries,
 			NextRetry:         time.Now().UTC(),
-			DSNNotify:         "FAILURE", // Request failure notifications from remote server
-			DSNRet:            "FULL",    // Request full message in failure report
-			DSNEnvID:          msg.MessageID,
+			DSNNotify:         dsnNotify,
+			DSNRet:            dsnRet,
+			DSNEnvID:          dsnEnvID,
 			VERPBounceAddress: verpAddr, // VERP-encoded bounce address (empty if disabled)
-			OriginalRecipient: rcpt,     // Store original recipient for tracking
+			OriginalRecipient: originalRecipient,
 		}
 
 		entries = append(entries, entry)
 	}
-	msgID, err := q.db.SaveQueuedMessage(msg, entries)
+	// System-generated messages have no Sent-folder owner. Their raw MIME is
+	// fully queued for delivery, but decoded sidecars have nowhere to belong.
+	var attachments []store.IMAPAppendAttachment
+	if accountID != 0 {
+		attachments = make([]store.IMAPAppendAttachment, 0, len(parsed.Attachments))
+		for _, attachment := range parsed.Attachments {
+			attachments = append(attachments, store.IMAPAppendAttachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: attachment.Data})
+		}
+	}
+	var msgID int64
+	if mdnSourceID != 0 {
+		msgID, err = q.db.SaveQueuedMDNMessageWithAttachments(msg, entries, mdnSourceID, attachments)
+	} else {
+		msgID, err = q.db.SaveQueuedMessageWithAttachments(msg, entries, attachments)
+	}
 	if err != nil {
 		return fmt.Errorf("queueing outbound message: %w", err)
 	}
-	// Save attachments from the parsed message
-	if parsed != nil && len(parsed.Attachments) > 0 {
-		records, err := parser.SaveAttachments(parsed.Attachments, msgID, q.cfg.Store.AttachmentsPath)
-		if err != nil {
-			logging.Info(fmt.Sprintf("[delivery] attachment save error: %v", err))
-		} else {
-			for _, rec := range records {
-				if _, err := q.db.SaveAttachment(rec); err != nil {
-					logging.Info(fmt.Sprintf("[delivery] failed to save attachment record: %v", err))
-				}
-			}
-		}
-	}
-
 	// Update sent folder counts
 	if msg.FolderID != nil {
 		q.db.UpdateFolderCounts(*msg.FolderID)

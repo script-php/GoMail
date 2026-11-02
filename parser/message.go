@@ -11,6 +11,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/text/encoding/htmlindex"
+	"golang.org/x/text/transform"
 )
 
 // ParsedMessage holds the parsed components of an RFC 5322 message.
@@ -83,24 +86,31 @@ func Parse(raw []byte) (*ParsedMessage, error) {
 		return nil, fmt.Errorf("reading message body: %w", err)
 	}
 
-	// Decode transfer encoding (base64, quoted-printable)
+	// Decode transfer encoding and convert declared text charset to UTF-8.
 	body = decodeTransferEncoding(body, msg.Header.Get("Content-Transfer-Encoding"))
+	mediaType, contentParams, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	body = decodeCharset(body, contentParams["charset"])
 
 	// Check Content-Type for MIME multipart
 	contentType := msg.Header.Get("Content-Type")
-	if strings.Contains(contentType, "multipart/") {
+	switch {
+	case strings.HasPrefix(mediaType, "multipart/"):
 		if err := parseMIME(parsed, contentType, body); err != nil {
 			// Fallback: treat as plain text
 			parsed.TextBody = string(body)
+		} else if parsed.TextBody == "" && parsed.HTMLBody != "" {
+			// HTML-only multipart messages still need a searchable/readable text
+			// representation, matching the top-level text/html behavior.
+			parsed.TextBody = strings.TrimSpace(htmlToPlainText(parsed.HTMLBody))
 		}
-	} else if strings.Contains(contentType, "text/html") {
+	case mediaType == "text/html":
 		// Store HTML but also provide as text for display
 		parsed.HTMLBody = string(body)
 		parsed.TextBody = strings.TrimSpace(htmlToPlainText(string(body)))
 		if parsed.TextBody == "" {
 			parsed.TextBody = string(body) // If conversion fails, use HTML as-is
 		}
-	} else {
+	default:
 		// Plain text or unknown
 		parsed.TextBody = string(body)
 	}
@@ -134,7 +144,7 @@ func decodeRFC2047(s string) string {
 	}
 
 	// Use Go's mime package for proper RFC 2047 decoding
-	decoder := mime.WordDecoder{}
+	decoder := mime.WordDecoder{CharsetReader: charsetReader}
 	result, err := decoder.DecodeHeader(s)
 	if err == nil {
 		return result
@@ -172,6 +182,30 @@ func decodeRFC2047(s string) string {
 		// For now, assume UTF-8 (most modern emails use it)
 		return string(decoded)
 	})
+}
+
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	charset = strings.TrimSpace(strings.ToLower(charset))
+	if charset == "" || charset == "utf-8" || charset == "us-ascii" {
+		return input, nil
+	}
+	encoding, err := htmlindex.Get(charset)
+	if err != nil {
+		return nil, err
+	}
+	return transform.NewReader(input, encoding.NewDecoder()), nil
+}
+
+func decodeCharset(data []byte, charset string) []byte {
+	reader, err := charsetReader(charset, bytes.NewReader(data))
+	if err != nil {
+		return data
+	}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return data
+	}
+	return decoded
 }
 
 // decodeTransferEncoding handles base64 and quoted-printable encoding

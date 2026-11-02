@@ -13,28 +13,27 @@
         {{else}}
         <button class="toolbar-btn" data-bulk-action="trash" disabled>Trash</button>
         {{end}}
-        <select id="move-folder" aria-label="Move selected messages to folder" disabled>
+        {{if and (ne .Section "sent") (ne .Section "drafts") (not .IsTrash) (ne .FolderType "drafts") (ne .FolderType "sent")}}
+        <select id="move-folder" aria-label="Move selected received messages to folder" disabled>
             <option value="">Move to…</option>
-            {{range .Folders}}{{if ne .FolderType "drafts"}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}
+            {{range .Folders}}{{if or (eq .FolderType "spam") (eq .FolderType "custom") (eq .FolderType "inbox")}}<option value="{{.ID}}" data-folder-type="{{.FolderType}}">{{.Name}}</option>{{end}}{{end}}
         </select>
+        {{end}}
         <button class="toolbar-btn" title="Refresh" data-reload>&#8635;</button>
     </div>
     <div class="toolbar-right">
         {{if .Total}}<span>{{.Total}} messages</span>{{end}}
-        {{if gt .TotalPages 1}}
-        <span>Page {{.Page}} of {{.TotalPages}}</span>
-        {{if gt .Page 1}}<a href="?q={{.Query}}&amp;page={{subtract .Page 1}}" class="toolbar-btn" title="Newer">&lsaquo;</a>{{end}}
-        {{if lt .Page .TotalPages}}<a href="?q={{.Query}}&amp;page={{add .Page 1}}" class="toolbar-btn" title="Older">&rsaquo;</a>{{end}}
-        {{end}}
+        {{if .HasNewer}}<a href="{{if eq .Section "search"}}?q={{urlquery .Query}}&amp;cursor={{.NewerCursor}}{{else}}?cursor={{.NewerCursor}}{{end}}" class="toolbar-btn" title="Newer messages" aria-label="Newer messages">&lsaquo;</a>{{end}}
+        {{if .HasOlder}}<a href="{{if eq .Section "search"}}?q={{urlquery .Query}}&amp;cursor={{.OlderCursor}}{{else}}?cursor={{.OlderCursor}}{{end}}" class="toolbar-btn" title="Older messages" aria-label="Older messages">&rsaquo;</a>{{end}}
     </div>
 </div>
 
 <p id="mail-action-error" role="alert" hidden></p>
-{{if eq .Section "search"}}<p>Search results for “{{.Query}}” ({{.Total}})</p>{{end}}
+{{if eq .Section "search"}}<div class="search-results-heading"><h2>Search results</h2><span class="search-results-query">{{.Query}}</span><span class="search-results-count">{{.Total}} {{if eq .Total 1}}message{{else}}messages{{end}}</span></div>{{end}}
 <div class="email-list">
     {{if .Messages}}
     {{range .Messages}}
-    <div class="email-row {{if not .IsRead}}unread{{else}}read{{end}}" data-id="{{.ID}}" {{if eq .Direction "draft"}}data-draft="true"{{end}}>
+    <div class="email-row {{if not .IsRead}}unread{{else}}read{{end}} {{if or (eq $.Section "search") (eq $.Section "starred") $.IsTrash}}mixed-mail-list{{end}}" data-id="{{.ID}}" data-direction="{{.Direction}}" data-folder-id="{{folderID .FolderID}}" data-deleted="{{.IsDeleted}}" {{if and (eq .Direction "draft") (not .IsDeleted)}}data-draft="true"{{end}}>
         <div class="email-checkbox">
             <input type="checkbox" aria-label="Select">
         </div>
@@ -45,12 +44,16 @@
             </button>
         </div>
         <div class="email-from">
-            {{if eq $.Section "sent"}}{{truncate .ToAddr 30}}{{else}}{{truncate .FromAddr 30}}{{end}}
+            {{if or (eq $.Section "search") (eq $.Section "starred") $.IsTrash}}
+                {{if eq .Direction "outbound"}}<span class="mail-direction mail-direction-sent">Sent</span><span class="mail-counterpart" title="To: {{.ToAddr}}">To: {{truncate .ToAddr 32}}</span>
+                {{else if eq .Direction "draft"}}<span class="mail-direction mail-direction-draft">Draft</span><span class="mail-counterpart" title="To: {{.ToAddr}}">To: {{truncate .ToAddr 32}}</span>
+                {{else}}<span class="mail-direction mail-direction-received">Received</span><span class="mail-counterpart" title="From: {{.FromAddr}}">From: {{truncate .FromAddr 32}}</span>{{end}}
+            {{else if eq $.Section "sent"}}{{truncate .ToAddr 30}}{{else}}{{truncate .FromAddr 30}}{{end}}
             {{if .HasAttachments}}<span class="email-attachment" title="Has attachments">&#128206;</span>{{end}}
         </div>
-        <div class="email-subject">
+        <a class="email-subject email-open-link" href="{{if and (eq .Direction "draft") (not .IsDeleted)}}/compose?draft={{.ID}}{{else}}/message/{{.ID}}{{end}}" aria-label="Open {{if and (eq .Direction "draft") (not .IsDeleted)}}draft{{else}}message{{end}}: {{.Subject}}">
             <span class="email-subject-text">{{truncate .Subject 60}}</span>
-        </div>
+        </a>
         <div class="email-auth">
             <span class="auth-dot {{.SPFResult}}" title="SPF: {{.SPFResult}}"></span>
             <span class="auth-dot {{.DKIMResult}}" title="DKIM: {{.DKIMResult}}"></span>
@@ -64,16 +67,15 @@
     {{else}}
     <div class="empty-state">
         <div class="empty-icon">&#9993;</div>
-        <p>{{if eq .Section "search"}}No matching messages.{{else}}No messages yet.{{end}}</p>
+        <p>{{if eq .Section "search"}}No matching messages.{{else if eq .Section "starred"}}No starred messages yet. Star a message to find it here.{{else}}No messages yet.{{end}}</p>
     </div>
     {{end}}
 </div>
 
-{{if and .Messages (gt .TotalPages 1)}}
+{{if and .Messages (or .HasNewer .HasOlder)}}
 <div class="pagination">
-    {{if gt .Page 1}}<a href="?q={{.Query}}&amp;page={{subtract .Page 1}}">&laquo; Newer</a>{{end}}
-    <span>Page {{.Page}} of {{.TotalPages}}</span>
-    {{if lt .Page .TotalPages}}<a href="?q={{.Query}}&amp;page={{add .Page 1}}">Older &raquo;</a>{{end}}
+    {{if .HasNewer}}<a href="{{if eq .Section "search"}}?q={{urlquery .Query}}&amp;cursor={{.NewerCursor}}{{else}}?cursor={{.NewerCursor}}{{end}}">&laquo; Newer</a>{{end}}
+    {{if .HasOlder}}<a href="{{if eq .Section "search"}}?q={{urlquery .Query}}&amp;cursor={{.OlderCursor}}{{else}}?cursor={{.OlderCursor}}{{end}}">Older &raquo;</a>{{end}}
 </div>
 {{end}}
 {{end}}

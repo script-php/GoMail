@@ -29,8 +29,12 @@ func TestPOP3MaildropAndDelete(t *testing.T) {
 	_, _ = db.SaveMessage(&Message{AccountID: accountID, FolderID: &spam.ID, MessageID: "spam", Direction: "inbound", RawMessage: []byte("spam"), ReceivedAt: time.Now()})
 
 	messages, err := db.ListPOP3Messages(accountID)
-	if err != nil || len(messages) != 1 || messages[0].ID != inboxID {
+	if err != nil || len(messages) != 1 || messages[0].ID != inboxID || messages[0].Octets != len("Subject: inbox\r\n\r\nbody\r\n") {
 		t.Fatalf("maildrop=%+v err=%v", messages, err)
+	}
+	raw, err := db.GetPOP3MessageRaw(accountID, inboxID)
+	if err != nil || string(raw) != "Subject: inbox\r\n\r\nbody\r\n" {
+		t.Fatalf("on-demand POP3 body=%q err=%v", raw, err)
 	}
 	if err := db.DeletePOP3Messages(accountID, []int64{inboxID}); err != nil {
 		t.Fatal(err)
@@ -42,5 +46,22 @@ func TestPOP3MaildropAndDelete(t *testing.T) {
 	message, err := db.GetMessage(inboxID, accountID)
 	if err != nil || message == nil || !message.IsDeleted {
 		t.Fatalf("message was not moved to trash: %+v err=%v", message, err)
+	}
+}
+
+func TestPOP3CanonicalOctets(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"", 0},
+		{"line", len("line\r\n")},
+		{"a\nb", len("a\r\nb\r\n")},
+		{"a\rb", len("a\r\nb\r\n")},
+		{"a\r\nb\r\n", len("a\r\nb\r\n")},
+	} {
+		if got := pop3CanonicalOctets([]byte(tc.raw)); got != tc.want {
+			t.Errorf("octets(%q)=%d, want %d", tc.raw, got, tc.want)
+		}
 	}
 }

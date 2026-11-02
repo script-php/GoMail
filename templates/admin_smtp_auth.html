@@ -1,0 +1,19 @@
+{{define "content"}}
+<div class="settings-container smtp-auth-page">
+    <header class="settings-page-heading"><h1>SMTP authentication</h1><p>Choose which credentials accounts may use to send mail through authenticated SMTP submission.</p></header>
+    {{if .Error}}<div class="error-notification" role="alert">{{.Error}}</div>{{end}}
+    {{if .Success}}<div class="success-notification" role="status">{{.Success}}</div>{{end}}
+    <section class="settings-card" aria-labelledby="smtp-auth-policy-title">
+        <div class="settings-section-heading"><h2 id="smtp-auth-policy-title">Server-wide login policy</h2><p>This controls SMTP submission only. Webmail, IMAP, and POP3 sign-in are unchanged. Users can restrict their own SMTP access further, but cannot enable a method disabled here.</p></div>
+        <form method="POST" action="/admin/smtp-auth" class="settings-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <fieldset class="settings-group settings-choice-group"><legend>Allowed login methods</legend>
+                <label class="settings-choice"><input type="radio" name="mode" value="both" {{if eq .Mode "both"}}checked{{end}}><span><strong>Account password and app credentials</strong><small>Users may send with either their account password or a separate app credential.</small></span></label>
+                <label class="settings-choice"><input type="radio" name="mode" value="password" {{if eq .Mode "password"}}checked{{end}}><span><strong>Account password only</strong><small>Separate app credentials cannot be used for SMTP login.</small></span></label>
+                <label class="settings-choice"><input type="radio" name="mode" value="app" {{if eq .Mode "app"}}checked{{end}}><span><strong>App credentials only</strong><small>Users must create an app credential; their normal account password will not work for SMTP login.</small></span></label>
+            </fieldset>
+            <div class="settings-actions"><button type="submit" class="btn btn-primary">Save SMTP policy</button></div>
+        </form>
+    </section>
+</div>
+{{end}}

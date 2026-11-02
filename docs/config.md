@@ -2,12 +2,25 @@
 
 GoMail is configured via a single `config.json` file in JSON format.
 
+Administrators can edit the complete configuration at `/admin/configuration`
+using a sectioned form or switch to the complete JSON editor. Both views use
+the same validation and atomic save. In the form, blank secret fields preserve
+their saved values; in JSON, the write-only placeholder does the same. Lists
+are entered as JSON arrays in their individual form fields. A timestamped copy
+of the previous file is retained. Logging and outbound-limit changes apply immediately.
+All other values are marked restart-required because listeners, storage, TLS,
+sessions, trusted proxies, protocol servers and workers are constructed during
+startup. The running process continues with its prior values until restarted.
+
 ## Full Configuration Example
 
 ```json
 {
   "server": {
-    "hostname": "mail.example.com"
+    "hostname": "mail.example.com",
+    "domain": "example.com",
+    "tls_report_sender": "noreply-smtp-tls-reporting@example.com",
+    "dsn_sender": "Mailer-Daemon@example.com"
   },
 
   "smtp": {
@@ -25,6 +38,7 @@ GoMail is configured via a single `config.json` file in JSON format.
 
   "mail_clients": {
     "enabled": false,
+    "imap": { "enabled": false, "listen_addr": ":993" },
     "pop3": { "enabled": true, "listen_addr": ":995" },
     "submission": { "enabled": true, "listen_addr": ":587" },
     "read_timeout": 60,
@@ -70,8 +84,9 @@ GoMail is configured via a single `config.json` file in JSON format.
 
   "delivery": {
     "queue_workers": 2,
-    "retry_intervals": [60, 300, 900],
-    "max_retries": 3,
+    "retry_intervals": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 86400, 86400, 86400],
+    "max_retries": 11,
+    "dsn_delay_after_seconds": 14400,
     "network": "tcp",
     "enable_verp": true
   },
@@ -99,9 +114,19 @@ GoMail is configured via a single `config.json` file in JSON format.
     "send_reports": false
   },
 
+  "tls_rpt": {
+    "send_reports": false
+  },
+
   "logging": {
     "level": "info",
     "format": "text"
+  },
+
+  "metrics": {
+    "enabled": false,
+    "listen_addr": "127.0.0.1:9090",
+    "bearer_token": ""
   }
 }
 ```
@@ -146,27 +171,50 @@ to `true`. It cannot be enabled with `tls.mode: "none"`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch for all mail-client listeners |
+| `imap.enabled` | bool | `false` | Explicitly enable experimental IMAP over implicit TLS |
+| `imap.listen_addr` | string | `:993` | IMAP-over-TLS bind address |
 | `pop3.enabled` | bool | `true` when master enabled | Enable POP3 retrieval over implicit TLS |
 | `pop3.listen_addr` | string | `:995` | POP3-over-TLS bind address |
 | `submission.enabled` | bool | `true` when master enabled | Enable authenticated SMTP submission |
 | `submission.listen_addr` | string | `:587` | Submission bind address; STARTTLS is mandatory before AUTH |
 | `read_timeout` | int | `60` | Per-command/data read timeout in seconds |
 | `write_timeout` | int | `60` | Response write timeout in seconds |
-| `max_connections` | int | `50` | Shared concurrent POP3/submission connection limit |
-| `auth_attempts_per_minute` | int | `10` | Shared authentication-attempt limit per client IP |
+| `max_connections` | int | `50` | Shared concurrent IMAP/POP3/submission connection limit |
+| `auth_attempts_per_minute` | int | `10` | Shared failed-authentication limit per client IP across IMAP, POP3, and submission |
 
-Use the full mailbox email address and the same bcrypt-backed account password
-used by the web UI. POP3 exposes Inbox only and supports `USER`, `PASS`, `STAT`,
+Use the full mailbox email address. SMTP submission accepts the account password
+or a separately generated app credential according to the live policy at
+**Admin → SMTP Authentication** and the user's **Settings → SMTP client login**.
+The server-wide policy defaults to both methods for backward compatibility;
+users can narrow the choice or disable their own SMTP login. App credentials
+are created under user Settings, shown once, stored as hashes, and can be
+revoked independently. They apply only to SMTP submission, not webmail, IMAP,
+or POP3. Changing the server policy or revoking a credential also ends an
+affected authenticated SMTP session when it next sends a command. Creating,
+revoking, or changing a user preference requires their current account password.
+POP3 exposes Inbox only and supports `USER`, `PASS`, `STAT`,
 `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, and `QUIT`. Deletions are committed
 to GoMail Trash only on a successful `QUIT`. SMTP submission supports `AUTH PLAIN`
 and `AUTH LOGIN` only after STARTTLS, requires the envelope sender and `From`
 header to match the authenticated account, strips `Bcc`, and queues mail through
-the normal DKIM/delivery path.
+the normal DKIM/delivery path. Submission advertises DSN and accepts `RET` and
+`ENVID` on `MAIL FROM`, plus `NOTIFY` and `ORCPT` on each `RCPT TO`.
+PHPMailer-style submission may send an 8-bit MIME body without a `BODY=`
+parameter; GoMail accepts that case and normalizes eligible MIME before DKIM
+signing. An explicit `BODY=7BIT` still rejects 8-bit data. The DSN options are
+retained with each queued recipient; malformed or repeated parameters are rejected.
 
-This first client-access implementation is POP3, not IMAP: POP3 downloads the
-Inbox but does not synchronize folders, flags, drafts, or sent-mail changes.
-Clients needing multi-device folder synchronization should continue to use the
-web UI until a complete IMAP implementation is added.
+Experimental IMAP provides durable UIDs, folders, synchronization flags,
+APPEND, MIME body structures/sections, COPY/MOVE, IDLE, UIDPLUS, NAMESPACE,
+SPECIAL-USE, CONDSTORE and QRESYNC. It is deliberately not inherited from the
+master switch: set both `mail_clients.enabled` and
+`mail_clients.imap.enabled` to true. Real-client interoperability is still
+pending, so production installations should leave it disabled for now.
+
+With certificate-backed TLS and at least one enabled client protocol, GoMail
+serves Thunderbird autoconfiguration and Microsoft Autodiscover XML. Each
+document contains only enabled protocols and accepts any domain configured in
+GoMail. Plaintext or fully disabled client configurations return 404.
 
 ### dkim
 
@@ -189,6 +237,58 @@ web UI until a complete IMAP implementation is added.
 | `mysql.name` | string | | Required database name |
 | `mysql.tls` | string | `false` | `true` enables certificate-verified TLS; use for remote servers |
 | `attachments_path` | string | `./data/attachments` | Directory for storing email attachments |
+
+### storage_pressure
+
+Filesystem pressure protection is disabled when both values are zero. For a
+production server, configure a warning threshold above the hard minimum. GoMail
+checks the lowest available space across its local database/attachment paths
+before durable writes; backups additionally check their destination and
+temporary workspace.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `warning_free_bytes` | int | `0` | Display/log a warning and raise the pressure metric below this free-space level |
+| `minimum_free_bytes` | int | `0` | Preserve this many free bytes by temporarily refusing messages, drafts, APPEND/COPY and backups |
+
+Example preserving 1 GiB and warning below 2 GiB:
+
+```json
+"storage_pressure": {
+  "warning_free_bytes": 2147483648,
+  "minimum_free_bytes": 1073741824
+}
+```
+
+### outbound_limits
+
+Authenticated webmail and SMTP submission share persistent account counters.
+Accepted counters and queue entries commit atomically; an over-limit attempt is
+not queued and can temporarily suspend the account. System-generated DSNs and
+scheduled reports use the internal account identity and are exempt. Settings
+can be changed live under **Admin → Outbound Limits**.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable per-account outbound abuse protection |
+| `messages_per_hour` | int | `100` | Accepted messages allowed per UTC hour |
+| `messages_per_day` | int | `500` | Accepted messages allowed per UTC day |
+| `recipients_per_hour` | int | `250` | Total recipients allowed per UTC hour |
+| `recipients_per_day` | int | `1000` | Total recipients allowed per UTC day |
+| `max_recipients_per_message` | int | `100` | Maximum To/Cc/envelope recipients in one message |
+| `suspension_minutes` | int | `60` | Temporary suspension after an hourly/daily limit is crossed |
+
+```json
+"outbound_limits": {
+  "enabled": true,
+  "messages_per_hour": 100,
+  "messages_per_day": 500,
+  "recipients_per_hour": 250,
+  "recipients_per_day": 1000,
+  "max_recipients_per_message": 100,
+  "suspension_minutes": 60
+}
+```
 
 #### MySQL example
 
@@ -260,8 +360,9 @@ test instructions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `queue_workers` | int | `4` | Parallel workers processing outbound queue |
-| `retry_intervals` | array | `[60,300,900,3600,14400,86400]` | Retry delays in seconds |
-| `max_retries` | int | `6` | Max delivery attempts before permanent failure |
+| `retry_intervals` | array | `[1800,3600,7200,14400,28800,43200,86400,86400,86400,86400]` | Retry delays in seconds, starting after the first failed attempt |
+| `max_retries` | int | `11` | Max delivery attempts before permanent failure; defaults keep temporary failures queued for over five days |
+| `dsn_delay_after_seconds` | int | `14400` | Minimum queue age before one requested delayed DSN is generated |
 | `network` | string | `tcp` | Outbound network: `tcp`, `tcp4`, or `tcp6` |
 | `enable_verp` | bool | `true` | Use per-recipient bounce envelope addresses |
 
@@ -288,7 +389,21 @@ test instructions.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `send_reports` | bool | `false` | Enable scheduled DMARC aggregate report generation/delivery |
+| `send_reports` | bool | `false` | Enable daily UTC DMARC aggregate report generation/delivery, with catch-up after downtime |
+
+### tls_rpt
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `send_reports` | bool | `false` | Enable independent daily TLS-RPT generation at 00:00 UTC, including `mailto:` and HTTPS `rua` delivery with retry state |
+
+Incoming aggregate-report analysis is configured separately in Admin →
+Received Reports. It is disabled by default and can be enabled for one active
+local GoMail mailbox without a server restart. The analyzer scans that
+mailbox about once per minute, accepts bounded DMARC XML and TLS-RPT JSON
+attachments (including gzip and single-file ZIP), and keeps a deduplicated
+history without deleting the source email. This does not create the mailbox or
+publish its address in DNS.
 
 ### security
 
@@ -303,7 +418,20 @@ test instructions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `format` | string | `text` | Log format: `text` or `json` |
+| `format` | string | `text` | Log format: `text` or newline-delimited `json`; invalid values prevent startup |
+
+### metrics
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Start a dedicated Prometheus-compatible HTTP endpoint at `/metrics` |
+| `listen_addr` | string | `127.0.0.1:9090` | Dedicated listener; keep it on loopback when scraped by a local agent or reverse proxy |
+| `bearer_token` | string | empty | Optional HTTP bearer token; required when the listener is not loopback-only |
+
+The metrics listener is independent from webmail and is never enabled
+implicitly. It exports aggregate queue, mailbox-quota, TLS-policy and process
+gauges without email addresses, domains, message identifiers or other
+high-cardinality labels. See [monitoring.md](monitoring.md).
 
 ## Authentication and Spam Routing
 
@@ -358,14 +486,13 @@ disk space for the database and attachments, TLS certificate expiry, and DMARC/
 TLS-RPT processing errors. Alert on sustained SMTP 4xx/5xx changes and repeated
 DNSSEC/TLSA failures.
 
-For SQLite, take a transactionally consistent database backup with the SQLite
-backup command, then copy the attachments directory while message ingestion is
-paused or snapshot both paths atomically. For MySQL, use a consistent database
-dump/snapshot and capture the attachments directory from the same recovery point.
-Encrypt backups, keep at least one off-host copy, and regularly restore into an
-isolated environment. A restore is not verified until account/message counts,
-attachment hashes, queue state, login, inbound SMTP, and a test outbound delivery
-have all been checked.
+Use the built-in offline `-backup`, `-verify-backup` and guarded
+`-restore-backup ... -force-restore` commands described in
+[deployment.md](deployment.md#backup-and-restore). The server and these commands
+share an instance lock so database and attachment state cannot be captured while
+GoMail is accepting changes. Encrypt archives, keep an off-host copy, and
+regularly restore into an isolated environment. A restore drill must still check
+queue state, login, inbound SMTP and a test outbound delivery.
 
 Configuration is read from the JSON file selected by `-config`. GoMail does not
 currently implement general `GOMAIL_*` environment-variable overrides.

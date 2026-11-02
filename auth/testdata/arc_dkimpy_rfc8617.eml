@@ -1,0 +1,25 @@
+ARC-Seal: i=1; cv=none; a=rsa-sha256; d=example.test; s=arc;
+ t=1792490400;
+ b=yCsPgmY8odKC1Uv1XYo9CSEWZeLsZK4yTYzqtI9mpFu4xDiRdw0BWVYTErtbEO2DzuDWm
+ ZJefU7kcczaFEoI6g4PrRi/HaXqAkN94e7tXwnGo9K88CylpqOqvtWBAoPuqIohR938rYwS
+ mUevZf7EVwVSfztfJDoGXe7yGtEOoeX1NSPLsHjojH1FYRKAfIds4zAypVVHyNmeyg6zOuu
+ GqIbPaIZwnSMO4UlIzpJt6OC8KPM33991KV57++/U0jCs+EOz1GXGy4xO3nit3C5lS4oYF3
+ oLNcDk1mseCiMB9M7Gb0eR9yNzqQPtrEiUECOsP52vbOpGjcQcPTDTJqlqQQ==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed;
+ d=example.test; s=arc; t=1792490400; h=from : to : subject : date :
+ message-id; bh=Iw/80Mo9MPW60RUqXVuQ31MptwZFGBZrAlXQkGn/1pw=;
+ b=ueQRuZE+vurQYmBhfe4fbqfPePcSmdiGRX1JUWdzzAqecFnYJGDIuLS3A9Pto8sHIv2J2
+ CohziCSW+TXRLuBGbcWk/hWkRopjjOgWXw/Sz7UwQGtsKJ4GLdEdydKO2ZJAqHm8ZmPpomM
+ 05WuPaOfO9hIGjI2UrNLwbg6R1Z1D4zAS8Vp9/UxK13sfxxaZx+M6ZPUlusvHGYrf2hvFmK
+ Kx7CLFERLFllZbe6YM58oZvcCdISjYAnk63S1pge6jBvtKogFAsdnflIfoaqC9katKm+o/7
+ 8nosDCXX8vYjKyJ/zexr/X3ewDZ45R5hqugiXINNXph9vAlldwU0gGndv0dA==
+ARC-Authentication-Results: i=1; dkimpy.example;
+ spf=pass smtp.mailfrom=sender@example.test
+From: sender@example.test
+To: receiver@example.test
+Subject: Independent ARC fixture
+Date: Tue, 20 Oct 2026 10:00:00 +0000
+Message-ID: <arc-fixture@example.test>
+Authentication-Results: dkimpy.example; spf=pass smtp.mailfrom=sender@example.test
+
+Fixture body

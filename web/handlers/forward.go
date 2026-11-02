@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -10,6 +12,7 @@ import (
 
 	"gomail/config"
 	"gomail/delivery"
+	"gomail/metrics"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
@@ -26,12 +29,7 @@ type ForwardHandler struct {
 
 // NewForwardHandler creates a forward handler.
 func NewForwardHandler(cfg *config.Config, db *store.DB, queue *delivery.Queue, sm *security.SessionManager) *ForwardHandler {
-	funcMap := template.FuncMap{
-		"safeHTML": func(s string) template.HTML {
-			return template.HTML(sanitizeHTML(s))
-		},
-	}
-	tmpl := templates.LoadTemplate(funcMap, "base", "forward", "welcome")
+	tmpl := templates.LoadTemplate(nil, "base", "forward", "welcome")
 
 	return &ForwardHandler{
 		cfg:        cfg,
@@ -97,7 +95,6 @@ func (h *ForwardHandler) renderForwardForm(w http.ResponseWriter, r *http.Reques
 		"OriginalCC":      originalMsg.CcAddr,
 		"OriginalSubject": subject,
 		"OriginalText":    originalMsg.TextBody,
-		"OriginalHTML":    originalMsg.HTMLBody,
 		"IsHTML":          originalMsg.HTMLBody != "",
 		"Account":         account,
 		"CSRFToken":       h.sessionMgr.GenerateCSRFToken(r),
@@ -165,15 +162,33 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[forward.Send] retrieved original message: id=%d, direction=%s, rawmsg_size=%d",
 		originalMsg.ID, originalMsg.Direction, len(originalMsg.RawMessage))
+	attachedOriginal, err := forwardedRFC822Bytes(originalMsg)
+	if err != nil {
+		h.renderForwardForm(w, r, account, originalMsg, "The original message cannot be attached without changing its bytes. Its stored MIME has invalid line framing or an overlong line.", to, cc, subject, forwardNotes, http.StatusUnprocessableEntity)
+		return
+	}
 
 	// Parse recipients
-	recipients := parseRecipients(to)
+	recipients, err := parseRecipients(to)
+	if err != nil {
+		http.Error(w, "Invalid To address: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	if cc != "" {
-		recipients = append(recipients, parseRecipients(cc)...)
+		ccRecipients, err := parseRecipients(cc)
+		if err != nil {
+			http.Error(w, "Invalid Cc address: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		recipients = append(recipients, ccRecipients...)
 	}
 
 	if len(recipients) == 0 {
 		http.Error(w, "No valid recipients", http.StatusBadRequest)
+		return
+	}
+	if limits := h.db.OutboundLimits(); limits.Enabled && len(recipients) > limits.MaxRecipientsPerMessage {
+		http.Error(w, fmt.Sprintf("A message can have at most %d recipients", limits.MaxRecipientsPerMessage), http.StatusUnprocessableEntity)
 		return
 	}
 
@@ -193,7 +208,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if isLocal {
-			acct, err := h.db.GetAccountByEmail(rcpt)
+			acct, err := h.db.GetDeliveryAccount(rcpt)
 			if err != nil || acct == nil || !acct.IsActive {
 				http.Error(w, fmt.Sprintf("Recipient not found: %s", rcpt), http.StatusBadRequest)
 				return
@@ -208,22 +223,12 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	// Build forwarded message
 	var msg strings.Builder
 
-	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID2, to, time.Now()))
+	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID2, strings.Join(recipients, ", "), time.Now()))
 
-	// Add Resent- headers (RFC 5322 forwarding convention)
-	// These encode non-ASCII characters if present
-	msg.WriteString(fmt.Sprintf("Resent-From: %s\r\n", encodeHeaderValue(from)))
-	msg.WriteString(fmt.Sprintf("Resent-Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
-	msg.WriteString(fmt.Sprintf("Resent-To: %s\r\n", encodeHeaderValue(to)))
-	if cc != "" {
-		msg.WriteString(fmt.Sprintf("Resent-Cc: %s\r\n", encodeHeaderValue(cc)))
-	}
-	msg.WriteString(fmt.Sprintf("Resent-Message-ID: %s\r\n", msgID2))
-
-	// For forwarded messages, From: must be the forwarder for DMARC alignment with DKIM signature.
-	// Original sender goes in Reply-To for context. Resent- headers also identify the forwarder.
+	// A user forward is a new message, not a resend of the original.
+	// From identifies the forwarder; the original sender remains in the body
+	// and attached message/rfc822, not in Reply-To.
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
-	msg.WriteString(fmt.Sprintf("Reply-To: %s\r\n", encodeHeaderValue(originalMsg.FromAddr)))
 
 	// Use the actual forward recipient, not the original message's recipient
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
@@ -281,11 +286,7 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString("Content-Type: message/rfc822; name=\"forwarded-message.eml\"\r\n")
 	msg.WriteString("Content-Disposition: attachment; filename=\"forwarded-message.eml\"\r\n")
 	msg.WriteString("\r\n")
-	if len(originalMsg.RawMessage) > 0 {
-		msg.WriteString(normalizeBodyLineEndings(string(originalMsg.RawMessage)))
-	} else {
-		msg.WriteString(buildForwardedRFC822(originalMsg))
-	}
+	_, _ = msg.Write(attachedOriginal)
 	msg.WriteString("\r\n")
 
 	// End of multipart
@@ -298,6 +299,15 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if err := h.queue.Enqueue(from, recipients, messageToEnqueue, account.ID); err != nil {
 		log.Printf("[forward] enqueue error: %v", err)
 		message := "The message could not be queued. Please try again."
+		if errors.Is(err, store.ErrOutboundLimit) {
+			metrics.IncOutboundLimit("forward")
+			message = "Your outbound sending limit was reached. Try again later or contact an administrator."
+		} else if errors.Is(err, store.ErrDiskPressure) {
+			message = "The server is temporarily low on storage. Please try again later."
+		} else if errors.Is(err, store.ErrQuotaExceeded) {
+			metrics.IncQuota("forward")
+			message = "Your mailbox quota is full. Permanently delete messages or ask an administrator to increase the quota."
+		}
 		if strings.Contains(err.Error(), "DKIM") || strings.Contains(err.Error(), "unsigned delivery") {
 			message = "Forwarding is unavailable because DKIM is not configured for your sender domain. An administrator must open Admin → Domains, edit the domain, and generate DKIM keys."
 		}
@@ -307,6 +317,43 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
 	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+}
+
+// forwardedRFC822Bytes keeps a stored source message byte-for-byte intact.
+// A noncanonical IMAP APPEND literal cannot be embedded in SMTP DATA without
+// rewriting it, which would invalidate signatures, so reject it instead.
+func forwardedRFC822Bytes(original *store.Message) ([]byte, error) {
+	if len(original.RawMessage) == 0 {
+		return []byte(buildForwardedRFC822(original)), nil
+	}
+	raw := original.RawMessage
+	if bytes.Index(raw, []byte("\r\n\r\n")) < 0 {
+		return nil, fmt.Errorf("missing RFC 5322 header/body separator")
+	}
+	lineLength := 0
+	for i, b := range raw {
+		switch b {
+		case 0:
+			return nil, fmt.Errorf("NUL in SMTP DATA source")
+		case '\r':
+			if i+1 == len(raw) || raw[i+1] != '\n' {
+				return nil, fmt.Errorf("bare CR in source")
+			}
+		case '\n':
+			if i == 0 || raw[i-1] != '\r' {
+				return nil, fmt.Errorf("bare LF in source")
+			}
+			lineLength = 0
+			continue
+		}
+		if b != '\r' {
+			lineLength++
+			if lineLength > 998 {
+				return nil, fmt.Errorf("source line exceeds SMTP DATA limit")
+			}
+		}
+	}
+	return raw, nil
 }
 
 func forwardSubject(subject string) string {

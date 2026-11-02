@@ -12,6 +12,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"gomail/logging"
+	"gomail/security"
 	"gomail/store"
 )
 
@@ -40,7 +41,7 @@ func (s *Server) handlePOP3(conn net.Conn) {
 	session.ok("GoMail POP3 server ready")
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout()))
-		line, err := session.reader.ReadString('\n')
+		line, err := security.ReadLineLimited(session.reader, 512)
 		if err != nil {
 			return
 		}
@@ -48,12 +49,23 @@ func (s *Server) handlePOP3(conn net.Conn) {
 			session.err("command line too long")
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
+		line, err = security.ParseCRLFCommandLine(line)
+		if err != nil {
+			session.err("command requires CRLF framing")
+			return
+		}
 		parts := strings.SplitN(line, " ", 2)
 		command := strings.ToUpper(parts[0])
 		argument := ""
 		if len(parts) == 2 {
-			argument = strings.TrimSpace(parts[1])
+			argument = parts[1]
+			if command != "PASS" {
+				argument = strings.TrimSpace(argument)
+			}
+		}
+		if session.account != nil && !s.accountStillActive(session.account) {
+			session.err("account no longer active")
+			return
 		}
 		if session.account == nil {
 			if session.authorization(command, argument) {
@@ -91,7 +103,13 @@ func (p *pop3Session) authorization(command, argument string) bool {
 		if err == nil && account != nil {
 			hash = account.PasswordHash
 		}
-		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(argument)) != nil || account == nil {
+		passwordErr := bcrypt.CompareHashAndPassword([]byte(hash), []byte(argument))
+		if err != nil {
+			p.err("authentication temporarily unavailable")
+			break
+		}
+		if passwordErr != nil || account == nil {
+			p.server.recordAuthenticationFailure(p.conn.RemoteAddr().String())
 			p.err("authentication failed")
 			break
 		}
@@ -126,8 +144,13 @@ func (p *pop3Session) transaction(command, argument string) bool {
 		p.list(command, argument)
 	case "RETR":
 		if message, _, ok := p.message(argument); ok {
-			p.ok(fmt.Sprintf("%d octets", len(message.RawMessage)))
-			p.multi(message.RawMessage)
+			raw, err := p.server.db.GetPOP3MessageRaw(p.account.ID, message.ID)
+			if err != nil {
+				p.err("message temporarily unavailable")
+				break
+			}
+			p.ok(fmt.Sprintf("%d octets", message.Octets))
+			p.multi(raw)
 		}
 	case "TOP":
 		fields := strings.Fields(argument)
@@ -141,8 +164,13 @@ func (p *pop3Session) transaction(command, argument string) bool {
 			break
 		}
 		if message, _, ok := p.message(fields[0]); ok {
+			raw, err := p.server.db.GetPOP3MessageRaw(p.account.ID, message.ID)
+			if err != nil {
+				p.err("message temporarily unavailable")
+				break
+			}
 			p.ok("top of message follows")
-			p.multi(topMessage(message.RawMessage, lines))
+			p.multi(topMessage(raw, lines))
 		}
 	case "DELE":
 		if _, index, ok := p.message(argument); ok {
@@ -181,7 +209,7 @@ func (p *pop3Session) list(command, argument string) {
 		if !ok {
 			return
 		}
-		value := strconv.Itoa(len(message.RawMessage))
+		value := strconv.Itoa(message.Octets)
 		if command == "UIDL" {
 			value = fmt.Sprintf("gomail-%d", message.ID)
 		}
@@ -194,7 +222,7 @@ func (p *pop3Session) list(command, argument string) {
 		if p.deleted[index] {
 			continue
 		}
-		value := strconv.Itoa(len(message.RawMessage))
+		value := strconv.Itoa(message.Octets)
 		if command == "UIDL" {
 			value = fmt.Sprintf("gomail-%d", message.ID)
 		}
@@ -221,7 +249,7 @@ func (p *pop3Session) visibleSize() int {
 	total := 0
 	for index, message := range p.messages {
 		if !p.deleted[index] {
-			total += len(message.RawMessage)
+			total += message.Octets
 		}
 	}
 	return total
@@ -250,6 +278,16 @@ func (p *pop3Session) multi(data []byte) {
 	}
 	_, _ = p.writer.WriteString(".\r\n")
 	_ = p.writer.Flush()
+}
+
+// POP3 size excludes transparency dots but includes the CRLF transmitted for
+// each message line. Keep this calculation aligned with multi's framing.
+func pop3MessageOctets(raw []byte) int {
+	data := bytes.TrimSuffix(normalizeCRLF(raw), []byte("\r\n"))
+	if len(data) == 0 {
+		return 0
+	}
+	return len(data) + 2
 }
 
 func normalizeCRLF(data []byte) []byte {

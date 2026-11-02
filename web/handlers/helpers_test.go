@@ -1,10 +1,24 @@
 package handlers
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestOriginatingIPIgnoresProviderHeader(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "203.0.113.9:1234"
+	r.Header.Set("CF-Connecting-IP", "198.51.100.66")
+	if got := getRealClientIP(r); got != "203.0.113.9" {
+		t.Fatalf("untrusted provider header selected client IP: %q", got)
+	}
+	r.RemoteAddr = "[2001:db8::9]:1234"
+	if got := getRealClientIP(r); got != "2001:db8::9" {
+		t.Fatalf("IPv6 peer parsed incorrectly: %q", got)
+	}
+}
 
 func TestOriginatingHeadersPrivacySetting(t *testing.T) {
 	date := time.Unix(1, 0)
@@ -22,5 +36,29 @@ func TestEncodeHeaderValuePreventsHeaderInjection(t *testing.T) {
 	got := encodeHeaderValue("hello\r\nBcc: attacker@example.net")
 	if strings.ContainsAny(got, "\r\n") || !strings.Contains(got, "Bcc: attacker@example.net") {
 		t.Fatalf("unsafe or unexpected header value: %q", got)
+	}
+}
+
+func TestRecipientParsingRejectsCommandAndHeaderInjection(t *testing.T) {
+	for _, malicious := range []string{
+		"victim@example.net\r\nBcc: attacker@example.net",
+		"victim@example.net\nDATA",
+		"not-an-address",
+		"victim@example.net, broken",
+	} {
+		if recipients, err := parseRecipients(malicious); err == nil {
+			t.Fatalf("accepted malicious recipient %q as %#v", malicious, recipients)
+		}
+	}
+	recipients, err := parseRecipients("Person <person@example.net>; second@example.org")
+	if err != nil || len(recipients) != 2 || recipients[0] != "person@example.net" || recipients[1] != "second@example.org" {
+		t.Fatalf("valid recipients failed: %#v %v", recipients, err)
+	}
+}
+
+func TestOriginatingHeadersForceSingleLineValues(t *testing.T) {
+	got := originatingHeaders(false, "192.0.2.1\r\nInjected: yes", "mail.example", "id\nX: y", "to@example\r\nBcc: bad@example", time.Unix(1, 0))
+	if strings.Contains(got, "\r\nInjected:") || strings.Contains(got, "\nX:") || strings.Contains(got, "\r\nBcc:") {
+		t.Fatalf("generated header accepted injected field: %q", got)
 	}
 }

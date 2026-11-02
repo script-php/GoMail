@@ -25,11 +25,14 @@ func parseMIME(parsed *ParsedMessage, contentType string, body []byte) error {
 	}
 
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
-	return walkParts(parsed, reader, mediaType)
+	return walkParts(parsed, reader, mediaType, 0)
 }
 
 // walkParts recursively walks MIME parts.
-func walkParts(parsed *ParsedMessage, reader *multipart.Reader, parentType string) error {
+func walkParts(parsed *ParsedMessage, reader *multipart.Reader, parentType string, depth int) error {
+	if depth > 30 {
+		return fmt.Errorf("MIME nesting exceeds limit")
+	}
 	for {
 		part, err := reader.NextPart()
 		if err == io.EOF {
@@ -49,9 +52,12 @@ func walkParts(parsed *ParsedMessage, reader *multipart.Reader, parentType strin
 		if strings.HasPrefix(mediaType, "multipart/") {
 			boundary := params["boundary"]
 			if boundary != "" {
-				data, _ := io.ReadAll(part)
+				data, err := io.ReadAll(part)
+				if err != nil {
+					return fmt.Errorf("reading nested MIME part: %w", err)
+				}
 				subReader := multipart.NewReader(bytes.NewReader(data), boundary)
-				if err := walkParts(parsed, subReader, mediaType); err != nil {
+				if err := walkParts(parsed, subReader, mediaType, depth+1); err != nil {
 					return err
 				}
 				continue
@@ -64,6 +70,9 @@ func walkParts(parsed *ParsedMessage, reader *multipart.Reader, parentType strin
 		}
 
 		disposition := part.Header.Get("Content-Disposition")
+		if strings.HasPrefix(mediaType, "text/") {
+			data = decodeCharset(data, params["charset"])
+		}
 
 		// Is this an attachment?
 		if isAttachment(disposition, mediaType) {
@@ -120,8 +129,9 @@ func isAttachment(disposition, mediaType string) bool {
 	if strings.HasPrefix(strings.ToLower(disposition), "attachment") {
 		return true
 	}
-	// Inline content (including inline images in multipart/related) are NOT attachments
-	return false
+	// Preserve non-text inline resources from multipart/related. The storage and
+	// rendering layers can decide whether to display them inline or as downloads.
+	return mediaType != "" && !strings.HasPrefix(mediaType, "text/") && !strings.HasPrefix(mediaType, "multipart/")
 }
 
 // extractFilename gets the filename from Content-Disposition or Content-Type params.
@@ -139,6 +149,9 @@ func extractFilename(headers textproto.MIMEHeader, ctParams map[string]string) s
 	// Fallback to Content-Type name parameter
 	if name := ctParams["name"]; name != "" {
 		return decodeRFC2047(name)
+	}
+	if contentID := strings.Trim(headers.Get("Content-ID"), "<> "); contentID != "" {
+		return "cid-" + contentID
 	}
 	return "unnamed"
 }

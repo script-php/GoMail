@@ -242,9 +242,16 @@ func VerifyDKIM(message []byte) (string, string) {
 }
 
 func VerifyDKIMDetailed(message []byte) (status, detail, domain, selector string) {
+	status, detail, domain, selector, _ = VerifyDKIMDetailedWithIdentities(message)
+	return
+}
+
+// VerifyDKIMDetailedWithIdentities returns every verified signing domain so
+// DMARC can align any valid signature, not merely the first one.
+func VerifyDKIMDetailedWithIdentities(message []byte) (status, detail, domain, selector string, verifiedDomains []string) {
 	hdrs, _, err := parseMessageHeaders(message)
 	if err != nil {
-		return "permerror", "malformed headers", "", ""
+		return "permerror", "malformed headers", "", "", nil
 	}
 	var signatures []*headerRaw
 	for _, h := range hdrs {
@@ -253,14 +260,18 @@ func VerifyDKIMDetailed(message []byte) (status, detail, domain, selector string
 		}
 	}
 	if len(signatures) == 0 {
-		return "none", "no DKIM-Signature header", "", ""
+		return "none", "no DKIM-Signature header", "", "", nil
 	}
 	bestStatus, bestDetail := "fail", "all DKIM signatures failed"
 	for i, sig := range signatures {
 		tags := parseDKIMTags(sig.value)
 		currentStatus, currentDetail := verifyDKIMAt(message, i)
 		if currentStatus == "pass" {
-			return currentStatus, currentDetail, tags["d"], tags["s"]
+			verifiedDomains = append(verifiedDomains, tags["d"])
+			if status != "pass" {
+				status, detail, domain, selector = currentStatus, currentDetail, tags["d"], tags["s"]
+			}
+			continue
 		}
 		if currentStatus == "temperror" {
 			bestStatus, bestDetail = currentStatus, currentDetail
@@ -268,7 +279,10 @@ func VerifyDKIMDetailed(message []byte) (status, detail, domain, selector string
 			bestStatus, bestDetail = currentStatus, currentDetail
 		}
 	}
-	return bestStatus, bestDetail, "", ""
+	if status == "pass" {
+		return status, detail, domain, selector, verifiedDomains
+	}
+	return bestStatus, bestDetail, "", "", nil
 }
 
 func verifyDKIMAt(message []byte, targetSignature int) (string, string) {

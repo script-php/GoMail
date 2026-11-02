@@ -30,7 +30,9 @@ Mail-client services are disabled by default. When explicitly enabled:
 - POP3: port 995 with implicit TLS.
 - SMTP submission: port 587 with STARTTLS and authentication.
 - Username: full mailbox email address.
-- IMAP and automatic client discovery are not implemented.
+- IMAP: port 993 with implicit TLS, when its separate switch is enabled.
+- Thunderbird autoconfiguration and Microsoft Autodiscover advertise only
+  enabled, TLS-backed services.
 
 ## Continuous checks
 

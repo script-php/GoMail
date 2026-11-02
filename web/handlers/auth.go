@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"gomail/metrics"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
@@ -49,6 +50,12 @@ func (h *AuthHandler) SetLoginRateLimiter(limiter LoginRateLimiter) {
 
 // LoginPage shows the login form or processes a login attempt.
 func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	// If already logged in, redirect to home
 	if h.sessionMgr.GetSession(r) != "" {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -60,6 +67,23 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		if !h.sessionMgr.ValidateLoginCSRF(r) {
+			loginToken, err := h.sessionMgr.IssueLoginCSRFToken(w, r)
+			if err != nil {
+				http.Error(w, "Unable to prepare login form", http.StatusInternalServerError)
+				return
+			}
+			data["Error"] = "This sign-in form expired or was replaced. Please try again."
+			data["Email"] = r.FormValue("email")
+			data["LoginCSRFToken"] = loginToken
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
+				log.Printf("[web] login template error: %v", err)
+			}
+			return
+		}
 		email := r.FormValue("email")
 		password := r.FormValue("password")
 		clientIP := getClientIP(r)
@@ -69,8 +93,15 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 		if h.loginRateLimiter != nil {
 			blocked, remaining := h.loginRateLimiter.IsBlocked(clientIP)
 			if blocked {
+				metrics.IncLogin("blocked")
 				data["Error"] = fmt.Sprintf("Too many failed login attempts. Try again in %d seconds", int(remaining.Seconds())+1)
 				log.Printf("[auth] IP %s is blocked, showing lockout message", clientIP)
+				loginToken, err := h.sessionMgr.IssueLoginCSRFToken(w, r)
+				if err != nil {
+					http.Error(w, "Unable to prepare login form", http.StatusInternalServerError)
+					return
+				}
+				data["LoginCSRFToken"] = loginToken
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
 					log.Printf("[web] template error: %v", err)
@@ -80,7 +111,12 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if h.authenticate(email, password) {
+		authenticated, authErr := h.authenticate(email, password)
+		if authErr != nil {
+			http.Error(w, "Authentication temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if authenticated {
 			log.Printf("[auth] auth succeeded for %s from IP %s, clearing failures", email, clientIP)
 			if h.loginRateLimiter != nil {
 				h.loginRateLimiter.RecordSuccess(clientIP)
@@ -89,10 +125,12 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[web] session creation error: %v", err)
 				data["Error"] = "Internal error, please try again"
 			} else {
+				h.sessionMgr.ClearLoginCSRF(w)
 				http.Redirect(w, r, "/", http.StatusSeeOther)
 				return
 			}
 		} else {
+			metrics.IncLogin("failed")
 			log.Printf("[auth] auth failed for %s from IP %s, recording failure", email, clientIP)
 			if h.loginRateLimiter != nil {
 				h.loginRateLimiter.RecordFailure(clientIP)
@@ -100,6 +138,12 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 			data["Error"] = "Invalid email or password"
 		}
 	}
+	loginToken, err := h.sessionMgr.IssueLoginCSRFToken(w, r)
+	if err != nil {
+		http.Error(w, "Unable to prepare login form", http.StatusInternalServerError)
+		return
+	}
+	data["LoginCSRFToken"] = loginToken
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.templates.ExecuteTemplate(w, "base.html", data); err != nil {
@@ -110,38 +154,47 @@ func (h *AuthHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
 
 // Logout destroys the session and redirects to login.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.sessionMgr.ValidateCSRF(r) {
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+		return
+	}
 	h.sessionMgr.DestroySession(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-func (h *AuthHandler) authenticate(email, password string) bool {
+func (h *AuthHandler) authenticate(email, password string) (bool, error) {
 	if email == "" || password == "" {
 		log.Printf("[auth] authenticate failed: empty email or password")
-		return false
+		return false, nil
 	}
 
 	account, err := h.db.GetAccountByEmail(email)
 	if err != nil {
 		log.Printf("[auth] GetAccountByEmail(%s) error: %v", email, err)
-		return false
+		return false, err
 	}
 	if account == nil {
 		log.Printf("[auth] GetAccountByEmail(%s) returned nil account", email)
-		return false
+		return false, nil
 	}
 
 	if !account.IsActive {
 		log.Printf("[auth] account %s is not active", email)
-		return false
+		return false, nil
 	}
 
 	err = bcrypt.CompareHashAndPassword([]byte(account.PasswordHash), []byte(password))
 	if err != nil {
 		log.Printf("[auth] bcrypt.CompareHashAndPassword failed for %s: %v", email, err)
-		return false
+		return false, nil
 	}
 	log.Printf("[auth] authentication successful for %s", email)
-	return true
+	return true, nil
 }
 
 // getClientIP extracts the client IP from the request (handles X-Forwarded-For).

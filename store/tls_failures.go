@@ -185,6 +185,43 @@ func (db *DB) MarkTLSFailuresAsReported(domain string, startTime, endTime time.T
 	return err
 }
 
+// GetTLSReportStart returns the earliest eligible unreported event. Failed
+// deliveries retain this boundary so the same reporting window is retried.
+func (db *DB) GetTLSReportStart(domain string, endTime time.Time) (time.Time, bool, error) {
+	var raw sql.NullString
+	err := db.QueryRow(`
+		SELECT MIN(attempted_at) FROM tls_failures
+		WHERE recipient_domain = ? AND attempted_at < ? AND sent_at IS NULL
+		  AND (next_report_attempt IS NULL OR next_report_attempt <= ?)
+	`, domain, databaseTime(endTime), databaseTime(time.Now())).Scan(&raw)
+	if err != nil || !raw.Valid {
+		return time.Time{}, false, err
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339, "2006-01-02T15:04:05Z07:00"} {
+		if parsed, parseErr := time.Parse(layout, raw.String); parseErr == nil {
+			return parsed.UTC(), true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("parsing TLS report window start %q", raw.String)
+}
+
+// RecordTLSReportFailure stores explicit bounded-backoff retry state.
+func (db *DB) RecordTLSReportFailure(domain string, startTime, endTime time.Time, deliveryErr error) error {
+	var attempts int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(report_attempts), 0) FROM tls_failures
+		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL`,
+		domain, databaseTime(startTime), databaseTime(endTime)).Scan(&attempts); err != nil {
+		return err
+	}
+	delay := time.Hour << min(attempts, 4)
+	next := time.Now().UTC().Add(delay)
+	_, err := db.Exec(`UPDATE tls_failures
+		SET report_attempts = report_attempts + 1, next_report_attempt = ?, report_last_error = ?
+		WHERE recipient_domain = ? AND attempted_at >= ? AND attempted_at < ? AND sent_at IS NULL`,
+		databaseTime(next), deliveryErr.Error(), domain, databaseTime(startTime), databaseTime(endTime))
+	return err
+}
+
 // CleanOldTLSFailures removes records older than retentionDays days
 func (db *DB) CleanOldTLSFailures(retentionDays int) error {
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)

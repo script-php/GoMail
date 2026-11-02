@@ -1,8 +1,14 @@
 package handlers
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"html/template"
 	"log"
 	"mime"
@@ -15,6 +21,7 @@ import (
 	"gomail/config"
 	"gomail/delivery"
 	"gomail/mdn"
+	"gomail/parser"
 	"gomail/security"
 	"gomail/store"
 	"gomail/templates"
@@ -106,37 +113,58 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 
 	// Mark as read
 	if !msg.IsRead {
-		h.db.MarkRead(id)
+		if err := h.db.MarkRead(id); err != nil {
+			log.Printf("[web] mark message %d read: %v", id, err)
+			http.Error(w, "Unable to update message", http.StatusInternalServerError)
+			return
+		}
 		msg.IsRead = true
 
 		// Update folder counts since message is now read
 		if msg.FolderID != nil {
-			h.db.UpdateFolderCounts(*msg.FolderID)
+			if err := h.db.UpdateFolderCounts(*msg.FolderID); err != nil {
+				log.Printf("[web] update folder counts after reading message %d: %v", id, err)
+			}
 		}
 
-		// Handle MDN (Message Disposition Notification) if requested
-		if msg.MDNRequested && !msg.MDNSent && h.cfg.MDN.Enabled == "yes" {
-			log.Printf("[web] MDN handling - mode=%s, address=%s", h.cfg.MDN.Mode, msg.MDNAddress)
-			h.handleMDN(msg, account)
+	}
+	// A transient enqueue failure must remain retryable on later views, even
+	// after the message was marked read on its first view.
+	if msg.MDNRequested && !msg.MDNSent && h.cfg.MDN.Enabled == "yes" && h.cfg.MDN.Mode == "auto" {
+		if err := h.sendMDN(msg, account); err != nil && !errors.Is(err, store.ErrMDNAlreadySent) {
+			log.Printf("[web] automatic MDN enqueue for message %d: %v", id, err)
 		}
 	}
 
-	// Get attachments
-	attachments, _ := h.db.GetAttachments(id)
+	// Raw MIME is authoritative. A previous sidecar write may have failed after
+	// acceptance; repair it on an account-scoped view instead of hiding it.
+	attachments, attachmentErr := h.db.GetAttachments(id)
+	if attachmentErr == nil && msg.HasAttachments && len(attachments) == 0 {
+		if err := parser.RepairAttachments(h.db, msg, h.db.AttachmentsPath()); err != nil {
+			attachmentErr = err
+			log.Printf("[web] attachment repair for message %d: %v", id, err)
+		} else {
+			attachments, attachmentErr = h.db.GetAttachments(id)
+		}
+	}
+	attachmentUnavailable := attachmentErr != nil || (msg.HasAttachments && len(attachments) == 0)
 
 	unread, _ := h.db.CountUnread(account.ID)
 	folders, _ := h.db.ListFolders(account.ID)
 
 	data := map[string]interface{}{
-		"Title":       msg.Subject,
-		"Message":     msg,
-		"Attachments": attachments,
-		"Unread":      unread,
-		"CSRFToken":   h.sessionMgr.GenerateCSRFToken(r),
-		"Section":     msg.Direction,
-		"Account":     account,
-		"Folders":     folders,
-		"MDNMode":     h.cfg.MDN.Mode,
+		"Title":                 msg.Subject,
+		"Message":               msg,
+		"Attachments":           attachments,
+		"AttachmentUnavailable": attachmentUnavailable,
+		"Unread":                unread,
+		"CSRFToken":             h.sessionMgr.GenerateCSRFToken(r),
+		"Section":               msg.Direction,
+		"Account":               account,
+		"Folders":               folders,
+		"MDNMode":               h.cfg.MDN.Mode,
+		"RemoteImages":          h.remoteImagesAllowed(r, account.ID, id),
+		"RemoteImagePermit":     h.remoteImagePermit(r, account.ID, id),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -275,26 +303,11 @@ func (h *MessageHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-// handleMDN handles Message Disposition Notification based on config mode
-func (h *MessageHandler) handleMDN(msg *store.Message, account *store.Account) {
-	if msg.MDNAddress == "" {
-		log.Printf("[web] handleMDN: no MDN address")
-		return
-	}
-
-	log.Printf("[web] handleMDN: mode=%s, checking auto mode", h.cfg.MDN.Mode)
-	// In auto mode, send MDN immediately
-	if h.cfg.MDN.Mode == "auto" {
-		log.Printf("[web] handleMDN: sending MDN in auto mode")
-		h.sendMDN(msg, account)
-	} else {
-		log.Printf("[web] handleMDN: manual mode, no auto-send")
-	}
-	// In manual mode, MDN will be shown in template and user can send/deny via API
-}
-
 // sendMDN generates and sends an MDN response
-func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) {
+func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) error {
+	if msg.MDNAddress == "" {
+		return fmt.Errorf("MDN destination is empty")
+	}
 	log.Printf("[web] sendMDN: starting for msg=%d, recipient=%s", msg.ID, msg.MDNAddress)
 	// Generate MDN message using multipart/report format per RFC 3798
 	mdnBody := mdn.GenerateMDNMultipart(
@@ -307,14 +320,14 @@ func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) {
 
 	log.Printf("[web] sendMDN: MDN body generated, enqueueing for delivery")
 	// Enqueue MDN for delivery
-	if err := h.queue.Enqueue(account.Email, []string{msg.MDNAddress}, []byte(mdnBody), account.ID); err != nil {
+	if err := h.queue.EnqueueMDN(account.Email, []string{msg.MDNAddress}, []byte(mdnBody), account.ID, msg.ID); err != nil {
 		log.Printf("[web] MDN enqueue error: %v", err)
-		return
+		return err
 	}
 
-	// Mark MDN as sent
-	h.db.MarkMDNSent(msg.ID)
+	msg.MDNSent = true
 	log.Printf("[web] MDN sent for message %d to %s", msg.ID, msg.MDNAddress)
+	return nil
 }
 
 // SendMDN handles the API endpoint for manually sending MDN
@@ -359,7 +372,14 @@ func (h *MessageHandler) SendMDN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[web] SendMDN API: sending MDN for message %d", id)
-	h.sendMDN(msg, account)
+	if err := h.sendMDN(msg, account); err != nil {
+		if errors.Is(err, store.ErrMDNAlreadySent) {
+			http.Error(w, "MDN already sent", http.StatusConflict)
+		} else {
+			http.Error(w, "Unable to queue MDN; please retry", http.StatusServiceUnavailable)
+		}
+		return
+	}
 
 	// Redirect back to the message
 	http.Redirect(w, r, "/message/"+idStr, http.StatusSeeOther)
@@ -386,24 +406,28 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	basePath, err := filepath.Abs(h.db.AttachmentsPath())
+	name := att.StoragePath
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		http.NotFound(w, r)
+		return
+	}
+	// Open relative to a trusted directory descriptor. O_NOFOLLOW prevents a
+	// replaced attachment filename from escaping the tree, even during a race.
+	baseFD, err := unix.Open(h.db.AttachmentsPath(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	fullPath, err := filepath.Abs(filepath.Join(basePath, filepath.Clean(att.StoragePath)))
+	defer unix.Close(baseFD)
+	fileFD, err := unix.Openat(baseFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	relative, err := filepath.Rel(basePath, fullPath)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		http.NotFound(w, r)
-		return
-	}
-
-	// Check file exists
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+	file := os.NewFile(uintptr(fileFD), name)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
@@ -415,7 +439,7 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(att.Filename)})
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", disposition)
-	http.ServeFile(w, r, fullPath)
+	http.ServeContent(w, r, filepath.Base(att.Filename), info.ModTime(), file)
 }
 
 // Content serves sanitized HTML mail in a sandboxed, origin-isolated frame.
@@ -437,10 +461,33 @@ func (h *MessageHandler) Content(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src data: cid: https: http:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; navigate-to 'none'")
+	allowRemote := h.remoteImagesAllowed(r, account.ID, id)
+	imageSources := "data: cid:"
+	if allowRemote {
+		imageSources += " https: http:"
+	}
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src "+imageSources+"; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; navigate-to 'none'")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8>" + sanitizeHTML(msg.HTMLBody)))
+	_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8>" + sanitizeHTMLWithRemoteImages(msg.HTMLBody, allowRemote)))
+}
+
+func (h *MessageHandler) remoteImagePermit(r *http.Request, accountID, messageID int64) string {
+	mac := hmac.New(sha256.New, []byte(h.cfg.Security.CSRFKey))
+	_, _ = fmt.Fprintf(mac, "remote-images:%d:%d:%s", accountID, messageID, h.sessionMgr.GenerateCSRFToken(r))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (h *MessageHandler) remoteImagesAllowed(r *http.Request, accountID, messageID int64) bool {
+	if r.URL.Query().Get("remote_images") != "1" {
+		return false
+	}
+	token := r.URL.Query().Get("permit")
+	if len(token) != 64 {
+		return false
+	}
+	expected := h.remoteImagePermit(r, accountID, messageID)
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
 // BulkAction applies an account-scoped, atomic action to selected messages.

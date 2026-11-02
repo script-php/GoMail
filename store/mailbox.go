@@ -6,34 +6,15 @@ import (
 	"strings"
 )
 
-// SearchMessages searches visible mail, scoped to its owner. SQL wildcards are literal.
-func (db *DB) SearchMessages(accountID int64, query string, limit, offset int) ([]*Message, int, error) {
-	pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query) + "%"
-	where := `account_id = ? AND is_deleted = 0 AND (subject LIKE ? ESCAPE '!' OR from_addr LIKE ? ESCAPE '!' OR to_addr LIKE ? ESCAPE '!' OR text_body LIKE ? ESCAPE '!')`
-	if db.IsMySQL() {
-		for _, field := range []string{"subject", "from_addr", "to_addr", "text_body"} {
-			where = strings.ReplaceAll(where, field+" LIKE", field+" COLLATE utf8mb4_unicode_ci LIKE")
-		}
+func escapedSearchPattern(query string) string {
+	return "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query) + "%"
+}
+
+func mysqlCaseInsensitiveSearch(where string) string {
+	for _, field := range []string{"subject", "from_addr", "to_addr", "text_body"} {
+		where = strings.ReplaceAll(where, field+" LIKE", field+" COLLATE utf8mb4_unicode_ci LIKE")
 	}
-	args := []interface{}{accountID, pattern, pattern, pattern, pattern}
-	var total int
-	if err := db.QueryRow("SELECT COUNT(*) FROM messages WHERE "+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-	rows, err := db.Query(`SELECT id, from_addr, to_addr, subject, has_attachments, is_read, is_starred, spf_result, dkim_result, dmarc_result, received_at FROM messages WHERE `+where+` ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-	var messages []*Message
-	for rows.Next() {
-		m := &Message{}
-		if err := rows.Scan(&m.ID, &m.FromAddr, &m.ToAddr, &m.Subject, &m.HasAttachments, &m.IsRead, &m.IsStarred, &m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.ReceivedAt); err != nil {
-			return nil, 0, err
-		}
-		messages = append(messages, m)
-	}
-	return messages, total, rows.Err()
+	return where
 }
 
 // ApplyMessageAction validates the entire selection before changing anything.
@@ -56,20 +37,35 @@ func (db *DB) ApplyMessageAction(accountID int64, ids []int64, action string, fo
 		if err := tx.QueryRow(`SELECT folder_type FROM folders WHERE id = ? AND account_id = ?`, folderID, accountID).Scan(&destinationType); err != nil {
 			return fmt.Errorf("destination folder not found")
 		}
-		if destinationType == "drafts" {
-			return fmt.Errorf("received or sent messages cannot become drafts")
-		}
 	}
 	for _, id := range ids {
-		var direction string
-		if err := tx.QueryRow(`SELECT direction FROM messages WHERE id = ? AND account_id = ?`, id, accountID).Scan(&direction); err != nil {
+		var direction, sourceType string
+		var sourceFolderID int64
+		if err := tx.QueryRow(`SELECT m.direction, f.folder_type, f.id FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.id = ? AND m.account_id = ? AND f.account_id = ?`, id, accountID, accountID).Scan(&direction, &sourceType, &sourceFolderID); err != nil {
 			return sql.ErrNoRows
+		}
+		if action == "move" {
+			if sourceFolderID == folderID {
+				return fmt.Errorf("message is already in that folder")
+			}
+			if err := validateMessageMove(direction, sourceType, destinationType, false); err != nil {
+				return err
+			}
+		}
+		if action == "restore" && sourceType != "trash" {
+			return fmt.Errorf("only trashed messages can be restored")
+		}
+		if action == "trash" && sourceType == "trash" {
+			return fmt.Errorf("message is already in Trash")
 		}
 	}
 	for _, id := range ids {
 		switch action {
 		case "read", "unread":
 			_, err = tx.Exec(`UPDATE messages SET is_read = ? WHERE id = ? AND account_id = ?`, action == "read", id, accountID)
+			if err == nil {
+				err = db.touchIMAPMessageState(tx, id)
+			}
 		default:
 			target, kind := folderID, destinationType
 			if action == "trash" {
@@ -83,6 +79,8 @@ func (db *DB) ApplyMessageAction(accountID int64, ids []int64, action string, fo
 				kind = "inbox"
 				if direction == "outbound" {
 					kind = "sent"
+				} else if direction == "draft" {
+					kind = "drafts"
 				}
 			}
 			if action != "move" {
@@ -91,6 +89,9 @@ func (db *DB) ApplyMessageAction(accountID int64, ids []int64, action string, fo
 				}
 			}
 			_, err = tx.Exec(`UPDATE messages SET folder_id = ?, is_deleted = ? WHERE id = ? AND account_id = ?`, target, kind == "trash", id, accountID)
+			if err == nil {
+				err = db.moveIMAPMessageState(tx, id, target)
+			}
 		}
 		if err != nil {
 			return err
@@ -103,5 +104,43 @@ func (db *DB) ApplyMessageAction(accountID int64, ids []int64, action string, fo
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err == nil {
+		db.NotifyIMAPChanges(accountID)
+	}
+	return err
+}
+
+// validateMessageMove keeps system folders consistent with immutable message
+// direction. fromTrash is used only by IMAP MOVE as its restore equivalent.
+func validateMessageMove(direction, sourceType, destinationType string, fromTrash bool) error {
+	if destinationType == "drafts" {
+		return fmt.Errorf("messages cannot be moved into Drafts")
+	}
+	if sourceType == "trash" {
+		if fromTrash && destinationType == restoreFolderForDirection(direction) {
+			return nil
+		}
+		return fmt.Errorf("trashed messages can only be restored")
+	}
+	if direction == "draft" {
+		return fmt.Errorf("drafts cannot be moved")
+	}
+	if destinationType == "trash" {
+		return nil
+	}
+	if direction == "inbound" && (destinationType == "spam" || destinationType == "custom" || sourceType == "spam" && destinationType == "inbox") {
+		return nil
+	}
+	return fmt.Errorf("destination folder is not allowed for this message")
+}
+
+func restoreFolderForDirection(direction string) string {
+	switch direction {
+	case "outbound":
+		return "sent"
+	case "draft":
+		return "drafts"
+	default:
+		return "inbox"
+	}
 }

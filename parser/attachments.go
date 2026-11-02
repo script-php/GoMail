@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gomail/store"
 )
@@ -12,12 +13,18 @@ import (
 // SaveAttachments writes all parsed attachments to disk and returns Attachment model records.
 func SaveAttachments(attachments []ParsedAttachment, messageDBID int64, basePath string) ([]*store.Attachment, error) {
 	var records []*store.Attachment
+	var written []string
+	cleanup := func() {
+		for _, path := range written {
+			_ = os.Remove(path)
+		}
+	}
 
 	for i, att := range attachments {
 		// Generate a safe, unique filename using hash
 		hash := sha256.Sum256(att.Data)
 		ext := filepath.Ext(att.Filename)
-		if ext == "" {
+		if !safeAttachmentExtension(ext) {
 			ext = ".bin"
 		}
 		safeFilename := fmt.Sprintf("%d_%d_%x%s", messageDBID, i, hash[:8], ext)
@@ -25,9 +32,11 @@ func SaveAttachments(attachments []ParsedAttachment, messageDBID int64, basePath
 		fullPath := filepath.Join(basePath, safeFilename)
 
 		// Write file
-		if err := os.WriteFile(fullPath, att.Data, 0640); err != nil {
+		if err := store.WriteAttachmentFile(fullPath, att.Data); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("writing attachment %s: %w", att.Filename, err)
 		}
+		written = append(written, fullPath)
 
 		records = append(records, &store.Attachment{
 			MessageID:   messageDBID,
@@ -39,4 +48,27 @@ func SaveAttachments(attachments []ParsedAttachment, messageDBID int64, basePath
 	}
 
 	return records, nil
+}
+
+func safeAttachmentExtension(extension string) bool {
+	if extension == "" || len(extension) > 16 || extension[0] != '.' {
+		return false
+	}
+	for _, char := range extension[1:] {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
+			return false
+		}
+	}
+	return !strings.ContainsAny(extension, `/\\`)
+}
+
+// RemoveSavedAttachments compensates a failed metadata transaction. Paths are
+// generated internally by SaveAttachments and contain no directory component.
+func RemoveSavedAttachments(records []*store.Attachment, basePath string) {
+	for _, record := range records {
+		if record == nil || filepath.Base(record.StoragePath) != record.StoragePath {
+			continue
+		}
+		_ = os.Remove(filepath.Join(basePath, record.StoragePath))
+	}
 }

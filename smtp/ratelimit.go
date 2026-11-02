@@ -15,6 +15,8 @@ type RateLimiter struct {
 	maxMsgsPerMin  int
 }
 
+const maxRateWindowClients = 10000
+
 type rateWindow struct {
 	timestamps []time.Time
 }
@@ -27,8 +29,6 @@ func NewRateLimiter(connsPerMin, msgsPerMin int) *RateLimiter {
 		maxConnsPerMin: connsPerMin,
 		maxMsgsPerMin:  msgsPerMin,
 	}
-	// Start cleanup goroutine
-	go rl.cleanup()
 	return rl
 }
 
@@ -51,6 +51,12 @@ func (rl *RateLimiter) allow(windows map[string]*rateWindow, ip string, limit in
 
 	w, ok := windows[ip]
 	if !ok {
+		if len(windows) >= maxRateWindowClients {
+			cleanMap(windows, cutoff)
+			if len(windows) >= maxRateWindowClients {
+				return false
+			}
+		}
 		w = &rateWindow{}
 		windows[ip] = w
 	}
@@ -64,26 +70,12 @@ func (rl *RateLimiter) allow(windows map[string]*rateWindow, ip string, limit in
 	}
 	w.timestamps = valid
 
-	if len(w.timestamps) >= limit {
+	if limit <= 0 || len(w.timestamps) >= limit {
 		return false
 	}
 
 	w.timestamps = append(w.timestamps, now)
 	return true
-}
-
-// cleanup periodically removes stale entries.
-func (rl *RateLimiter) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		rl.mu.Lock()
-		cutoff := time.Now().Add(-time.Minute)
-		cleanMap(rl.connections, cutoff)
-		cleanMap(rl.messages, cutoff)
-		rl.mu.Unlock()
-	}
 }
 
 func cleanMap(m map[string]*rateWindow, cutoff time.Time) {

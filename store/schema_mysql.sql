@@ -27,10 +27,49 @@ CREATE TABLE IF NOT EXISTS accounts (
     password_hash VARCHAR(255)    NOT NULL,
     is_admin      BIGINT NOT NULL DEFAULT 0,
     is_active     BIGINT NOT NULL DEFAULT 1,
+    allow_aliases BIGINT NOT NULL DEFAULT 0,
     quota_bytes   BIGINT NOT NULL DEFAULT 0,
+    mailbox_used_bytes BIGINT NOT NULL DEFAULT 0,
     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(email),
     FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS domain_report_recipients (
+    domain_id BIGINT PRIMARY KEY,
+    account_id BIGINT NOT NULL,
+    FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS smtp_auth_policy (
+    id BIGINT PRIMARY KEY,
+    mode VARCHAR(16) NOT NULL DEFAULT 'both'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS smtp_user_auth_policy (
+    account_id BIGINT PRIMARY KEY,
+    mode VARCHAR(16) NOT NULL DEFAULT 'both',
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS smtp_app_passwords (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    account_id BIGINT NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    secret_hash CHAR(64) NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at DATETIME NULL,
+    UNIQUE(account_id, secret_hash),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS aliases (
+    address VARCHAR(254) PRIMARY KEY,
+    target_account_id BIGINT NOT NULL,
+    owner_account_id BIGINT,
+    FOREIGN KEY (target_account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_account_id) REFERENCES accounts(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 
@@ -82,6 +121,56 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE IF NOT EXISTS imap_mailboxes (
+    folder_id       BIGINT PRIMARY KEY,
+    uid_validity    BIGINT NOT NULL,
+    uid_next        BIGINT NOT NULL DEFAULT 1,
+    highest_modseq  BIGINT NOT NULL DEFAULT 1,
+    FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS imap_message_state (
+    message_id      BIGINT PRIMARY KEY,
+    folder_id       BIGINT NOT NULL,
+    uid             BIGINT NOT NULL,
+    modseq          BIGINT NOT NULL,
+    answered        BIGINT NOT NULL DEFAULT 0,
+    deleted         BIGINT NOT NULL DEFAULT 0,
+    draft           BIGINT NOT NULL DEFAULT 0,
+    recent          BIGINT NOT NULL DEFAULT 1,
+    UNIQUE(folder_id, uid),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS imap_keywords (
+    message_id      BIGINT NOT NULL,
+    keyword         VARCHAR(255) NOT NULL,
+    PRIMARY KEY(message_id, keyword),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS imap_subscriptions (
+    account_id      BIGINT NOT NULL,
+    folder_id       BIGINT NOT NULL,
+    PRIMARY KEY(account_id, folder_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS imap_expunge_history (
+    folder_id       BIGINT NOT NULL,
+    uid             BIGINT NOT NULL,
+    modseq          BIGINT NOT NULL,
+    expunged_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(folder_id, uid),
+    FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE INDEX idx_imap_state_folder_uid ON imap_message_state(folder_id, uid);
+CREATE INDEX idx_imap_state_modseq ON imap_message_state(folder_id, modseq);
+CREATE INDEX idx_imap_expunge_modseq ON imap_expunge_history(folder_id, modseq);
+
 CREATE TABLE IF NOT EXISTS attachments (
     id          BIGINT PRIMARY KEY AUTO_INCREMENT,
     message_id  BIGINT NOT NULL,
@@ -96,6 +185,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE TABLE IF NOT EXISTS outbound_queue (
     id                  BIGINT PRIMARY KEY AUTO_INCREMENT,
     message_id          BIGINT,
+    origin_account_id   BIGINT NOT NULL DEFAULT -1,
     mail_from           VARCHAR(320)    NOT NULL,
     rcpt_to             LONGTEXT    NOT NULL,
     raw_message         LONGBLOB    NOT NULL,
@@ -104,10 +194,14 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     next_retry          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_error          LONGTEXT    NOT NULL DEFAULT (''),
     status              VARCHAR(32)    NOT NULL DEFAULT 'pending',
+    claim_token         VARCHAR(64)    NOT NULL DEFAULT '',
     dsn_notify          VARCHAR(64)    NOT NULL DEFAULT '',
     dsn_ret             VARCHAR(16)    NOT NULL DEFAULT 'FULL',
     dsn_envid           LONGTEXT    NOT NULL DEFAULT (''),
     dsn_sent            BIGINT NOT NULL DEFAULT 0,
+    dsn_attempts        BIGINT NOT NULL DEFAULT 0,
+    dsn_retry_at        DATETIME NOT NULL DEFAULT '1970-01-01',
+    dsn_delay_sent      BIGINT NOT NULL DEFAULT 0,
     verp_bounce_address LONGTEXT    NOT NULL DEFAULT (''),
     original_recipient  VARCHAR(320)    NOT NULL DEFAULT '',
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -115,10 +209,92 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE IF NOT EXISTS outbound_queue_events (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    queue_id    BIGINT NOT NULL,
+    event_type  VARCHAR(40) NOT NULL,
+    attempt     BIGINT NOT NULL DEFAULT 0,
+    smtp_code   INTEGER NOT NULL DEFAULT 0,
+    detail      VARCHAR(500) NOT NULL DEFAULT '',
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (queue_id) REFERENCES outbound_queue(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS outbound_queue_retention (
+    id INTEGER PRIMARY KEY,
+    days INTEGER NOT NULL DEFAULT 0,
+    verp_days INTEGER NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS issued_verp (
+    address VARCHAR(320) PRIMARY KEY,
+    recipient VARCHAR(320) NOT NULL,
+    sender VARCHAR(320) NOT NULL,
+    archived_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 CREATE TABLE IF NOT EXISTS sessions (
     token      VARCHAR(64) PRIMARY KEY,
     data       LONGTEXT NOT NULL,
     expires_at DATETIME NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS backup_settings (
+    id              INTEGER PRIMARY KEY,
+    enabled         INTEGER NOT NULL DEFAULT 0,
+    directory       LONGTEXT NOT NULL,
+    interval_hours  INTEGER NOT NULL DEFAULT 24,
+    retention_count INTEGER NOT NULL DEFAULT 7,
+    last_success_at DATETIME,
+    last_path       LONGTEXT NOT NULL,
+    last_error      LONGTEXT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS report_inbox_settings (
+    id              BIGINT PRIMARY KEY,
+    enabled         BIGINT NOT NULL DEFAULT 0,
+    account_id      BIGINT NOT NULL DEFAULT 0,
+    last_message_id BIGINT NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS received_reports (
+    id                BIGINT PRIMARY KEY AUTO_INCREMENT,
+    account_id        BIGINT NOT NULL,
+    source_message_id BIGINT NOT NULL,
+    dedupe_key        CHAR(64) NOT NULL UNIQUE,
+    kind              VARCHAR(16) NOT NULL,
+    report_domain     VARCHAR(253) NOT NULL,
+    submitter         VARCHAR(253) NOT NULL,
+    report_id         VARCHAR(998) NOT NULL,
+    period_start      VARCHAR(64) NOT NULL,
+    period_end        VARCHAR(64) NOT NULL,
+    successes         BIGINT NOT NULL DEFAULT 0,
+    failures          BIGINT NOT NULL DEFAULT 0,
+    payload_json      LONGTEXT NOT NULL,
+    received_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_received_report_source_domain (account_id, source_message_id, kind, report_domain)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS report_inbox_failures (
+    account_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    next_retry_unix BIGINT NOT NULL DEFAULT 0,
+    attempts BIGINT NOT NULL DEFAULT 0,
+    last_error VARCHAR(500) NOT NULL DEFAULT '',
+    PRIMARY KEY(account_id,message_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS outbound_account_usage (
+    account_id       BIGINT PRIMARY KEY,
+    hour_started_at  DATETIME NOT NULL,
+    hour_messages    BIGINT NOT NULL DEFAULT 0,
+    hour_recipients  BIGINT NOT NULL DEFAULT 0,
+    day_started_at   DATETIME NOT NULL,
+    day_messages     BIGINT NOT NULL DEFAULT 0,
+    day_recipients   BIGINT NOT NULL DEFAULT 0,
+    suspended_until  DATETIME,
+    updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 
@@ -131,27 +307,40 @@ CREATE INDEX idx_messages_account       ON messages(account_id);
 CREATE INDEX idx_messages_folder        ON messages(folder_id);
 CREATE INDEX idx_messages_direction     ON messages(direction);
 CREATE INDEX idx_messages_received_at   ON messages(received_at);
+CREATE INDEX idx_messages_account_direction_page ON messages(account_id, direction, is_deleted, received_at, id);
+CREATE INDEX idx_messages_folder_page ON messages(account_id, folder_id, received_at, id);
 CREATE INDEX idx_messages_is_deleted    ON messages(is_deleted);
 CREATE INDEX idx_messages_is_read       ON messages(is_read);
 CREATE INDEX idx_messages_mail_from     ON messages(mail_from);
 CREATE INDEX idx_messages_msgid         ON messages(message_id(191));
 CREATE INDEX idx_attachments_message    ON attachments(message_id);
 CREATE INDEX idx_queue_status           ON outbound_queue(status, next_retry);
+CREATE INDEX idx_queue_verp_address     ON outbound_queue(verp_bounce_address(191));
+CREATE INDEX idx_issued_verp_archived   ON issued_verp(archived_at);
+CREATE INDEX idx_queue_events_queue      ON outbound_queue_events(queue_id, id);
 CREATE INDEX idx_sessions_expires       ON sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS dmarc_feedback (
     id                  BIGINT PRIMARY KEY AUTO_INCREMENT,
     domain              VARCHAR(253) NOT NULL,
+    policy_domain       VARCHAR(253) NOT NULL DEFAULT '',
     source_ip           VARCHAR(45) NOT NULL,
     envelope_from_domain LONGTEXT,
-    dkim_result         VARCHAR(32),
-    spf_result          VARCHAR(32),
+	dkim_result         VARCHAR(32),
+	dkim_domain         VARCHAR(253),
+	dkim_selector       VARCHAR(253),
+	spf_result          VARCHAR(32),
+	spf_domain          VARCHAR(253),
+	spf_scope           VARCHAR(16) NOT NULL DEFAULT 'mfrom',
+    dkim_aligned        BOOLEAN NOT NULL DEFAULT FALSE,
+    spf_aligned         BOOLEAN NOT NULL DEFAULT FALSE,
     disposition         VARCHAR(32),
     received_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     sent_at             DATETIME
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE INDEX idx_dmarc_feedback_domain ON dmarc_feedback(domain);
+CREATE INDEX idx_dmarc_feedback_policy_domain ON dmarc_feedback(policy_domain);
 CREATE INDEX idx_dmarc_feedback_received ON dmarc_feedback(received_at);
 
 
@@ -177,13 +366,23 @@ CREATE TABLE IF NOT EXISTS tls_failures (
     mx_host_pattern     VARCHAR(4096) NOT NULL DEFAULT '[]',
     additional_information LONGTEXT,
     failure_reason_code LONGTEXT,
-    attempted_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    sent_at             DATETIME
+	attempted_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	report_attempts     INTEGER NOT NULL DEFAULT 0,
+	next_report_attempt DATETIME,
+	report_last_error   LONGTEXT,
+	sent_at             DATETIME
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE INDEX idx_tls_failures_domain ON tls_failures(recipient_domain);
 CREATE INDEX idx_tls_failures_attempted ON tls_failures(attempted_at);
 
+
+CREATE TABLE IF NOT EXISTS mta_sts_policy_cache (
+    domain VARCHAR(253) PRIMARY KEY,
+    policy_id VARCHAR(32) NOT NULL,
+    policy_json TEXT NOT NULL,
+    expires_at DATETIME NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS greylisting (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,

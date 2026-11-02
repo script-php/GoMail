@@ -1,0 +1,75 @@
+{{define "content"}}
+<div class="admin-panel backup-page">
+    <header class="backup-page-header">
+        <div>
+            <h2>Backups</h2>
+            <p>Create verified archives and schedule automatic protection for this server.</p>
+        </div>
+        <span class="backup-state {{if .Settings.Enabled}}backup-state-enabled{{else}}backup-state-disabled{{end}}">Automatic backups {{if .Settings.Enabled}}on{{else}}off{{end}}</span>
+    </header>
+
+    {{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
+    {{if .Saved}}<div class="alert alert-success" role="status">Backup settings saved.</div>{{end}}
+    {{if .Created}}<div class="alert alert-success" role="status">Verified backup created: <strong>{{.Created}}</strong></div>{{end}}
+
+    <div class="backup-grid">
+        <section class="backup-card" aria-labelledby="manual-backup-heading">
+            <div class="backup-card-header">
+                <span class="backup-card-icon" aria-hidden="true">↓</span>
+                <div><h3 id="manual-backup-heading">Manual backup</h3><p>Create a checksum-verified archive immediately.</p></div>
+            </div>
+            <p class="backup-card-copy">The archive stays on the server and contains messages, configuration, and private key material. It is never downloaded through the browser.</p>
+            <form method="POST" action="/admin/backups" class="backup-card-action">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <input type="hidden" name="action" value="run">
+                <button class="btn btn-primary" type="submit">Create verified backup</button>
+            </form>
+        </section>
+
+        <section class="backup-card" aria-labelledby="backup-status-heading">
+            <div class="backup-card-header">
+                <span class="backup-card-icon backup-card-icon-status" aria-hidden="true">✓</span>
+                <div><h3 id="backup-status-heading">Backup status</h3><p>The latest scheduler and archive results.</p></div>
+            </div>
+            <dl class="backup-status-list">
+                <div><dt>Last successful backup</dt><dd>{{if .Settings.LastSuccessAt}}{{.Settings.LastSuccessAt.Format "02 Jan 2006, 15:04 MST"}}{{else}}Never{{end}}</dd></div>
+                <div><dt>Last archive</dt><dd>{{if .Settings.LastPath}}<code>{{.Settings.LastPath}}</code>{{else}}Not available{{end}}</dd></div>
+                <div><dt>Last error</dt><dd class="{{if .Settings.LastError}}backup-error{{else}}backup-ok{{end}}">{{if .Settings.LastError}}{{.Settings.LastError}}{{else}}None{{end}}</dd></div>
+            </dl>
+        </section>
+
+        <section class="backup-card backup-card-wide" aria-labelledby="automatic-backups-heading">
+            <div class="backup-card-header">
+                <span class="backup-card-icon" aria-hidden="true">↻</span>
+                <div><h3 id="automatic-backups-heading">Automatic backups</h3><p>Choose where archives are stored and how often they are created.</p></div>
+            </div>
+            <form method="POST" action="/admin/backups" class="backup-settings-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <input type="hidden" name="action" value="save">
+                <label class="backup-toggle" for="backup-enabled">
+                    <span><strong>Enable automatic backups</strong><small>GoMail will create and rotate archives in the background.</small></span>
+                    <span class="backup-switch"><input id="backup-enabled" type="checkbox" name="enabled" value="1" {{if .Settings.Enabled}}checked{{end}}><span aria-hidden="true"></span></span>
+                </label>
+                <div class="backup-form-grid">
+                    <div class="form-group backup-form-wide">
+                        <label for="directory">Server backup directory</label>
+                        <input id="directory" name="directory" type="text" required value="{{.Settings.Directory}}" autocomplete="off">
+                        <small>Must be outside the database, attachment, and ACME directories. Files are created with mode 0600.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="interval_hours">Interval</label>
+                        <div class="backup-input-suffix"><input id="interval_hours" name="interval_hours" type="number" min="1" max="720" required value="{{.Settings.IntervalHours}}"><span>hours</span></div>
+                    </div>
+                    <div class="form-group">
+                        <label for="retention_count">Retention</label>
+                        <div class="backup-input-suffix"><input id="retention_count" name="retention_count" type="number" min="1" max="365" required value="{{.Settings.RetentionCount}}"><span>archives</span></div>
+                    </div>
+                </div>
+                <div class="backup-form-actions"><button class="btn btn-primary" type="submit">Save backup settings</button></div>
+            </form>
+        </section>
+    </div>
+
+    <aside class="backup-warning" aria-label="Backup security notice"><span aria-hidden="true">!</span><p><strong>Store another encrypted copy off-site.</strong> Server archives are not encrypted. Periodically test an isolated restore so you know the copy is usable.</p></aside>
+</div>
+{{end}}

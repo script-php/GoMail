@@ -8,9 +8,10 @@
     <div class="alert alert-error">{{.Error}}</div>
     {{end}}
     <form method="POST" action="/login">
+        <input type="hidden" name="csrf_token" value="{{.LoginCSRFToken}}">
         <div class="form-group">
             <label for="email">Email</label>
-            <input type="text" id="email" name="email" required autofocus placeholder="Email address">
+            <input type="text" id="email" name="email" value="{{.Email}}" required autofocus placeholder="Email address">
         </div>
         <div class="form-group">
             <label for="password">Password</label>

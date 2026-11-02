@@ -1,0 +1,93 @@
+package store
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestInboundAttachmentsCommitOrRollbackWithMessage(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&Domain{Domain: "example.test", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&Account{DomainID: domainID, Email: "alice@example.test", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMessage := func() *Message {
+		return &Message{AccountID: accountID, MessageID: "attachment-test", Direction: "inbound", RawMessage: []byte("From: sender@remote.test\r\n\r\nbody\r\n"), HasAttachments: true, ReceivedAt: time.Now()}
+	}
+	batch := [][]IMAPAppendAttachment{{{Filename: "document.txt", ContentType: "text/plain", Data: []byte("payload")}}}
+	if _, err := db.Exec(`CREATE TRIGGER fail_attachment BEFORE INSERT ON attachments BEGIN SELECT RAISE(FAIL, 'attachment unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveMessagesWithQueueAndAttachments([]*Message{newMessage()}, nil, batch); err == nil {
+		t.Fatal("message committed despite attachment failure")
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE message_id='attachment-test'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("messages after rollback=%d err=%v", count, err)
+	}
+	files, err := os.ReadDir(db.AttachmentsPath())
+	if err != nil || len(files) != 0 {
+		t.Fatalf("attachment files after rollback=%d err=%v", len(files), err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_attachment`); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := db.SaveMessagesWithQueueAndAttachments([]*Message{newMessage()}, nil, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachments, err := db.GetAttachments(ids[0])
+	if err != nil || len(attachments) != 1 {
+		t.Fatalf("committed attachments=%d err=%v", len(attachments), err)
+	}
+	data, err := os.ReadFile(filepath.Join(db.AttachmentsPath(), attachments[0].StoragePath))
+	if err != nil || string(data) != "payload" {
+		t.Fatalf("committed attachment=%q err=%v", data, err)
+	}
+}
+
+func TestInboundBounceAndMessageRollbackTogether(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&Domain{Domain: "example.test", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&Account{DomainID: domainID, Email: "alice@example.test", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := &Message{AccountID: accountID, MessageID: "bounce-atomic", Direction: "inbound", RawMessage: []byte("From: sender@remote.test\r\n\r\nbody\r\n"), ReceivedAt: time.Now()}
+	bounces := []InboundVERPBounce{{OriginalRecipient: "first@remote.test", SenderEmail: "alice@example.test", BounceAddress: "first+verp@example.test"}, {OriginalRecipient: "second@remote.test", SenderEmail: "alice@example.test", BounceAddress: "second+verp@example.test"}}
+	if _, err := db.Exec(`CREATE TRIGGER fail_second_bounce BEFORE INSERT ON verp_bounces WHEN NEW.original_recipient='second@remote.test' BEGIN SELECT RAISE(FAIL, 'bounce unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveInboundDelivery([]*Message{message}, nil, nil, bounces); err == nil {
+		t.Fatal("transaction committed despite second bounce failure")
+	}
+	var messages, recorded int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE message_id='bounce-atomic'`).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM verp_bounces WHERE sender_email='alice@example.test'`).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 || recorded != 0 {
+		t.Fatalf("partial transaction: messages=%d bounces=%d", messages, recorded)
+	}
+}

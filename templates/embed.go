@@ -28,8 +28,10 @@ func ServeStatic(w http.ResponseWriter, r *http.Request) {
 	switch path.Ext(filename) {
 	case ".css":
 		w.Header().Set("Content-Type", "text/css")
+		w.Header().Set("Cache-Control", "no-cache")
 	case ".js":
 		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
 	}
 	
 	io.WriteString(w, string(data))

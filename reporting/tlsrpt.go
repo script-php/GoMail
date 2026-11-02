@@ -3,11 +3,15 @@ package reporting
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/mail"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -151,7 +155,9 @@ func GenerateTLSReport(db *store.DB, ourHostname string, domain string, startTim
 	}
 
 	// Build report
-	reportID := fmt.Sprintf("%s.%d", domain, time.Now().Unix())
+	// Keep the identifier stable for retries of the same UTC reporting window.
+	// The address-shaped form also satisfies RFC 8460's Subject Report-ID syntax.
+	reportID := fmt.Sprintf("%s+%s@%s", startTime.UTC().Format("2006.01.02T15.04.05Z"), domain, ourHostname)
 	report := &TLSReport{
 		OrganizationName: ourHostname,
 		DateRange: TLSDateRange{
@@ -169,43 +175,135 @@ func GenerateTLSReport(db *store.DB, ourHostname string, domain string, startTim
 // ExtractTLSRPTAddresses looks up the TLS-RPT DNS record for a domain and extracts all rua= addresses
 // Returns a slice of email addresses from the rua= field (comma-separated)
 func ExtractTLSRPTAddresses(domain string) ([]string, error) {
+	endpoints, err := ExtractTLSRPTURIs(domain)
+	if err != nil {
+		return nil, err
+	}
+	var addresses []string
+	for _, endpoint := range endpoints {
+		parsed, _ := url.Parse(endpoint)
+		if parsed.Scheme == "mailto" {
+			addresses = append(addresses, parsed.Opaque)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no mailto rua= address found in TLS-RPT record for %s", domain)
+	}
+	return addresses, nil
+}
+
+// ExtractTLSRPTURIs returns validated mailto and HTTPS report destinations.
+func ExtractTLSRPTURIs(domain string) ([]string, error) {
 	// Look up _smtp._tls.<domain> TXT record
 	records, err := net.LookupTXT(fmt.Sprintf("_smtp._tls.%s", domain))
 	if err != nil {
 		return nil, fmt.Errorf("TLS-RPT DNS lookup failed for %s: %w", domain, err)
 	}
 
-	if len(records) == 0 {
-		return nil, fmt.Errorf("no TLS-RPT record found for %s", domain)
-	}
+	return parseTLSRPTRecords(records)
+}
 
-	// Parse the first TXT record looking for rua= addresses
+func parseTLSRPTRecords(records []string) ([]string, error) {
+	var selected string
 	for _, record := range records {
-		// Record should be: v=TLSRPTv1; rua=mailto:admin@example.com,mailto:admin2@example.com
-		parts := strings.Split(record, ";")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if strings.HasPrefix(part, "rua=") {
-				rua := strings.TrimPrefix(part, "rua=")
-				// Split by comma for multiple mailto: addresses
-				var addresses []string
-				for _, addr := range strings.Split(rua, ",") {
-					addr = strings.TrimSpace(addr)
-					// Extract email from mailto:
-					if strings.HasPrefix(addr, "mailto:") {
-						addresses = append(addresses, strings.TrimPrefix(addr, "mailto:"))
-					} else {
-						addresses = append(addresses, addr)
-					}
-				}
-				if len(addresses) > 0 {
-					return addresses, nil
-				}
+		if !tlsRPTVersionRecord(record) {
+			continue
+		}
+		if selected != "" {
+			return nil, fmt.Errorf("multiple TLS-RPT policy records")
+		}
+		selected = record
+	}
+	if selected == "" {
+		return nil, fmt.Errorf("no TLS-RPT policy record")
+	}
+	return ParseTLSRPTRecord(selected)
+}
+
+func tlsRPTVersionRecord(record string) bool {
+	const version = "v=TLSRPTv1"
+	return strings.HasPrefix(record, version) && strings.HasPrefix(strings.TrimLeft(record[len(version):], " \t"), ";")
+}
+
+func ParseTLSRPTRecord(record string) ([]string, error) {
+	if !tlsRPTVersionRecord(record) {
+		return nil, fmt.Errorf("invalid TLS-RPT policy version")
+	}
+	tags := make(map[string]string)
+	for _, part := range strings.Split(record, ";") {
+		pair := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(pair) == 2 {
+			key := strings.ToLower(pair[0])
+			if _, exists := tags[key]; exists {
+				return nil, fmt.Errorf("duplicate TLS-RPT tag %s", key)
 			}
+			tags[key] = strings.TrimSpace(pair[1])
 		}
 	}
+	if tags["v"] != "TLSRPTv1" || tags["rua"] == "" {
+		return nil, fmt.Errorf("invalid TLS-RPT policy")
+	}
+	var endpoints []string
+	for _, raw := range strings.Split(tags["rua"], ",") {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "mailto":
+			if parsed.Opaque == "" || parsed.RawQuery != "" {
+				continue
+			}
+			if _, err := mail.ParseAddress(parsed.Opaque); err != nil {
+				continue
+			}
+			endpoints = append(endpoints, "mailto:"+parsed.Opaque)
+		case "https":
+			if parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+				continue
+			}
+			endpoints = append(endpoints, parsed.String())
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("TLS-RPT policy has no supported rua destination")
+	}
+	return endpoints, nil
+}
 
-	return nil, fmt.Errorf("no rua= address found in TLS-RPT record for %s", domain)
+// PostTLSRPT sends a gzip-compressed report to an RFC 8460 HTTPS endpoint.
+func PostTLSRPT(ctx context.Context, client *http.Client, endpoint string, report *TLSReport) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("invalid TLS-RPT HTTPS endpoint")
+	}
+	reportJSON, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encoding TLS-RPT report: %w", err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(reportJSON); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, parsed.String(), bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/tlsrpt+gzip")
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("posting TLS-RPT report: %w", err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("TLS-RPT endpoint returned HTTP %d", response.StatusCode)
+	}
+	return nil
 }
 
 // ExtractTLSRPTAddress (deprecated: use ExtractTLSRPTAddresses instead)
@@ -235,16 +333,12 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 	// Base64 encode the compressed data
 	encodedReport := foldBase64(base64.StdEncoding.EncodeToString(compressedBuf.Bytes()))
 	policyDomain := "unknown"
-	totalFailures := 0
 	if len(report.Policies) > 0 {
 		policyDomain = report.Policies[0].Policy.PolicyDomain
 	}
-	for _, policy := range report.Policies {
-		totalFailures += policy.Summary.TotalFailureSessionCount
-	}
 	start, _ := time.Parse(time.RFC3339, report.DateRange.StartDatetime)
 	end, _ := time.Parse(time.RFC3339, report.DateRange.EndDatetime)
-	filename := fmt.Sprintf("%s!%s!%d!%d.json.gz", ourHostname, policyDomain, start.Unix(), end.Unix())
+	filename := fmt.Sprintf("%s!%s!%d!%d!001.json.gz", ourHostname, policyDomain, start.Unix(), end.Unix())
 
 	// Build multipart email with gzip-compressed JSON report as attachment
 	boundary := "boundary_tlsrpt"
@@ -253,7 +347,7 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 			"To: %s\r\n"+
 			"Subject: Report Domain: %s Submitter: %s Report-ID: <%s>\r\n"+
 			"Date: %s\r\n"+
-			"Message-ID: <%s@%s>\r\n"+
+			"Message-ID: <%s>\r\n"+
 			"TLS-Report-Domain: %s\r\n"+
 			"TLS-Report-Submitter: %s\r\n"+
 			"MIME-Version: 1.0\r\n"+
@@ -262,9 +356,7 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 			"--%s\r\n"+
 			"Content-Type: text/plain; charset=UTF-8\r\n"+
 			"\r\n"+
-			"This is an automated TLS-RPT report for domain %s.\r\n"+
-			"Report period: %s to %s\r\n"+
-			"Failures recorded: %d\r\n"+
+			"This is an aggregate TLS report from %s\r\n"+
 			"\r\n"+
 			"--%s\r\n"+
 			"Content-Type: application/tlsrpt+gzip\r\n"+
@@ -280,15 +372,11 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 		report.ReportID,
 		time.Now().Format(time.RFC1123Z),
 		report.ReportID,
-		ourHostname,
 		policyDomain,
 		ourHostname,
 		boundary,
 		boundary,
-		policyDomain,
-		report.DateRange.StartDatetime,
-		report.DateRange.EndDatetime,
-		totalFailures,
+		ourHostname,
 		boundary,
 		filename,
 		encodedReport,

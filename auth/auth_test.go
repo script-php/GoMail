@@ -79,9 +79,110 @@ func TestSPFMechanismSyntax(t *testing.T) {
 			t.Errorf("%s: %v", valid, err)
 		}
 	}
-	for _, invalid := range []string{"wat:example.com", "ip4:999.1.1.1", "ip6:192.0.2.1", "a/33", "mx//129", "a:", "include:", "exists:"} {
+	for _, invalid := range []string{"wat:example.com", "all:example.com", "all/24", "ip4:999.1.1.1", "ip6:192.0.2.1", "a/33", "mx//129", "a:", "include:", "exists:"} {
 		if err := validateSPFMechanism(invalid); err == nil {
 			t.Errorf("accepted %s", invalid)
+		}
+	}
+}
+
+func TestSPFMacroExpansionRFC7208Examples(t *testing.T) {
+	ctx := &spfContext{
+		senderIP: "192.0.2.3", localPart: "strong-bad", domain: "email.example.com",
+		helo: "mx.example.org", receiverDomain: "receiver.example.net", timestamp: 12345,
+	}
+	tests := map[string]string{
+		"%{s}":                  "strong-bad@email.example.com",
+		"%{o}":                  "email.example.com",
+		"%{d2}":                 "example.com",
+		"%{d4}":                 "email.example.com",
+		"%{d1r}":                "email",
+		"%{l-}":                 "strong.bad",
+		"%{lr-}":                "bad.strong",
+		"%{ir}.%{v}._spf.%{d2}": "3.2.0.192.in-addr._spf.example.com",
+		"%%-%_-%-":              "%- -%20",
+		"%{S}":                  "strong-bad%40email.example.com",
+	}
+	for input, want := range tests {
+		if err := validateMacroString(input, false); err != nil {
+			t.Fatalf("%q validation failed: %v", input, err)
+		}
+		if got := expandMacros(input, ctx, false); got != want {
+			t.Errorf("expandMacros(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestSPFIPv6MacroExpansion(t *testing.T) {
+	ctx := &spfContext{senderIP: "2001:db8::cb01", domain: "example.com"}
+	want := "1.0.b.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2"
+	if got := expandMacros("%{ir}", ctx, false); got != want {
+		t.Fatalf("IPv6 reverse macro = %q, want %q", got, want)
+	}
+}
+
+func TestSPFRejectsMalformedOrDisallowedMacros(t *testing.T) {
+	invalid := []string{
+		"%", "%x", "%{}", "%{z}", "%{c}", "%{d2rr}", "%{dr2}",
+		"%{d!}", "%{d", "%{d2r!}", "%{d999999999999999999999999}",
+	}
+	for _, input := range invalid {
+		if err := validateMacroString(input, false); err == nil {
+			t.Errorf("accepted invalid macro string %q", input)
+		}
+	}
+	for _, input := range []string{"%{c}", "%{r}", "%{t}"} {
+		if err := validateMacroString(input, true); err != nil {
+			t.Errorf("rejected explanation macro %q: %v", input, err)
+		}
+	}
+}
+
+func TestSPFValidatedDomainMacro(t *testing.T) {
+	oldAddr, oldHost := lookupAddr, lookupHost
+	t.Cleanup(func() { lookupAddr, lookupHost = oldAddr, oldHost })
+	addrCalls := 0
+	lookupAddr = func(string) ([]string, error) {
+		addrCalls++
+		return []string{"unrelated.test.", "mail.example.com."}, nil
+	}
+	lookupHost = func(name string) ([]string, error) {
+		if name == "unrelated.test" {
+			return []string{"198.51.100.1"}, nil
+		}
+		return []string{"192.0.2.3"}, nil
+	}
+	ctx := &spfContext{senderIP: "192.0.2.3", domain: "example.com"}
+	if got := expandMacros("%{p}.%{p}", ctx, false); got != "mail.example.com.mail.example.com" {
+		t.Fatalf("validated-domain macro = %q", got)
+	}
+	if addrCalls != 1 {
+		t.Fatalf("PTR lookup called %d times, want cached single lookup", addrCalls)
+	}
+}
+
+func TestSPFValidatedDomainMacroUnknownWithoutForwardConfirmation(t *testing.T) {
+	oldAddr, oldHost := lookupAddr, lookupHost
+	t.Cleanup(func() { lookupAddr, lookupHost = oldAddr, oldHost })
+	lookupAddr = func(string) ([]string, error) { return []string{"forged.example.com."}, nil }
+	lookupHost = func(string) ([]string, error) { return []string{"198.51.100.1"}, nil }
+	ctx := &spfContext{senderIP: "192.0.2.3", domain: "example.com"}
+	if got := expandMacros("%{p}", ctx, false); got != "unknown" {
+		t.Fatalf("unconfirmed validated-domain macro = %q, want unknown", got)
+	}
+}
+
+func TestSPFMalformedMacroProducesPermErrorBeforeMatch(t *testing.T) {
+	old := lookupTXT
+	t.Cleanup(func() { lookupTXT = old })
+	for _, record := range []string{
+		"v=spf1 +all exists:%{z}.example.com",
+		"v=spf1 +all redirect=%{c}.example.com",
+		"v=spf1 +all a:%{d2rr}",
+	} {
+		lookupTXT = func(string) ([]string, error) { return []string{record}, nil }
+		if result, _ := CheckSPF("192.0.2.1", "a@example.com"); result != SPFPermError {
+			t.Errorf("record %q got %s, want permerror", record, result)
 		}
 	}
 }
@@ -232,6 +333,50 @@ func TestDKIMSignVerifyAndMultipleSignatures(t *testing.T) {
 	}
 }
 
+func TestDMARCUsesAnyVerifiedDKIMIdentity(t *testing.T) {
+	private, _, key, err := GenerateDKIMKeyPair("ed25519")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aligned, err := NewDKIMSignerFromPEM("example.com", "mail", []byte(private), "ed25519")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unaligned, err := NewDKIMSignerFromPEM("other.test", "mail", []byte(private), "ed25519")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := []byte("From: a@example.com\r\nTo: b@example.net\r\nSubject: hello\r\n\r\nbody\r\n")
+	message, err = aligned.Sign(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err = unaligned.Sign(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := lookupTXT
+	lookupTXT = func(name string) ([]string, error) {
+		switch name {
+		case "mail._domainkey.example.com", "mail._domainkey.other.test":
+			return []string{key}, nil
+		case "_dmarc.example.com":
+			return []string{"v=DMARC1; p=reject; adkim=s"}, nil
+		default:
+			return nil, &net.DNSError{IsNotFound: true}
+		}
+	}
+	t.Cleanup(func() { lookupTXT = old })
+	status, _, domain, _, verified := VerifyDKIMDetailedWithIdentities(message)
+	if status != "pass" || domain != "other.test" || len(verified) != 2 || verified[1] != "example.com" {
+		t.Fatalf("verified identities: status=%s first=%q all=%v", status, domain, verified)
+	}
+	result := CheckDMARC("example.com", SPFFail, "other.test", status, domain, verified[1:]...)
+	if result.Result != DMARCPass {
+		t.Fatalf("aligned second signature did not pass DMARC: %+v", result)
+	}
+}
+
 func TestDMARCAlignmentAndPolicyDiscovery(t *testing.T) {
 	old := lookupTXT
 	lookupTXT = func(name string) ([]string, error) {
@@ -254,12 +399,12 @@ func TestDMARCAlignmentAndPolicyDiscovery(t *testing.T) {
 	}
 }
 
-func TestDMARCMultipleRecordsArePermError(t *testing.T) {
+func TestDMARCMultipleRecordsAreDiscarded(t *testing.T) {
 	old := lookupTXT
 	lookupTXT = func(string) ([]string, error) { return []string{"v=DMARC1; p=none", "v=DMARC1; p=reject"}, nil }
 	t.Cleanup(func() { lookupTXT = old })
 	got := CheckDMARC("example.com", SPFFail, "bad.example", "fail", "")
-	if got.Result != DMARCPermError {
+	if got.Result != DMARCNone {
 		t.Fatalf("got %+v", got)
 	}
 }

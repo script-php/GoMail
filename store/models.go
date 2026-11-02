@@ -24,15 +24,17 @@ type Domain struct {
 
 // Account represents a user mailbox.
 type Account struct {
-	ID           int64     `json:"id"`
-	DomainID     int64     `json:"domain_id"`
-	Email        string    `json:"email"`
-	DisplayName  string    `json:"display_name"`
-	PasswordHash string    `json:"-"`
-	IsAdmin      bool      `json:"is_admin"`
-	IsActive     bool      `json:"is_active"`
-	QuotaBytes   int64     `json:"quota_bytes"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	DomainID         int64     `json:"domain_id"`
+	Email            string    `json:"email"`
+	DisplayName      string    `json:"display_name"`
+	PasswordHash     string    `json:"-"`
+	IsAdmin          bool      `json:"is_admin"`
+	IsActive         bool      `json:"is_active"`
+	AllowAliases     bool      `json:"allow_aliases"`
+	QuotaBytes       int64     `json:"quota_bytes"`
+	MailboxUsedBytes int64     `json:"mailbox_used_bytes"`
+	CreatedAt        time.Time `json:"created_at"`
 	// Joined fields (not stored)
 	DomainName string `json:"domain_name,omitempty"`
 }
@@ -86,6 +88,7 @@ type Attachment struct {
 type QueueEntry struct {
 	ID                int64     `json:"id"`
 	MessageID         *int64    `json:"message_id,omitempty"`
+	OriginAccountID   int64     `json:"-"` // 0=system; -1=legacy unknown
 	MailFrom          string    `json:"mail_from"`
 	RcptTo            string    `json:"rcpt_to"`
 	RawMessage        []byte    `json:"-"`
@@ -94,10 +97,13 @@ type QueueEntry struct {
 	NextRetry         time.Time `json:"next_retry"`
 	LastError         string    `json:"last_error"`
 	Status            string    `json:"status"`
-	DSNNotify         string    `json:"dsn_notify"`          // DSN NOTIFY flags
-	DSNRet            string    `json:"dsn_ret"`             // FULL or HDRS
-	DSNEnvID          string    `json:"dsn_envid"`           // Envelope ID
-	DSNSent           bool      `json:"dsn_sent"`            // Whether DSN was sent
+	ClaimToken        string    `json:"-"`
+	DSNNotify         string    `json:"dsn_notify"` // DSN NOTIFY flags
+	DSNRet            string    `json:"dsn_ret"`    // FULL or HDRS
+	DSNEnvID          string    `json:"dsn_envid"`  // Envelope ID
+	DSNSent           bool      `json:"dsn_sent"`   // Whether DSN was sent
+	DSNAttempts       int       `json:"dsn_attempts"`
+	DSNDelaySent      bool      `json:"dsn_delay_sent"`      // Whether a delayed DSN was sent
 	VERPBounceAddress string    `json:"verp_bounce_address"` // VERP-encoded bounce address for MAIL FROM
 	OriginalRecipient string    `json:"original_recipient"`  // Original recipient for bounce tracking
 	CreatedAt         time.Time `json:"created_at"`

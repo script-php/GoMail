@@ -34,6 +34,8 @@ type WebRateLimiter struct {
 	window  time.Duration
 }
 
+const maxWebRateClients = 10000
+
 type webRateEntry struct {
 	count   int
 	resetAt time.Time
@@ -46,7 +48,6 @@ func NewWebRateLimiter(requestsPerMinute int) *WebRateLimiter {
 		limit:   requestsPerMinute,
 		window:  time.Minute,
 	}
-	go rl.cleanup()
 	return rl
 }
 
@@ -66,6 +67,14 @@ func (rl *WebRateLimiter) Middleware(next http.Handler) http.Handler {
 		now := time.Now()
 
 		if !ok || now.After(entry.resetAt) {
+			if !ok && len(rl.clients) >= maxWebRateClients {
+				rl.pruneExpired(now)
+				if len(rl.clients) >= maxWebRateClients {
+					rl.mu.Unlock()
+					http.Error(w, "Too many requests", http.StatusTooManyRequests)
+					return
+				}
+			}
 			rl.clients[ip] = &webRateEntry{count: 1, resetAt: now.Add(rl.window)}
 			rl.mu.Unlock()
 			next.ServeHTTP(w, r)
@@ -84,18 +93,11 @@ func (rl *WebRateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (rl *WebRateLimiter) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for ip, entry := range rl.clients {
-			if now.After(entry.resetAt) {
-				delete(rl.clients, ip)
-			}
+func (rl *WebRateLimiter) pruneExpired(now time.Time) {
+	for ip, entry := range rl.clients {
+		if !now.Before(entry.resetAt) {
+			delete(rl.clients, ip)
 		}
-		rl.mu.Unlock()
 	}
 }
 
@@ -143,6 +145,9 @@ func TrustedProxyMiddleware(cidrs []string, next http.Handler) http.Handler {
 		return false
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Provider-specific client-IP headers are not part of the normalized
+		// trust chain and must not influence downstream message headers.
+		r.Header.Del("CF-Connecting-IP")
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
@@ -181,6 +186,8 @@ type LoginRateLimiter struct {
 	lockTime time.Duration            // How long to lock the IP
 }
 
+const maxLoginRateClients = 10000
+
 type loginAttempt struct {
 	count        int
 	lastAttempt  time.Time
@@ -194,7 +201,6 @@ func NewLoginRateLimiter() *LoginRateLimiter {
 		maxFails: 5,
 		lockTime: 15 * time.Minute,
 	}
-	go lr.cleanup()
 	return lr
 }
 
@@ -205,6 +211,12 @@ func (lr *LoginRateLimiter) RecordFailure(ip string) {
 
 	now := time.Now()
 	entry, ok := lr.attempts[ip]
+	if !ok && len(lr.attempts) >= maxLoginRateClients {
+		lr.pruneExpired(now)
+		if len(lr.attempts) >= maxLoginRateClients {
+			return
+		}
+	}
 
 	if !ok {
 		// First attempt from this IP
@@ -253,6 +265,12 @@ func (lr *LoginRateLimiter) IsBlocked(ip string) (bool, time.Duration) {
 
 	entry, ok := lr.attempts[ip]
 	if !ok {
+		if len(lr.attempts) >= maxLoginRateClients {
+			lr.pruneExpired(time.Now())
+			if len(lr.attempts) >= maxLoginRateClients {
+				return true, lr.lockTime
+			}
+		}
 		return false, 0
 	}
 
@@ -267,19 +285,11 @@ func (lr *LoginRateLimiter) IsBlocked(ip string) (bool, time.Duration) {
 }
 
 // cleanup periodically removes old entries.
-func (lr *LoginRateLimiter) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		lr.mu.Lock()
-		now := time.Now()
-		for ip, entry := range lr.attempts {
-			// Remove if no recent attempts and block expired
-			if now.After(entry.lastAttempt.Add(30*time.Minute)) && now.After(entry.blockedUntil) {
-				delete(lr.attempts, ip)
-			}
+func (lr *LoginRateLimiter) pruneExpired(now time.Time) {
+	for ip, entry := range lr.attempts {
+		if !now.Before(entry.lastAttempt.Add(30*time.Minute)) && !now.Before(entry.blockedUntil) {
+			delete(lr.attempts, ip)
 		}
-		lr.mu.Unlock()
 	}
 }
 

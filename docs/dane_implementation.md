@@ -33,23 +33,32 @@ Matching types:
 - `1`: SHA-256.
 - `2`: SHA-512.
 
-Malformed fields, unsupported values and invalid hex data are rejected. Usage 0
+Malformed fields, unsupported values and invalid hex data are ignored as unusable. Usage 0
 and 2 consider appropriate chain candidates; Usage 1 and 3 match the leaf.
+Authenticated RRsets containing TLSA records but no usable association require
+TLS encryption without DANE authentication; they are not treated as absence.
+For Usage 2 with selector 0
+and matching type 0, the complete associated trust-anchor certificate can
+establish the validation path even when the SMTP server omits that root from its
+transmitted chain.
 
 ## Policy modes
 
 DANE enforcement is stored on the managed sender-domain record:
 
 - `disabled` — no TLSA lookup; normal SMTP TLS/PKIX policy applies.
-- `optional` — authenticated TLSA is evaluated when available. A lookup,
-  malformed-record or mismatch problem is logged and delivery may fall back to
-  ordinary PKIX according to the outbound TLS policy.
+- `optional` — a secure usable TLSA RRset requires authenticated TLS. A secure
+  nonempty but unusable RRset requires encryption. Insecure or authenticated
+  absence permits ordinary opportunistic TLS; a lookup failure skips that MX
+  and retries another or delays delivery.
 - `required` — authenticated usable TLSA must exist and authenticate the peer;
   otherwise delivery fails and retries according to queue classification.
+  Plaintext fallback is prohibited whenever this mode is selected, regardless
+  of the separate general TLS setting.
 
-Optional mode intentionally permits downgrade to PKIX if the DANE path is
-unavailable. Use required mode only when DNSSEC and TLSA availability are
-monitored and operationally reliable.
+After a STARTTLS handshake fails, GoMail does not send plaintext over the same
+connection. A later delivery attempt uses a fresh connection. Use required mode
+only when DNSSEC and TLSA availability are monitored and operationally reliable.
 
 ## Interaction with MTA-STS
 
@@ -63,6 +72,9 @@ not make an out-of-policy MTA-STS MX name valid.
 `dns/tlsa_test.go` and `tls/dane_test.go` cover authenticated/unauthenticated
 responses, all four usages, both selectors, all matching types, malformed
 records, leaf/chain handling, PKIX requirements and enforcement behavior.
+The semantics suite runs all 24 usage/selector/matching combinations. Outbound
+delivery uses one authenticated TLSA result for both handshake verification and
+reporting, so a DNS rotation cannot change policy halfway through one attempt.
 
 ```bash
 go test ./dns ./tls ./smtp

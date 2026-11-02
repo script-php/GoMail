@@ -21,6 +21,16 @@ type VERPBounce struct {
 	RecordedAt        time.Time `json:"recorded_at"`
 }
 
+// InboundVERPBounce is the validated bounce data staged for one SMTP transaction.
+type InboundVERPBounce struct {
+	OriginalRecipient string
+	SenderEmail       string
+	BounceAddress     string
+	BounceType        string
+	BounceCode        int
+	BounceReason      string
+}
+
 // RecordVERPBounce logs a bounce tracked via VERP.
 func (db *DB) RecordVERPBounce(originalRecipient, senderEmail, bounceAddress string, bounceType string, bounceCode int, bounceReason string) error {
 	logging.Debug(fmt.Sprintf("[store] recording VERP bounce for %s (sender: %s, type: %s, code: %d)", originalRecipient, senderEmail, bounceType, bounceCode))

@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/mail"
 	"os"
 	"strings"
 
@@ -11,26 +13,31 @@ import (
 
 // Config holds all server configuration parsed from config.json.
 type Config struct {
-	Server   ServerConfig      `json:"server"`
-	SMTP     SMTPConfig        `json:"smtp"`
-	TLS      TLSConfig         `json:"tls"`
-	DKIM     DKIMConfig        `json:"dkim"`
-	Store    StoreConfig       `json:"store"`
-	Web      WebConfig         `json:"web"`
-	Mail     MailConfig        `json:"mail"`
-	Delivery DeliveryConfig    `json:"delivery"`
-	DNS      DNSConfig         `json:"dns"`
-	Security SecurityConfig    `json:"security"`
-	MDN      MDNConfig         `json:"mdn"`
-	DMARC    DMARCConfig       `json:"dmarc"`
-	Clients  MailClientsConfig `json:"mail_clients"`
-	Logging  LoggingConfig     `json:"logging"`
+	Server          ServerConfig          `json:"server"`
+	SMTP            SMTPConfig            `json:"smtp"`
+	TLS             TLSConfig             `json:"tls"`
+	DKIM            DKIMConfig            `json:"dkim"`
+	Store           StoreConfig           `json:"store"`
+	Web             WebConfig             `json:"web"`
+	Mail            MailConfig            `json:"mail"`
+	Delivery        DeliveryConfig        `json:"delivery"`
+	DNS             DNSConfig             `json:"dns"`
+	Security        SecurityConfig        `json:"security"`
+	MDN             MDNConfig             `json:"mdn"`
+	DMARC           DMARCConfig           `json:"dmarc"`
+	TLSRPT          TLSRPTConfig          `json:"tls_rpt"`
+	Clients         MailClientsConfig     `json:"mail_clients"`
+	Logging         LoggingConfig         `json:"logging"`
+	Metrics         MetricsConfig         `json:"metrics"`
+	StoragePressure StoragePressureConfig `json:"storage_pressure"`
+	OutboundLimits  OutboundLimitsConfig  `json:"outbound_limits"`
 }
 
 // MailClientsConfig controls the optional protocols used by desktop and mobile
 // mail clients. The master switch is intentionally false by default.
 type MailClientsConfig struct {
 	Enabled        bool                `json:"enabled"`
+	IMAP           ClientServiceConfig `json:"imap"`
 	POP3           ClientServiceConfig `json:"pop3"`
 	Submission     ClientServiceConfig `json:"submission"`
 	ReadTimeout    int                 `json:"read_timeout"`
@@ -55,8 +62,39 @@ func (s ClientServiceConfig) IsEnabled(master bool) bool {
 }
 
 type ServerConfig struct {
-	Hostname string `json:"hostname"`
-	Domain   string `json:"domain"`
+	Hostname        string `json:"hostname"`
+	Domain          string `json:"domain"`
+	TLSReportSender string `json:"tls_report_sender"`
+	DSNSender       string `json:"dsn_sender"`
+}
+
+func (s ServerConfig) TLSReportSenderAddress() string {
+	if s.TLSReportSender != "" {
+		return s.TLSReportSender
+	}
+	return "noreply-smtp-tls-reporting@" + s.Domain
+}
+
+func (s ServerConfig) DSNSenderAddress() string {
+	if s.DSNSender != "" {
+		return s.DSNSender
+	}
+	return "Mailer-Daemon@" + s.Domain
+}
+
+func validateOperationalSender(field, address, domain string) error {
+	if address == "" {
+		return nil
+	}
+	parsed, err := mail.ParseAddress(address)
+	if err != nil || parsed.Name != "" || parsed.Address != address || strings.ContainsAny(address, "\r\n") {
+		return fmt.Errorf("%s must be one plain email address", field)
+	}
+	parts := strings.Split(address, "@")
+	if len(parts) != 2 || !strings.EqualFold(parts[1], domain) {
+		return fmt.Errorf("%s must use server.domain", field)
+	}
+	return nil
 }
 
 type SMTPConfig struct {
@@ -189,11 +227,12 @@ type MailConfig struct {
 }
 
 type DeliveryConfig struct {
-	QueueWorkers   int    `json:"queue_workers"`
-	RetryIntervals []int  `json:"retry_intervals"`
-	MaxRetries     int    `json:"max_retries"`
-	Network        string `json:"network"`     // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
-	EnableVERP     *bool  `json:"enable_verp"` // Enable per-recipient bounce tracking (default true)
+	QueueWorkers         int    `json:"queue_workers"`
+	RetryIntervals       []int  `json:"retry_intervals"`
+	MaxRetries           int    `json:"max_retries"`
+	DSNDelayAfterSeconds int    `json:"dsn_delay_after_seconds"`
+	Network              string `json:"network"`     // "tcp", "tcp4", "tcp6" - default "tcp" (both IPv4 and IPv6)
+	EnableVERP           *bool  `json:"enable_verp"` // Enable per-recipient bounce tracking (default true)
 }
 
 // IsVERPEnabled returns whether VERP (Variable Envelope Return Path) is enabled (defaults to true).
@@ -232,9 +271,38 @@ type DMARCConfig struct {
 	SendReports bool `json:"send_reports"` // Enable/disable DMARC report sending (default: false)
 }
 
+type TLSRPTConfig struct {
+	SendReports bool `json:"send_reports"`
+}
+
 type LoggingConfig struct {
 	Level  string `json:"level"`
 	Format string `json:"format"`
+}
+
+// MetricsConfig controls the dedicated Prometheus-compatible operational
+// endpoint. It is disabled by default and listens on loopback unless changed.
+type MetricsConfig struct {
+	Enabled     bool   `json:"enabled"`
+	ListenAddr  string `json:"listen_addr"`
+	BearerToken string `json:"bearer_token"`
+}
+
+// StoragePressureConfig protects all durable write paths from exhausting the
+// filesystem. Zero thresholds preserve the legacy disabled behavior.
+type StoragePressureConfig struct {
+	WarningFreeBytes int64 `json:"warning_free_bytes"`
+	MinimumFreeBytes int64 `json:"minimum_free_bytes"`
+}
+
+type OutboundLimitsConfig struct {
+	Enabled                 bool `json:"enabled"`
+	MessagesPerHour         int  `json:"messages_per_hour"`
+	MessagesPerDay          int  `json:"messages_per_day"`
+	RecipientsPerHour       int  `json:"recipients_per_hour"`
+	RecipientsPerDay        int  `json:"recipients_per_day"`
+	MaxRecipientsPerMessage int  `json:"max_recipients_per_message"`
+	SuspensionMinutes       int  `json:"suspension_minutes"`
 }
 
 // Load reads and parses config.json from the given path.
@@ -264,6 +332,12 @@ func (c *Config) Validate() error {
 	if c.Server.Hostname == "" {
 		return fmt.Errorf("server.hostname is required")
 	}
+	if err := validateOperationalSender("server.tls_report_sender", c.Server.TLSReportSender, c.Server.Domain); err != nil {
+		return err
+	}
+	if err := validateOperationalSender("server.dsn_sender", c.Server.DSNSender, c.Server.Domain); err != nil {
+		return err
+	}
 	if c.SMTP.ListenAddr == "" {
 		c.SMTP.ListenAddr = ":25"
 	}
@@ -281,6 +355,12 @@ func (c *Config) Validate() error {
 	}
 	if c.SMTP.MaxConnections <= 0 {
 		c.SMTP.MaxConnections = 100
+	}
+	if c.SMTP.RateLimit.ConnectionsPerMinute <= 0 {
+		c.SMTP.RateLimit.ConnectionsPerMinute = 60
+	}
+	if c.SMTP.RateLimit.MessagesPerMinute <= 0 {
+		c.SMTP.RateLimit.MessagesPerMinute = 30
 	}
 	if c.TLS.Mode == "" {
 		c.TLS.Mode = "autocert"
@@ -321,10 +401,13 @@ func (c *Config) Validate() error {
 		c.Delivery.QueueWorkers = 4
 	}
 	if c.Delivery.MaxRetries <= 0 {
-		c.Delivery.MaxRetries = 6
+		c.Delivery.MaxRetries = 11
 	}
 	if len(c.Delivery.RetryIntervals) == 0 {
-		c.Delivery.RetryIntervals = []int{60, 300, 900, 3600, 14400, 86400}
+		c.Delivery.RetryIntervals = []int{1800, 3600, 7200, 14400, 28800, 43200, 86400, 86400, 86400, 86400}
+	}
+	if c.Delivery.DSNDelayAfterSeconds <= 0 {
+		c.Delivery.DSNDelayAfterSeconds = 14400
 	}
 	if c.DNS.CacheTTL <= 0 {
 		c.DNS.CacheTTL = 300
@@ -344,8 +427,75 @@ func (c *Config) Validate() error {
 	if c.Clients.POP3.ListenAddr == "" {
 		c.Clients.POP3.ListenAddr = ":995"
 	}
+	if c.Clients.IMAP.ListenAddr == "" {
+		c.Clients.IMAP.ListenAddr = ":993"
+	}
+	if c.Clients.IMAP.Enabled == nil {
+		disabled := false
+		c.Clients.IMAP.Enabled = &disabled
+	}
 	if c.Clients.Submission.ListenAddr == "" {
 		c.Clients.Submission.ListenAddr = ":587"
+	}
+	if c.Metrics.ListenAddr == "" {
+		c.Metrics.ListenAddr = "127.0.0.1:9090"
+	}
+	if c.Metrics.Enabled {
+		host, _, err := net.SplitHostPort(c.Metrics.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("metrics.listen_addr must be host:port: %w", err)
+		}
+		ip := net.ParseIP(host)
+		loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		if !loopback && strings.TrimSpace(c.Metrics.BearerToken) == "" {
+			return fmt.Errorf("metrics.bearer_token is required for a non-loopback listener")
+		}
+	}
+	if c.StoragePressure.WarningFreeBytes < 0 || c.StoragePressure.MinimumFreeBytes < 0 {
+		return fmt.Errorf("storage_pressure thresholds cannot be negative")
+	}
+	if c.StoragePressure.WarningFreeBytes > 0 && c.StoragePressure.WarningFreeBytes < c.StoragePressure.MinimumFreeBytes {
+		return fmt.Errorf("storage_pressure.warning_free_bytes must be at least minimum_free_bytes")
+	}
+	if c.OutboundLimits.MessagesPerHour <= 0 {
+		c.OutboundLimits.MessagesPerHour = 100
+	}
+	if c.OutboundLimits.MessagesPerDay <= 0 {
+		c.OutboundLimits.MessagesPerDay = 500
+	}
+	if c.OutboundLimits.RecipientsPerHour <= 0 {
+		c.OutboundLimits.RecipientsPerHour = 250
+	}
+	if c.OutboundLimits.RecipientsPerDay <= 0 {
+		c.OutboundLimits.RecipientsPerDay = 1000
+	}
+	if c.OutboundLimits.MaxRecipientsPerMessage <= 0 {
+		c.OutboundLimits.MaxRecipientsPerMessage = 100
+	}
+	if c.OutboundLimits.SuspensionMinutes <= 0 {
+		c.OutboundLimits.SuspensionMinutes = 60
+	}
+	if c.OutboundLimits.Enabled {
+		if c.OutboundLimits.MessagesPerDay < c.OutboundLimits.MessagesPerHour || c.OutboundLimits.RecipientsPerDay < c.OutboundLimits.RecipientsPerHour {
+			return fmt.Errorf("outbound_limits daily limits must be at least hourly limits")
+		}
+		if c.OutboundLimits.MaxRecipientsPerMessage > c.SMTP.MaxRecipients {
+			return fmt.Errorf("outbound_limits.max_recipients_per_message cannot exceed smtp.max_recipients")
+		}
+	}
+	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
+	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	if c.Logging.Level != "debug" && c.Logging.Level != "info" && c.Logging.Level != "warn" && c.Logging.Level != "error" {
+		return fmt.Errorf("logging.level must be 'debug', 'info', 'warn', or 'error'")
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = "text"
+	}
+	if c.Logging.Format != "text" && c.Logging.Format != "json" {
+		return fmt.Errorf("logging.format must be 'text' or 'json'")
 	}
 	if c.Clients.Enabled && c.TLS.Mode == "none" {
 		return fmt.Errorf("mail_clients requires TLS; tls.mode cannot be 'none'")

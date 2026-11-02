@@ -1,6 +1,6 @@
 # GoMail standards and interoperability status
 
-**Updated:** 2026-09-22
+**Updated:** 2026-09-24
 **Meaning of this document:** implementation status based on current source and
 repository tests. It is not an external certification or a claim that every RFC
 test vector and provider combination has passed.
@@ -24,8 +24,8 @@ test vector and provider combination has passed.
 | SMTPUTF8 (RFC 6531) | Implemented and tested | Correctly attached to MAIL FROM, not RCPT TO; peer support required outbound |
 | CHUNKING/BDAT (RFC 3030) | Implemented and tested | Size/overflow and LAST behavior covered; broad client interop remains |
 | PIPELINING (RFC 2920) | Implemented by sequential command loop | Advertised; no parallel command execution is required by the extension |
-| DSN extension (RFC 3461) | Partial | Parameters and failure-report path exist; exact syntax/provider interop remains |
-| Enhanced status codes (RFC 3463) | Partial, not advertised | Responses are not consistently enhanced-status formatted |
+| DSN extension (RFC 3461) | Implemented and tested | Advertised; failure/success and one-shot delayed reports, RET, xtext ENVID/ORCPT, null reverse paths and outbound requests are covered |
+| Enhanced status codes (RFC 3463) | Implemented and tested | Consistent transactional replies; ENHANCEDSTATUSCODES is advertised |
 | SMTP dot transparency | Implemented and tested | Outbound DATA normalizes line endings and dot-stuffs exactly once |
 
 ## Mail authentication
@@ -36,7 +36,7 @@ test vector and provider combination has passed.
 | DKIM (RFC 6376/8463) | Implemented and tested | RSA/Ed25519 signing, DNS key parsing, expiration, required tags and multiple signatures; any passing valid signature can supply identity |
 | DMARC | Implemented and tested | PSL organizational domains, strict/relaxed alignment, p/sp/pct and discovery/error classes |
 | Authentication-Results (RFC 8601) | Implemented and tested | Correct header field, actual DKIM identity and injection-safe properties |
-| ARC (RFC 8617) | Partial | Structural and cryptographic code exists, but full multi-hop sealing/validation and external vectors are incomplete |
+| ARC (RFC 8617) | Implemented, coverage incomplete | Cumulative multi-hop sealing/validation and cv semantics have deterministic tests; selected published draft-suite vectors pass, but live intermediaries and final-RFC vector breadth remain |
 
 Ordinary locally originated mail is DKIM-signed but is not ARC-sealed. ARC is for
 an intermediary that preserves prior authentication results while forwarding or
@@ -47,7 +47,7 @@ it also embedded unsupported hard-coded pass results.
 
 | Area | Status | Notes |
 |---|---|---|
-| MTA-STS (RFC 8461) | Implemented and tested | TXT discovery required, policy parser validates required/duplicate fields, enforce/testing/none and one-label MX wildcard matching |
+| MTA-STS (RFC 8461) | Implemented and tested | TXT discovery required, policy parser validates required/duplicate fields, enforce/testing/none and one-label MX wildcard matching; a valid cached policy survives replacement-fetch failure |
 | DANE/TLSA (RFC 6698/7672) | Implemented and tested | Requires DNSSEC-authenticated data; Usage 0/1/2/3, Selector 0/1 and Matching 0/1/2, malformed records and chain handling covered |
 | DANE fallback | Explicit policy | `disabled`: PKIX only; `optional`: authenticated TLSA is checked and failure may fall back to PKIX; `required`: missing/invalid/mismatched authenticated TLSA fails delivery |
 | DNSSEC trust | Resolver boundary documented | Built-in defaults use authenticated DNS-over-TLS resolvers; custom plain DNS is only appropriate on a trusted path |
@@ -60,11 +60,11 @@ DANE verification behavior and its trust boundary are documented in
 
 | Area | Status | Notes |
 |---|---|---|
-| RFC 5322/MIME parsing | Partial | Common multipart/text/HTML/attachments work; charset conversion, RFC 2231 filenames and multipart related/alternative edge cases need tests |
+| RFC 5322/MIME parsing | Implemented, coverage incomplete | Charset conversion, RFC 2231 filenames, nested alternatives and related inline resources have deterministic tests; broad corpus testing remains |
 | HTML email safety | Implemented and tested | Allowlist sanitizer plus sandboxed iframe isolation; remote resources still have privacy implications |
 | MDN | Implemented, coverage incomplete | Manual/automatic paths exist |
-| DSN generation | Partial | Failure generation exists; external interoperability coverage remains |
-| DMARC aggregate reporting | Partial | Policy fields and external rua authorization are handled; complete auth_results population and interoperability tests remain |
+| DSN generation | Implemented, coverage incomplete | RFC 3464 failure/success/delay reports and RET/ENVID/ORCPT behavior are tested; live interoperability remains |
+| DMARC aggregate reporting | Implemented, coverage incomplete | Authentication identities, exact outcome grouping and external rua authorization are tested; live interoperability remains |
 
 ## Mailbox and clients
 
@@ -74,8 +74,8 @@ DANE verification behavior and its trust boundary are documented in
 | Drafts | Implemented and tested | Create, resume, update, autosave and remove after successful send |
 | POP3 | Implemented and tested | Optional implicit TLS on 995; USER/PASS, CAPA, STAT, LIST, UIDL, RETR, TOP, DELE, RSET, NOOP, QUIT; Inbox only |
 | SMTP submission | Implemented and tested at component level | Optional port 587, mandatory STARTTLS before AUTH PLAIN/LOGIN, sender identity restriction, Bcc removal and queue integration |
-| IMAP | Not implemented | No folder/flag/UID synchronization protocol |
-| Autoconfiguration | Not implemented | Clients must be configured manually |
+| IMAP | Implemented, live compatibility pending | Durable UIDs/mod-sequences, folders, flags, MIME sections, IDLE, UIDPLUS, MOVE, CONDSTORE and QRESYNC; disabled by default |
+| Autoconfiguration | Implemented, live compatibility pending | Thunderbird and Outlook XML endpoints advertise only enabled, TLS-backed services |
 
 POP3 and submission are gated by `mail_clients.enabled`, which defaults to
 `false`. TLS is mandatory, authentication is rate limited per IP, and POP3
@@ -96,19 +96,16 @@ remain to be run.
 - SQLite/MySQL additive schema synchronization and migration tracking.
 
 Operational monitoring, encrypted off-host backup, and restore drills are
-operator responsibilities. Repository documentation describes the procedure;
-the server does not contain a scheduler that performs backups automatically.
+operator responsibilities. The server supports scheduled local verified backups,
+but operators must copy archives to encrypted off-host storage and test restores.
 
 ## Required remaining verification
 
-1. Full ARC multi-hop construction and external RFC vectors.
-2. Exact SPF DNS term/subquery accounting, especially MX and PTR error cases.
-3. TLS-RPT success/failure event model and policy grouping.
-4. MIME charset, RFC 2231 and multipart semantic fixtures.
-5. DSN/enhanced-status interoperability.
-6. DMARC aggregate auth_results completeness and external-reporting tests.
-7. Live SMTP, POP3 and submission matrices against common servers and clients.
-8. Browser interaction and accessibility automation.
+1. Broader final-RFC ARC vectors and live intermediary tests. Selected vectors
+   from the archived ValiMail draft suite are covered locally.
+2. Live DSN and SMTP interoperability against common providers.
+3. Live POP3 and submission matrices against common clients.
+4. Browser interaction and accessibility automation.
 
 Do not replace these items with blanket “fully RFC compliant” claims until the
 corresponding tests and interoperability evidence exist.

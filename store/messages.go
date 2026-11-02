@@ -1,8 +1,13 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gomail/logging"
@@ -12,6 +17,9 @@ import (
 
 // CreateDomain adds a new domain.
 func (db *DB) CreateDomain(d *Domain) (int64, error) {
+	if err := ValidateMailDomain(d.Domain); err != nil {
+		return 0, err
+	}
 	result, err := db.Exec(`
 		INSERT INTO domains (domain, is_active, dkim_selector, dkim_algorithm, dkim_private_key, dkim_public_key, require_tls, dane_enforcement, greylisting_enabled, greylisting_delay_minutes, tarpitting_enabled, tarpitting_max_delay_seconds)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -100,6 +108,16 @@ func (db *DB) ListDomains() ([]*Domain, error) {
 
 // UpdateDomain updates a domain.
 func (db *DB) UpdateDomain(d *Domain) error {
+	if err := ValidateMailDomain(d.Domain); err != nil {
+		return err
+	}
+	var existingName string
+	if err := db.QueryRow(`SELECT domain FROM domains WHERE id = ?`, d.ID).Scan(&existingName); err != nil {
+		return fmt.Errorf("loading domain name before update: %w", err)
+	}
+	if d.Domain != existingName {
+		return fmt.Errorf("domain name cannot be changed after creation")
+	}
 	_, err := db.Exec(`
 		UPDATE domains SET domain = ?, is_active = ?, dkim_selector = ?, dkim_algorithm = ?,
 		dkim_private_key = ?, dkim_public_key = ?, require_tls = ?, dane_enforcement = ?, greylisting_enabled = ?, greylisting_delay_minutes = ?, tarpitting_enabled = ?, tarpitting_max_delay_seconds = ? WHERE id = ?`,
@@ -111,8 +129,7 @@ func (db *DB) UpdateDomain(d *Domain) error {
 
 // DeleteDomain removes a domain and its accounts (cascade).
 func (db *DB) DeleteDomain(id int64) error {
-	_, err := db.Exec(`DELETE FROM domains WHERE id = ?`, id)
-	return err
+	return db.deleteOwnerWithAttachments(`SELECT a.storage_path FROM attachments a JOIN messages m ON m.id=a.message_id JOIN accounts u ON u.id=m.account_id WHERE u.domain_id=?`, `DELETE FROM domains WHERE id=?`, id)
 }
 
 // ListAllDomainNames returns just active domain names for SMTP routing.
@@ -144,8 +161,9 @@ func (db *DB) CountDomainAccounts(domainID int64) (int, error) {
 func (db *DB) GetDomainsWithFeedback() ([]*Domain, error) {
 	// Get all unique domains from DMARC feedback (these are sender domains with DMARC records)
 	rows, err := db.Query(`
-		SELECT DISTINCT domain
+		SELECT DISTINCT COALESCE(NULLIF(policy_domain, ''), domain)
 		FROM dmarc_feedback
+		WHERE sent_at IS NULL
 		ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("listing domains with feedback: %w", err)
@@ -171,11 +189,23 @@ func (db *DB) GetDomainsWithFeedback() ([]*Domain, error) {
 
 // CreateAccount adds a new user account.
 func (db *DB) CreateAccount(a *Account) (int64, error) {
-	result, err := db.Exec(`
-		INSERT INTO accounts (domain_id, email, display_name, password_hash, is_admin, is_active, quota_bytes)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	var aliasCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM aliases WHERE address=?`, strings.ToLower(a.Email)).Scan(&aliasCount); err != nil {
+		return 0, err
+	}
+	if aliasCount != 0 {
+		return 0, fmt.Errorf("an alias already uses this address")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("beginning account creation: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`
+		INSERT INTO accounts (domain_id, email, display_name, password_hash, is_admin, is_active, allow_aliases, quota_bytes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.DomainID, a.Email, a.DisplayName, a.PasswordHash,
-		boolToInt(a.IsAdmin), boolToInt(a.IsActive), a.QuotaBytes,
+		boolToInt(a.IsAdmin), boolToInt(a.IsActive), boolToInt(a.AllowAliases), a.QuotaBytes,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("creating account: %w", err)
@@ -183,29 +213,29 @@ func (db *DB) CreateAccount(a *Account) (int64, error) {
 
 	accountID, err := result.LastInsertId()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("reading new account ID: %w", err)
 	}
 
-	// Create default folders for the account
-	if err := db.DefaultFolders(accountID); err != nil {
-		// Log error but don't fail account creation
-		fmt.Printf("[warn] failed to create default folders for account %d: %v\n", accountID, err)
+	if err := db.defaultFolders(tx, accountID); err != nil {
+		return 0, fmt.Errorf("provisioning account folders: %w", err)
 	}
-
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing account creation: %w", err)
+	}
 	return accountID, nil
 }
 
 // GetAccount returns an account by ID.
 func (db *DB) GetAccount(id int64) (*Account, error) {
 	a := &Account{}
-	var isAdmin, isActive int
+	var isAdmin, isActive, allowAliases int
 	err := db.QueryRow(`
 		SELECT a.id, a.domain_id, a.email, a.display_name, a.password_hash,
-			a.is_admin, a.is_active, a.quota_bytes, a.created_at, d.domain
+			a.is_admin, a.is_active, a.allow_aliases, a.quota_bytes, a.mailbox_used_bytes, a.created_at, d.domain
 		FROM accounts a JOIN domains d ON a.domain_id = d.id
 		WHERE a.id = ?`, id).Scan(
 		&a.ID, &a.DomainID, &a.Email, &a.DisplayName, &a.PasswordHash,
-		&isAdmin, &isActive, &a.QuotaBytes, &a.CreatedAt, &a.DomainName,
+		&isAdmin, &isActive, &allowAliases, &a.QuotaBytes, &a.MailboxUsedBytes, &a.CreatedAt, &a.DomainName,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -215,20 +245,21 @@ func (db *DB) GetAccount(id int64) (*Account, error) {
 	}
 	a.IsAdmin = isAdmin == 1
 	a.IsActive = isActive == 1
+	a.AllowAliases = allowAliases == 1
 	return a, nil
 }
 
 // GetAccountByEmail returns an account by email address.
 func (db *DB) GetAccountByEmail(email string) (*Account, error) {
 	a := &Account{}
-	var isAdmin, isActive int
+	var isAdmin, isActive, allowAliases int
 	err := db.QueryRow(`
 		SELECT a.id, a.domain_id, a.email, a.display_name, a.password_hash,
-			a.is_admin, a.is_active, a.quota_bytes, a.created_at, d.domain
+			a.is_admin, a.is_active, a.allow_aliases, a.quota_bytes, a.mailbox_used_bytes, a.created_at, d.domain
 		FROM accounts a JOIN domains d ON a.domain_id = d.id
 		WHERE a.email = ? AND a.is_active = 1 AND d.is_active = 1`, email).Scan(
 		&a.ID, &a.DomainID, &a.Email, &a.DisplayName, &a.PasswordHash,
-		&isAdmin, &isActive, &a.QuotaBytes, &a.CreatedAt, &a.DomainName,
+		&isAdmin, &isActive, &allowAliases, &a.QuotaBytes, &a.MailboxUsedBytes, &a.CreatedAt, &a.DomainName,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -238,6 +269,7 @@ func (db *DB) GetAccountByEmail(email string) (*Account, error) {
 	}
 	a.IsAdmin = isAdmin == 1
 	a.IsActive = isActive == 1
+	a.AllowAliases = allowAliases == 1
 	return a, nil
 }
 
@@ -247,12 +279,12 @@ func (db *DB) ListAccounts(domainID int64) ([]*Account, error) {
 	var err error
 	if domainID > 0 {
 		rows, err = db.Query(`
-			SELECT a.id, a.domain_id, a.email, a.display_name, a.is_admin, a.is_active, a.quota_bytes, a.created_at, d.domain
+			SELECT a.id, a.domain_id, a.email, a.display_name, a.is_admin, a.is_active, a.allow_aliases, a.quota_bytes, a.mailbox_used_bytes, a.created_at, d.domain
 			FROM accounts a JOIN domains d ON a.domain_id = d.id
 			WHERE a.domain_id = ? ORDER BY a.email`, domainID)
 	} else {
 		rows, err = db.Query(`
-			SELECT a.id, a.domain_id, a.email, a.display_name, a.is_admin, a.is_active, a.quota_bytes, a.created_at, d.domain
+			SELECT a.id, a.domain_id, a.email, a.display_name, a.is_admin, a.is_active, a.allow_aliases, a.quota_bytes, a.mailbox_used_bytes, a.created_at, d.domain
 			FROM accounts a JOIN domains d ON a.domain_id = d.id
 			ORDER BY a.email`)
 	}
@@ -264,13 +296,14 @@ func (db *DB) ListAccounts(domainID int64) ([]*Account, error) {
 	var accounts []*Account
 	for rows.Next() {
 		a := &Account{}
-		var isAdmin, isActive int
+		var isAdmin, isActive, allowAliases int
 		if err := rows.Scan(&a.ID, &a.DomainID, &a.Email, &a.DisplayName,
-			&isAdmin, &isActive, &a.QuotaBytes, &a.CreatedAt, &a.DomainName); err != nil {
+			&isAdmin, &isActive, &allowAliases, &a.QuotaBytes, &a.MailboxUsedBytes, &a.CreatedAt, &a.DomainName); err != nil {
 			return nil, fmt.Errorf("scanning account row: %w", err)
 		}
 		a.IsAdmin = isAdmin == 1
 		a.IsActive = isActive == 1
+		a.AllowAliases = allowAliases == 1
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
@@ -278,19 +311,84 @@ func (db *DB) ListAccounts(domainID int64) ([]*Account, error) {
 
 // UpdateAccount updates an account (does not change password).
 func (db *DB) UpdateAccount(a *Account) error {
-	_, err := db.Exec(`
+	return db.UpdateAccountWithPassword(a, "")
+}
+
+// UpdateAccountWithPassword atomically updates account metadata and, when
+// supplied, its password hash. Admin edits cannot commit only half the form.
+func (db *DB) UpdateAccountWithPassword(a *Account, passwordHash string) error {
+	var aliasCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM aliases WHERE address=?`, strings.ToLower(a.Email)).Scan(&aliasCount); err != nil {
+		return err
+	}
+	if aliasCount != 0 {
+		return fmt.Errorf("an alias already uses this address")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var previousEmail string
+	var previousDomainID int64
+	if err := tx.QueryRow(`SELECT domain_id FROM accounts WHERE id = ?`, a.ID).Scan(&previousDomainID); err != nil {
+		return err
+	}
+	if passwordHash != "" {
+		if err := tx.QueryRow(`SELECT email FROM accounts WHERE id = ?`, a.ID).Scan(&previousEmail); err != nil {
+			return err
+		}
+	}
+	result, err := tx.Exec(`
 		UPDATE accounts SET domain_id = ?, email = ?, display_name = ?,
-		is_admin = ?, is_active = ?, quota_bytes = ? WHERE id = ?`,
+		is_admin = ?, is_active = ?, allow_aliases = ?, quota_bytes = ? WHERE id = ?`,
 		a.DomainID, a.Email, a.DisplayName, boolToInt(a.IsAdmin),
-		boolToInt(a.IsActive), a.QuotaBytes, a.ID,
+		boolToInt(a.IsActive), boolToInt(a.AllowAliases), a.QuotaBytes, a.ID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return sql.ErrNoRows
+	}
+	if !a.AllowAliases || previousDomainID != a.DomainID {
+		if _, err := tx.Exec(`DELETE FROM aliases WHERE owner_account_id=?`, a.ID); err != nil {
+			return err
+		}
+	}
+	if passwordHash != "" {
+		if _, err := tx.Exec(`UPDATE accounts SET password_hash = ? WHERE id = ?`, passwordHash, a.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM sessions WHERE data = ?`, previousEmail); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // UpdateAccountPassword updates just the password hash.
 func (db *DB) UpdateAccountPassword(id int64, hash string) error {
-	_, err := db.Exec(`UPDATE accounts SET password_hash = ? WHERE id = ?`, hash, id)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE accounts SET password_hash = ? WHERE id = ? AND is_active = 1`, hash, id)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE data = (SELECT email FROM accounts WHERE id = ?)`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateAccountProfile updates fields a mailbox owner may change themselves.
@@ -307,8 +405,55 @@ func (db *DB) UpdateAccountProfile(id int64, displayName string) error {
 
 // DeleteAccount removes an account.
 func (db *DB) DeleteAccount(id int64) error {
-	_, err := db.Exec(`DELETE FROM accounts WHERE id = ?`, id)
-	return err
+	return db.deleteOwnerWithAttachments(`SELECT a.storage_path FROM attachments a JOIN messages m ON m.id=a.message_id WHERE m.account_id=?`, `DELETE FROM accounts WHERE id=?`, id)
+}
+
+func (db *DB) deleteOwnerWithAttachments(pathQuery, deleteQuery string, id int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(pathQuery, id)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			rows.Close()
+			return err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	result, err := tx.Exec(deleteQuery, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if fullPath, ok := db.safeAttachmentPath(path); ok {
+			_ = os.Remove(fullPath)
+		}
+	}
+	return nil
 }
 
 // CountAccounts returns the total number of accounts.
@@ -323,9 +468,139 @@ func (db *DB) CountAccounts() (int, error) {
 // SaveMessage inserts a new message into the database.
 type sqlExecutor interface {
 	Exec(string, ...interface{}) (sql.Result, error)
+	QueryRow(string, ...interface{}) *sql.Row
 }
 
-func (db *DB) SaveMessage(m *Message) (int64, error) { return saveMessage(db, m) }
+func (db *DB) SaveMessage(m *Message) (int64, error) {
+	ids, err := db.SaveMessages([]*Message{m})
+	if err != nil {
+		return 0, err
+	}
+	return ids[0], nil
+}
+
+// SaveMessages atomically reserves quota and stores every message. It is used
+// for one SMTP transaction with multiple local recipients so quota failure can
+// never leave only a subset delivered.
+func (db *DB) SaveMessages(messages []*Message) ([]int64, error) {
+	return db.SaveMessagesWithQueue(messages, nil)
+}
+
+// SaveMessagesWithQueue commits local delivery and its system-generated
+// reports together, so a successful SMTP acknowledgement never loses a
+// requested delivery notification.
+func (db *DB) SaveMessagesWithQueue(messages []*Message, entries []*QueueEntry) ([]int64, error) {
+	return db.SaveMessagesWithQueueAndAttachments(messages, entries, nil)
+}
+
+// SaveMessagesWithQueueAndAttachments commits local delivery, decoded
+// attachment metadata, and required reports together. Attachment files are
+// removed if any part of the transaction fails.
+func (db *DB) SaveMessagesWithQueueAndAttachments(messages []*Message, entries []*QueueEntry, attachments [][]IMAPAppendAttachment) (ids []int64, err error) {
+	return db.SaveInboundDelivery(messages, entries, attachments, nil)
+}
+
+// SaveInboundDelivery atomically commits mailbox copies, required reports,
+// decoded attachments and verified VERP bounce records.
+func (db *DB) SaveInboundDelivery(messages []*Message, entries []*QueueEntry, attachments [][]IMAPAppendAttachment, bounces []InboundVERPBounce) (ids []int64, err error) {
+	if attachments != nil && len(attachments) != len(messages) {
+		return nil, fmt.Errorf("attachment batch does not match messages")
+	}
+	if len(messages) == 0 {
+		if len(entries) == 0 && len(bounces) == 0 {
+			return nil, nil
+		}
+		if len(entries) != 0 {
+			return nil, fmt.Errorf("cannot queue delivery reports without messages")
+		}
+	}
+	var required int64
+	for _, message := range messages {
+		prepareMessageSize(message)
+		required += message.Size
+	}
+	for _, entry := range entries {
+		required += int64(len(entry.RawMessage))
+	}
+	for _, batch := range attachments {
+		for _, attachment := range batch {
+			required += int64(len(attachment.Data))
+		}
+	}
+	if err := db.EnsureDiskSpace(required); err != nil {
+		return nil, err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var written []string
+	defer func() {
+		if err != nil {
+			for _, path := range written {
+				_ = os.Remove(path)
+			}
+		}
+	}()
+	for _, message := range messages {
+		if err := reserveMailboxBytes(tx, message.AccountID, message.Size); err != nil {
+			return nil, err
+		}
+	}
+	ids = make([]int64, len(messages))
+	for index, message := range messages {
+		ids[index], err = saveMessage(tx, message)
+		if err != nil {
+			return nil, err
+		}
+		if err = db.addIMAPMessageState(tx, ids[index], message); err != nil {
+			return nil, err
+		}
+		if attachments != nil {
+			for attachmentIndex, attachment := range attachments[index] {
+				extension := filepath.Ext(attachment.Filename)
+				if !validIMAPAttachmentExtension(extension) {
+					extension = ".bin"
+				}
+				digest := sha256.Sum256(attachment.Data)
+				name := fmt.Sprintf("%d_inbound_%d_%x%s", ids[index], attachmentIndex, digest[:8], extension)
+				fullPath, safe := db.safeAttachmentPath(name)
+				if !safe {
+					return nil, fmt.Errorf("unsafe inbound attachment path")
+				}
+				if err = WriteAttachmentFile(fullPath, attachment.Data); err != nil {
+					return nil, fmt.Errorf("writing inbound attachment: %w", err)
+				}
+				written = append(written, fullPath)
+				if _, err = saveAttachmentRecord(tx, &Attachment{MessageID: ids[index], Filename: attachment.Filename, ContentType: attachment.ContentType, Size: int64(len(attachment.Data)), StoragePath: name}); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	for _, entry := range entries {
+		if _, err := enqueueMessage(tx, entry); err != nil {
+			return nil, err
+		}
+	}
+	for _, bounce := range bounces {
+		if _, err = tx.Exec(`INSERT INTO verp_bounces (original_recipient, sender_email, bounce_address, bounce_type, bounce_code, bounce_reason) VALUES (?, ?, ?, ?, ?, ?)`, bounce.OriginalRecipient, bounce.SenderEmail, bounce.BounceAddress, bounce.BounceType, bounce.BounceCode, bounce.BounceReason); err != nil {
+			return nil, fmt.Errorf("recording VERP bounce: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	accounts := make(map[int64]bool)
+	for _, message := range messages {
+		accounts[message.AccountID] = true
+	}
+	for accountID := range accounts {
+		db.NotifyIMAPChanges(accountID)
+	}
+	return ids, nil
+}
 
 func saveMessage(exec sqlExecutor, m *Message) (int64, error) {
 	result, err := exec.Exec(`
@@ -378,41 +653,6 @@ func (db *DB) GetMessage(id, accountID int64) (*Message, error) {
 	return m, nil
 }
 
-// ListMessages returns messages for the given direction, scoped to an account.
-func (db *DB) ListMessages(accountID int64, direction string, limit, offset int) ([]*Message, error) {
-	rows, err := db.Query(`
-		SELECT id, account_id, message_id, direction, mail_from, rcpt_to, from_addr, to_addr,
-			subject, size, has_attachments, is_read, is_starred,
-			spf_result, dkim_result, dmarc_result, received_at
-		FROM messages
-		WHERE account_id = ? AND direction = ? AND is_deleted = 0
-		ORDER BY received_at DESC
-		LIMIT ? OFFSET ?`, accountID, direction, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("listing messages: %w", err)
-	}
-	defer rows.Close()
-
-	var messages []*Message
-	for rows.Next() {
-		m := &Message{}
-		var hasAttach, isRead, isStarred int
-		if err := rows.Scan(
-			&m.ID, &m.AccountID, &m.MessageID, &m.Direction, &m.MailFrom, &m.RcptTo,
-			&m.FromAddr, &m.ToAddr, &m.Subject, &m.Size,
-			&hasAttach, &isRead, &isStarred,
-			&m.SPFResult, &m.DKIMResult, &m.DMARCResult, &m.ReceivedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scanning message row: %w", err)
-		}
-		m.HasAttachments = hasAttach == 1
-		m.IsRead = isRead == 1
-		m.IsStarred = isStarred == 1
-		messages = append(messages, m)
-	}
-	return messages, rows.Err()
-}
-
 // CountMessages returns the count of non-deleted messages for a direction, scoped to account.
 func (db *DB) CountMessages(accountID int64, direction string) (int, error) {
 	var count int
@@ -433,13 +673,47 @@ func (db *DB) CountUnread(accountID int64) (int, error) {
 
 // MarkRead marks a message as read.
 func (db *DB) MarkRead(id int64) error {
-	_, err := db.Exec(`UPDATE messages SET is_read = 1 WHERE id = ?`, id)
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var accountID int64
+	if err = tx.QueryRow(`SELECT account_id FROM messages WHERE id=?`, id).Scan(&accountID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE messages SET is_read = 1 WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err = db.touchIMAPMessageState(tx, id); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err == nil {
+		db.NotifyIMAPChanges(accountID)
+	}
 	return err
 }
 
 // MarkStarred toggles the starred status.
 func (db *DB) MarkStarred(id int64, starred bool) error {
-	_, err := db.Exec(`UPDATE messages SET is_starred = ? WHERE id = ?`, boolToInt(starred), id)
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var accountID int64
+	if err = tx.QueryRow(`SELECT account_id FROM messages WHERE id=?`, id).Scan(&accountID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE messages SET is_starred = ? WHERE id = ?`, boolToInt(starred), id); err != nil {
+		return err
+	}
+	if err = db.touchIMAPMessageState(tx, id); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err == nil {
+		db.NotifyIMAPChanges(accountID)
+	}
 	return err
 }
 
@@ -451,40 +725,37 @@ func (db *DB) MarkMDNSent(id int64) error {
 
 // DeleteMessage soft-deletes a message by moving it to trash folder.
 func (db *DB) DeleteMessage(id int64) error {
-	// First, get the message to find the account
-	m := &Message{}
-	err := db.QueryRow(`SELECT account_id, folder_id FROM messages WHERE id = ?`, id).Scan(&m.AccountID, &m.FolderID)
+	tx, err := db.Begin()
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var accountID, sourceFolderID, trashFolderID int64
+	if err := tx.QueryRow(`SELECT account_id, folder_id FROM messages WHERE id=?`, id).Scan(&accountID, &sourceFolderID); err != nil {
 		return fmt.Errorf("getting message for delete: %w", err)
 	}
-
-	// Get trash folder for this account
-	trashFolder, err := db.GetFolderByType(m.AccountID, "trash")
-	if err != nil {
+	if err := tx.QueryRow(`SELECT id FROM folders WHERE account_id=? AND folder_type='trash'`, accountID).Scan(&trashFolderID); err != nil {
 		return fmt.Errorf("getting trash folder: %w", err)
 	}
-	if trashFolder == nil {
-		return fmt.Errorf("trash folder not found for account %d", m.AccountID)
+	if sourceFolderID != trashFolderID {
+		result, err := tx.Exec(`UPDATE messages SET folder_id=?, is_deleted=1 WHERE id=? AND account_id=?`, trashFolderID, id, accountID)
+		if err != nil {
+			return fmt.Errorf("deleting message: %w", err)
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return sql.ErrNoRows
+		}
+		if err := db.moveIMAPMessageState(tx, id, trashFolderID); err != nil {
+			return fmt.Errorf("moving IMAP message state: %w", err)
+		}
 	}
-
-	// Update counts for old folder if it exists
-	if m.FolderID != nil {
-		db.UpdateFolderCounts(*m.FolderID)
+	if err := updateAccountFolderCounts(tx, accountID); err != nil {
+		return err
 	}
-
-	// Move message to trash and mark as deleted
-	_, err = db.Exec(`
-		UPDATE messages 
-		SET folder_id = ?, is_deleted = 1 
-		WHERE id = ?
-	`, trashFolder.ID, id)
-	if err != nil {
-		return fmt.Errorf("deleting message: %w", err)
+	if err := tx.Commit(); err != nil {
+		return err
 	}
-
-	// Update trash folder counts
-	db.UpdateFolderCounts(trashFolder.ID)
-
+	db.NotifyIMAPChanges(accountID)
 	return nil
 }
 
@@ -492,7 +763,30 @@ func (db *DB) DeleteMessage(id int64) error {
 
 // SaveAttachment inserts an attachment record.
 func (db *DB) SaveAttachment(a *Attachment) (int64, error) {
-	result, err := db.Exec(`
+	return saveAttachmentRecord(db, a)
+}
+
+// SaveAttachments stores an attachment batch atomically so a metadata failure
+// cannot leave only part of a message's attachment list visible.
+func (db *DB) SaveAttachments(attachments []*Attachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, attachment := range attachments {
+		if _, err := saveAttachmentRecord(tx, attachment); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func saveAttachmentRecord(exec sqlExecutor, a *Attachment) (int64, error) {
+	result, err := exec.Exec(`
 		INSERT INTO attachments (message_id, filename, content_type, size, storage_path)
 		VALUES (?, ?, ?, ?, ?)`,
 		a.MessageID, a.Filename, a.ContentType, a.Size, a.StoragePath,
@@ -501,6 +795,11 @@ func (db *DB) SaveAttachment(a *Attachment) (int64, error) {
 		return 0, fmt.Errorf("saving attachment: %w", err)
 	}
 	return result.LastInsertId()
+}
+
+func (db *DB) SetMessageHasAttachments(messageID int64, hasAttachments bool) error {
+	_, err := db.Exec(`UPDATE messages SET has_attachments = ? WHERE id = ?`, boolToInt(hasAttachments), messageID)
+	return err
 }
 
 // GetAttachments returns all attachments for a message.
@@ -560,9 +859,9 @@ func (db *DB) EnqueueMessage(q *QueueEntry) (int64, error) { return enqueueMessa
 
 func enqueueMessage(exec sqlExecutor, q *QueueEntry) (int64, error) {
 	result, err := exec.Exec(`
-		INSERT INTO outbound_queue (message_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid, verp_bounce_address, original_recipient)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		q.MessageID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, databaseTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
+		INSERT INTO outbound_queue (message_id, origin_account_id, mail_from, rcpt_to, raw_message, max_attempts, next_retry, dsn_notify, dsn_ret, dsn_envid, verp_bounce_address, original_recipient)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		q.MessageID, q.OriginAccountID, q.MailFrom, q.RcptTo, q.RawMessage, q.MaxAttempts, databaseTime(q.NextRetry), q.DSNNotify, q.DSNRet, q.DSNEnvID, q.VERPBounceAddress, q.OriginalRecipient,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("enqueueing message: %w", err)
@@ -573,8 +872,8 @@ func enqueueMessage(exec sqlExecutor, q *QueueEntry) (int64, error) {
 // GetPendingQueue returns queue entries that are ready for delivery attempt.
 func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 	rows, err := db.Query(`
-		SELECT id, message_id, mail_from, rcpt_to, raw_message, attempts, max_attempts,
-			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, verp_bounce_address, original_recipient, created_at, updated_at
+		SELECT id, message_id, origin_account_id, mail_from, rcpt_to, raw_message, attempts, max_attempts,
+			next_retry, last_error, status, dsn_notify, dsn_ret, dsn_envid, dsn_sent, dsn_delay_sent, verp_bounce_address, original_recipient, created_at, updated_at
 		FROM outbound_queue
 		WHERE status = 'pending' AND next_retry <= CURRENT_TIMESTAMP
 		ORDER BY next_retry ASC
@@ -587,13 +886,14 @@ func (db *DB) GetPendingQueue(limit int) ([]*QueueEntry, error) {
 	var entries []*QueueEntry
 	for rows.Next() {
 		q := &QueueEntry{}
-		var dsnSent int
-		if err := rows.Scan(&q.ID, &q.MessageID, &q.MailFrom, &q.RcptTo,
+		var dsnSent, dsnDelaySent int
+		if err := rows.Scan(&q.ID, &q.MessageID, &q.OriginAccountID, &q.MailFrom, &q.RcptTo,
 			&q.RawMessage, &q.Attempts, &q.MaxAttempts, &q.NextRetry,
-			&q.LastError, &q.Status, &q.DSNNotify, &q.DSNRet, &q.DSNEnvID, &dsnSent, &q.VERPBounceAddress, &q.OriginalRecipient, &q.CreatedAt, &q.UpdatedAt); err != nil {
+			&q.LastError, &q.Status, &q.DSNNotify, &q.DSNRet, &q.DSNEnvID, &dsnSent, &dsnDelaySent, &q.VERPBounceAddress, &q.OriginalRecipient, &q.CreatedAt, &q.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scanning queue row: %w", err)
 		}
 		q.DSNSent = dsnSent != 0
+		q.DSNDelaySent = dsnDelaySent != 0
 		entries = append(entries, q)
 	}
 	return entries, rows.Err()
@@ -610,18 +910,84 @@ func (db *DB) UpdateQueueEntry(id int64, status string, attempts int, nextRetry 
 	return err
 }
 
-// RecoverStaleQueueEntries finds entries stuck in "sending" status for >30 minutes and resets them to "pending".
-// This handles the case where the worker process crashed mid-delivery.
+// TransitionQueueEntry performs a compare-and-set state transition. Requiring
+// the expected state prevents stale workers from overwriting a newer outcome.
+func (db *DB) TransitionQueueEntry(id int64, expectedStatus, status string, attempts int, nextRetry time.Time, lastError string) error {
+	result, err := db.Exec(`
+		UPDATE outbound_queue
+		SET status = ?, attempts = ?, next_retry = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status = ?`,
+		status, attempts, databaseTime(nextRetry), lastError, id, expectedStatus,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("queue entry %d state changed from expected %q", id, expectedStatus)
+	}
+	return nil
+}
+
+// RecoverStaleQueueEntries quarantines claims with no heartbeat for 30 minutes.
+// A remote SMTP server may have accepted the message before the worker died, so
+// automatic requeue would risk delivering a duplicate.
 // Returns the number of entries recovered.
 func (db *DB) RecoverStaleQueueEntries() (int, error) {
-	result, err := db.Exec(`UPDATE outbound_queue SET status = 'pending', attempts = 0,
- next_retry = ?, last_error = 'recovered from stale sending status', updated_at = CURRENT_TIMESTAMP
- WHERE status = 'sending' AND updated_at < ?`, databaseTime(time.Now().Add(time.Minute)), databaseTime(time.Now().Add(-30*time.Minute)))
+	tx, err := db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("recovering stale queue entries: %w", err)
+		return 0, err
 	}
-	count, err := result.RowsAffected()
-	return int(count), err
+	defer tx.Rollback()
+	cutoff := databaseTime(time.Now().Add(-30 * time.Minute))
+	rows, err := tx.Query(`SELECT id, attempts FROM outbound_queue WHERE status = 'sending' AND updated_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("finding stale queue entries: %w", err)
+	}
+	type staleEntry struct {
+		id       int64
+		attempts int
+	}
+	var stale []staleEntry
+	for rows.Next() {
+		var item staleEntry
+		if err := rows.Scan(&item.id, &item.attempts); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		stale = append(stale, item)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, item := range stale {
+		result, err := tx.Exec(`UPDATE outbound_queue SET status = 'uncertain',
+ last_error = 'delivery outcome unknown after worker heartbeat expired; check recipient and delivery logs before resolving', updated_at = CURRENT_TIMESTAMP
+ WHERE id = ? AND status = 'sending' AND updated_at < ?`, item.id, cutoff)
+		if err != nil {
+			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if affected == 1 {
+			if err := appendQueueEvent(tx, item.id, "outcome_uncertain", item.attempts+1, 0, "worker heartbeat expired at startup; delivery outcome unknown"); err != nil {
+				return 0, err
+			}
+			count++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // DeleteQueueEntry removes a completed/failed entry from the queue.
@@ -638,6 +1004,93 @@ func (db *DB) MarkDSNSent(id int64) error {
 		WHERE id = ?`,
 		id,
 	)
+	return err
+}
+
+var ErrDSNAlreadySent = errors.New("final DSN already delivered")
+
+// GetPendingFinalDSNs returns terminal deliveries whose requested final DSN
+// remains due. Its retry clock is separate from outbound delivery retries.
+func (db *DB) GetPendingFinalDSNs(limit int) ([]*QueueEntry, error) {
+	if limit < 1 || limit > 100 {
+		return nil, fmt.Errorf("invalid final DSN batch size")
+	}
+	rows, err := db.Query(`SELECT id, mail_from, rcpt_to, raw_message, last_error, status,
+		dsn_notify, dsn_ret, dsn_envid, dsn_attempts, verp_bounce_address,
+		original_recipient, created_at
+		FROM outbound_queue
+		WHERE dsn_sent = 0 AND dsn_retry_at <= CURRENT_TIMESTAMP
+		AND ((status = 'sent' AND UPPER(dsn_notify) LIKE '%SUCCESS%')
+		  OR (status = 'failed' AND (dsn_notify = '' OR UPPER(dsn_notify) LIKE '%FAILURE%')))
+		AND mail_from <> '' ORDER BY dsn_retry_at, id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []*QueueEntry
+	for rows.Next() {
+		entry := &QueueEntry{}
+		if err := rows.Scan(&entry.ID, &entry.MailFrom, &entry.RcptTo, &entry.RawMessage,
+			&entry.LastError, &entry.Status, &entry.DSNNotify, &entry.DSNRet,
+			&entry.DSNEnvID, &entry.DSNAttempts, &entry.VERPBounceAddress,
+			&entry.OriginalRecipient, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func (db *DB) ScheduleFinalDSNRetry(id int64, attempts int, next time.Time) error {
+	_, err := db.Exec(`UPDATE outbound_queue SET dsn_attempts = ?, dsn_retry_at = ? WHERE id = ? AND dsn_sent = 0 AND status IN ('sent', 'failed')`, attempts, databaseTime(next), id)
+	return err
+}
+
+// SaveFinalDSNMessage commits the mailbox report and sent marker together.
+// A repeated or concurrent attempt cannot create a second report.
+func (db *DB) SaveFinalDSNMessage(m *Message, queueID int64) (int64, error) {
+	if m == nil || queueID <= 0 || m.AccountID <= 0 {
+		return 0, fmt.Errorf("invalid final DSN")
+	}
+	prepareMessageSize(m)
+	if err := db.EnsureDiskSpace(m.Size); err != nil {
+		return 0, err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE outbound_queue SET dsn_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND mail_from = ? AND dsn_sent = 0 AND status IN ('sent', 'failed')`, queueID, m.ToAddr)
+	if err != nil {
+		return 0, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if changed != 1 {
+		return 0, ErrDSNAlreadySent
+	}
+	if err := reserveMailboxBytes(tx, m.AccountID, m.Size); err != nil {
+		return 0, err
+	}
+	id, err := saveMessage(tx, m)
+	if err != nil {
+		return 0, err
+	}
+	if err := db.addIMAPMessageState(tx, id, m); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	db.NotifyIMAPChanges(m.AccountID)
+	return id, nil
+}
+
+func (db *DB) MarkDSNDelaySent(id int64) error {
+	_, err := db.Exec(`UPDATE outbound_queue SET dsn_delay_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	return err
 }
 
@@ -1061,23 +1514,115 @@ func boolToInt(b bool) int {
 
 // SaveQueuedMessage commits the sent copy and all recipients together.
 func (db *DB) SaveQueuedMessage(m *Message, entries []*QueueEntry) (int64, error) {
+	return db.saveQueuedMessage(m, entries, 0, nil)
+}
+
+// SaveQueuedMessageWithAttachments commits the Sent copy, queue entries and
+// decoded attachment sidecars in one database transaction.
+func (db *DB) SaveQueuedMessageWithAttachments(m *Message, entries []*QueueEntry, attachments []IMAPAppendAttachment) (int64, error) {
+	return db.saveQueuedMessage(m, entries, 0, attachments)
+}
+
+var ErrMDNAlreadySent = errors.New("MDN already queued")
+
+// SaveQueuedMDNMessage atomically queues a receipt and marks its source as sent.
+// The conditional update is the idempotency gate across concurrent requests.
+func (db *DB) SaveQueuedMDNMessage(m *Message, entries []*QueueEntry, sourceMessageID int64) (int64, error) {
+	if sourceMessageID <= 0 || m.AccountID <= 0 {
+		return 0, fmt.Errorf("invalid MDN source")
+	}
+	return db.saveQueuedMessage(m, entries, sourceMessageID, nil)
+}
+
+// SaveQueuedMDNMessageWithAttachments also marks the source receipt sent in
+// the same transaction as its sidecars and outbound queue entries.
+func (db *DB) SaveQueuedMDNMessageWithAttachments(m *Message, entries []*QueueEntry, sourceMessageID int64, attachments []IMAPAppendAttachment) (int64, error) {
+	if sourceMessageID <= 0 || m.AccountID <= 0 {
+		return 0, fmt.Errorf("invalid MDN source")
+	}
+	return db.saveQueuedMessage(m, entries, sourceMessageID, attachments)
+}
+
+func (db *DB) saveQueuedMessage(m *Message, entries []*QueueEntry, mdnSourceID int64, attachments []IMAPAppendAttachment) (int64, error) {
 	if len(entries) == 0 {
 		return 0, fmt.Errorf("no recipients")
+	}
+	if len(attachments) > 0 && m.AccountID == 0 {
+		return 0, fmt.Errorf("attachments require a stored sender copy")
+	}
+	var required int64
+	if m.AccountID != 0 {
+		prepareMessageSize(m)
+		required += m.Size
+	}
+	for _, entry := range entries {
+		required += int64(len(entry.RawMessage))
+	}
+	for _, attachment := range attachments {
+		required += int64(len(attachment.Data))
+	}
+	if err := db.EnsureDiskSpace(required); err != nil {
+		return 0, err
 	}
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	var written []string
+	committed := false
+	defer func() {
+		if !committed {
+			for _, path := range written {
+				_ = os.Remove(path)
+			}
+		}
+	}()
+	if limitErr, limitCheckErr := db.consumeOutboundAllowance(tx, m.AccountID, len(entries), time.Now()); limitCheckErr != nil {
+		return 0, limitCheckErr
+	} else if limitErr != nil {
+		// Persist an automatically triggered suspension, but never create the
+		// message or any queue entry for the rejected attempt.
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return 0, limitErr
+	}
 	var id int64
 	if m.AccountID != 0 {
+		if err = reserveMailboxBytes(tx, m.AccountID, m.Size); err != nil {
+			return 0, err
+		}
 		id, err = saveMessage(tx, m)
 		if err != nil {
 			return 0, err
 		}
+		if err = db.addIMAPMessageState(tx, id, m); err != nil {
+			return 0, err
+		}
+		for index, attachment := range attachments {
+			extension := filepath.Ext(attachment.Filename)
+			if !validIMAPAttachmentExtension(extension) {
+				extension = ".bin"
+			}
+			digest := sha256.Sum256(attachment.Data)
+			name := fmt.Sprintf("%d_sent_%d_%x%s", id, index, digest[:8], extension)
+			fullPath, safe := db.safeAttachmentPath(name)
+			if !safe {
+				return 0, fmt.Errorf("unsafe queued attachment path")
+			}
+			if err := WriteAttachmentFile(fullPath, attachment.Data); err != nil {
+				return 0, fmt.Errorf("writing queued attachment: %w", err)
+			}
+			written = append(written, fullPath)
+			if _, err := saveAttachmentRecord(tx, &Attachment{MessageID: id, Filename: attachment.Filename, ContentType: attachment.ContentType, Size: int64(len(attachment.Data)), StoragePath: name}); err != nil {
+				return 0, err
+			}
+		}
 	}
 	for _, entry := range entries {
 		entry.MessageID = nil
+		entry.OriginAccountID = m.AccountID
 		if id != 0 {
 			entry.MessageID = &id
 		}
@@ -1085,8 +1630,25 @@ func (db *DB) SaveQueuedMessage(m *Message, entries []*QueueEntry) (int64, error
 			return 0, err
 		}
 	}
+	if mdnSourceID != 0 {
+		result, err := tx.Exec(`UPDATE messages SET mdn_sent = 1 WHERE id = ? AND account_id = ? AND mdn_requested = 1 AND mdn_sent = 0`, mdnSourceID, m.AccountID)
+		if err != nil {
+			return 0, err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if updated != 1 {
+			return 0, ErrMDNAlreadySent
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	committed = true
+	if m.AccountID != 0 {
+		db.NotifyIMAPChanges(m.AccountID)
 	}
 	return id, nil
 }

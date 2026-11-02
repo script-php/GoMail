@@ -3,8 +3,10 @@ package smtp
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/mail"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +15,10 @@ import (
 	"gomail/config"
 	"gomail/dns"
 	"gomail/logging"
+	"gomail/metrics"
 	"gomail/parser"
+	"gomail/reporting"
+	"gomail/security"
 	"gomail/store"
 )
 
@@ -24,9 +29,49 @@ type InboundServer struct {
 	tlsConfig     *tls.Config
 	rateLimiter   *RateLimiter
 	listener      net.Listener
+	acceptWG      sync.WaitGroup
 	wg            sync.WaitGroup
+	stopOnce      sync.Once
+	connMu        sync.Mutex
+	connections   map[net.Conn]struct{}
 	quit          chan struct{}
 	connSemaphore chan struct{} // Limits concurrent connections
+}
+
+var errInvalidAuthor = errors.New("invalid RFC 5322 From field")
+
+// authorDomain extracts the one unambiguous domain DMARC is allowed to use.
+func authorDomain(headers mail.Header) (string, error) {
+	fields := headers["From"]
+	if len(fields) != 1 {
+		return "", errInvalidAuthor
+	}
+	authors, err := mail.ParseAddressList(fields[0])
+	if err != nil || len(authors) == 0 {
+		return "", errInvalidAuthor
+	}
+	if len(authors) > 1 {
+		senders := headers["Sender"]
+		if len(senders) != 1 {
+			return "", errInvalidAuthor
+		}
+		if _, err := mail.ParseAddress(senders[0]); err != nil {
+			return "", errInvalidAuthor
+		}
+	}
+	var domain string
+	for _, author := range authors {
+		at := strings.LastIndexByte(author.Address, '@')
+		if at < 0 || at == len(author.Address)-1 {
+			return "", errInvalidAuthor
+		}
+		current := strings.ToLower(author.Address[at+1:])
+		if domain != "" && domain != current {
+			return "", errInvalidAuthor
+		}
+		domain = current
+	}
+	return domain, nil
 }
 
 // NewInboundServer creates a new inbound SMTP server.
@@ -40,6 +85,7 @@ func NewInboundServer(cfg *config.Config, db *store.DB, tlsCfg *tls.Config) *Inb
 			cfg.SMTP.RateLimit.MessagesPerMinute,
 		),
 		quit:          make(chan struct{}),
+		connections:   make(map[net.Conn]struct{}),
 		connSemaphore: make(chan struct{}, cfg.SMTP.MaxConnections),
 	}
 }
@@ -54,23 +100,41 @@ func (s *InboundServer) Start() error {
 
 	logging.Info(fmt.Sprintf("[smtp] inbound listening on %s", s.cfg.SMTP.ListenAddr))
 
-	s.wg.Add(1)
+	s.acceptWG.Add(1)
 	go s.acceptLoop()
 	return nil
 }
 
 // Stop gracefully shuts down the SMTP server.
 func (s *InboundServer) Stop() {
-	close(s.quit)
-	if s.listener != nil {
-		s.listener.Close()
-	}
-	s.wg.Wait()
-	logging.Info("[smtp] inbound server stopped")
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		if s.listener != nil {
+			_ = s.listener.Close()
+		}
+		s.acceptWG.Wait()
+		done := make(chan struct{})
+		go func() { s.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			s.connMu.Lock()
+			for conn := range s.connections {
+				_ = conn.Close()
+			}
+			s.connMu.Unlock()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				logging.Warn("[smtp] shutdown deadline exceeded with active sessions")
+			}
+		}
+		logging.Info("[smtp] inbound server stopped")
+	})
 }
 
 func (s *InboundServer) acceptLoop() {
-	defer s.wg.Done()
+	defer s.acceptWG.Done()
 
 	for {
 		conn, err := s.listener.Accept()
@@ -82,6 +146,12 @@ func (s *InboundServer) acceptLoop() {
 				logging.Error(fmt.Sprintf("[smtp] accept error: %v", err))
 				continue
 			}
+		}
+		select {
+		case <-s.quit:
+			_ = conn.Close()
+			return
+		default:
 		}
 
 		// Rate limit by IP
@@ -96,9 +166,17 @@ func (s *InboundServer) acceptLoop() {
 		select {
 		case s.connSemaphore <- struct{}{}:
 			// Slot acquired, handle the connection
+			s.connMu.Lock()
+			s.connections[conn] = struct{}{}
+			s.connMu.Unlock()
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
+				defer func() {
+					s.connMu.Lock()
+					delete(s.connections, conn)
+					s.connMu.Unlock()
+				}()
 				defer func() { <-s.connSemaphore }() // Release slot when done
 				s.handleConnection(conn)
 			}()
@@ -132,9 +210,9 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		}
 	}
 
-	accountExists := func(email string) bool {
-		acct, err := s.db.GetAccountByEmail(email)
-		return err == nil && acct != nil && acct.IsActive
+	accountExists := func(email string) (bool, error) {
+		acct, err := s.db.GetDeliveryAccount(email)
+		return acct != nil && acct.IsActive, err
 	}
 
 	session := NewSession(
@@ -151,6 +229,7 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 		ptrValid,
 		s.db,
 	)
+	session.postmasterDomain = s.cfg.Server.Domain
 
 	// Override the DATA handler to intercept the message
 	s.runSession(session)
@@ -166,38 +245,54 @@ func (s *InboundServer) runSession(sess *Session) {
 	for sess.state != StateQuit {
 		sess.conn.SetReadDeadline(time.Now().Add(sess.readTimeout))
 
-		line, err := sess.reader.ReadString('\n')
+		line, err := security.ReadLineLimited(sess.reader, 1000)
 		if err != nil {
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
+		line, err = security.ParseCRLFCommandLine(line)
+		if err != nil {
+			sess.sendEnhanced(500, "5.5.2", "Command requires CRLF framing")
+			return
+		}
 
 		parts := strings.SplitN(line, " ", 2)
 		cmd := strings.ToUpper(parts[0])
 
 		if cmd == "DATA" {
+			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+				sess.sendEnhanced(501, "5.5.2", "DATA does not take arguments")
+				continue
+			}
 			if sess.state != StateRcpt || len(sess.rcptTo) == 0 {
-				sess.send(503, "Bad sequence of commands")
+				sess.sendEnhanced(503, "5.5.1", "Bad sequence of commands")
 				continue
 			}
 
 			// Rate limit messages
 			if !s.rateLimiter.AllowMessage(sess.clientIP) {
-				sess.send(451, "Too many messages, try again later")
+				metrics.IncSMTP("deferred")
+				sess.sendEnhanced(451, "4.5.3", "Too many messages, try again later")
 				continue
 			}
 
 			sess.handleDATA()
 
-			// Process the received message
-			if sess.data.Len() > 0 {
+			// A completed empty transfer must receive a final answer too.
+			if sess.state == StateReady && sess.data.Len() == 0 {
+				metrics.IncSMTP("rejected")
+				sess.sendEnhanced(554, "5.6.0", "Empty message is not accepted")
+				sess.reset()
+			} else if sess.data.Len() > 0 {
 				if err := sess.validateMessageEncoding(); err != nil {
-					sess.send(550, err.Error())
+					metrics.IncSMTP("rejected")
+					sess.sendEnhanced(550, "5.7.1", err.Error())
 				} else if err := s.processMessage(sess); err != nil {
+					metrics.IncSMTP("deferred")
 					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
-					sess.send(451, "Message processing failed, try again later")
+					s.sendProcessingError(sess, err)
 				} else {
-					sess.send(250, "OK message accepted for delivery")
+					metrics.IncSMTP("accepted")
+					sess.sendEnhanced(250, "2.0.0", "OK message accepted for delivery")
 				}
 				sess.reset()
 			}
@@ -210,21 +305,29 @@ func (s *InboundServer) runSession(sess *Session) {
 
 			// Rate limit messages on first chunk (StateRcpt)
 			if sess.state == StateRcpt && !s.rateLimiter.AllowMessage(sess.clientIP) {
-				sess.send(451, "Too many messages, try again later")
+				metrics.IncSMTP("deferred")
+				sess.sendEnhanced(451, "4.5.3", "Too many messages, try again later")
 				continue
 			}
 
 			sess.handleBDAT(arg)
 
 			// If LAST chunk was received (state transitions back to StateReady with data), process message
-			if sess.state == StateReady && sess.data.Len() > 0 {
+			if sess.state == StateReady && sess.data.Len() == 0 {
+				metrics.IncSMTP("rejected")
+				sess.sendEnhanced(554, "5.6.0", "Empty message is not accepted")
+				sess.reset()
+			} else if sess.state == StateReady && sess.data.Len() > 0 {
 				if err := sess.validateMessageEncoding(); err != nil {
-					sess.send(550, err.Error())
+					metrics.IncSMTP("rejected")
+					sess.sendEnhanced(550, "5.7.1", err.Error())
 				} else if err := s.processMessage(sess); err != nil {
+					metrics.IncSMTP("deferred")
 					logging.Error(fmt.Sprintf("[smtp] message processing error from %s: %v", sess.clientAddr, err))
-					sess.send(451, "Message processing failed, try again later")
+					s.sendProcessingError(sess, err)
 				} else {
-					sess.send(250, "OK message accepted for delivery")
+					metrics.IncSMTP("accepted")
+					sess.sendEnhanced(250, "2.0.0", "OK message accepted for delivery")
 				}
 				sess.reset()
 			}
@@ -234,9 +337,31 @@ func (s *InboundServer) runSession(sess *Session) {
 	}
 }
 
+func (s *InboundServer) sendProcessingError(sess *Session, err error) {
+	if errors.Is(err, store.ErrDiskPressure) {
+		sess.sendEnhanced(452, "4.3.1", "Insufficient system storage, try again later")
+		return
+	}
+	if errors.Is(err, store.ErrQuotaExceeded) {
+		metrics.IncQuota("inbound")
+		sess.sendEnhanced(452, "4.2.2", "Mailbox full, try again later")
+		return
+	}
+	if errors.Is(err, errInvalidAuthor) {
+		sess.sendEnhanced(554, "5.6.0", "Invalid or ambiguous From field")
+		return
+	}
+	sess.sendEnhanced(451, "4.3.0", "Message processing failed, try again later")
+}
+
 // processMessage runs authentication checks, parses, and stores an inbound message.
 func (s *InboundServer) processMessage(sess *Session) error {
 	rawMessage := sess.GetData()
+	var err error
+	rawMessage, err = RemoveExternalAuthenticationResults(rawMessage)
+	if err != nil {
+		return fmt.Errorf("removing untrusted authentication results: %w", err)
+	}
 	mailFrom := sess.GetMailFrom()
 	rcptTo := sess.GetRcptTo()
 	clientIP := sess.GetClientIP()
@@ -254,19 +379,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	}
 
 	// --- Add Received header ---
-	receivedHeader := fmt.Sprintf("Received: from %s\r\n\tby %s\r\n\twith SMTP%s\r\n\tid %s\r\n\tfor <%s>;\r\n\t%s\r\n",
-		clientIP,
-		s.cfg.Server.Hostname,
-		func() string {
-			if sess.tls {
-				return "S"
-			}
-			return ""
-		}(),
-		fmt.Sprintf("%d.%s@%s", time.Now().UnixNano(), clientIP, s.cfg.Server.Hostname),
-		strings.Join(rcptTo, ">, <"),
-		time.Now().Format(time.RFC1123Z),
-	)
+	receivedHeader := inboundReceivedHeader(s.cfg.Server.Hostname, clientIP, rcptTo, sess.tls, time.Now())
 	rawMessage = append([]byte(receivedHeader), rawMessage...)
 
 	// --- Authentication checks ---
@@ -278,7 +391,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	logging.Info(fmt.Sprintf("[smtp] SPF: %s (%s)", spfResult, spfDetail))
 
 	// DKIM
-	dkimResult, dkimDetail, dkimDomain, dkimSelector := auth.VerifyDKIMDetailed(rawMessage)
+	dkimResult, dkimDetail, dkimDomain, dkimSelector, verifiedDKIMDomains := auth.VerifyDKIMDetailedWithIdentities(rawMessage)
 	authBuilder.AddDKIM(dkimResult, dkimDetail, dkimDomain, dkimSelector)
 	logging.Info(fmt.Sprintf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail))
 
@@ -291,26 +404,19 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	logging.Info(fmt.Sprintf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
 		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments)))
 
-	fromDomain := extractDomain(parsed.From)
-	spfDomain := extractDomain(mailFrom)
+	fromDomain, err := authorDomain(parsed.Headers)
+	if err != nil {
+		return err
+	}
+	spfDomain := spfIdentityDomain(mailFrom, sess.ehlo)
 
-	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, dkimDomain)
+	var otherDKIMDomains []string
+	if len(verifiedDKIMDomains) > 1 {
+		otherDKIMDomains = verifiedDKIMDomains[1:]
+	}
+	dmarcResult := auth.CheckDMARC(fromDomain, spfResult, spfDomain, dkimResult, dkimDomain, otherDKIMDomains...)
 	authBuilder.AddDMARC(dmarcResult.Result, dmarcResult.Details, fromDomain)
 	logging.Info(fmt.Sprintf("[smtp] DMARC: %s (%s)", dmarcResult.Result, dmarcResult.Details))
-
-	// Record DMARC feedback for aggregate reporting (RFC 7489)
-	// Determine disposition based on policy and auth results
-	disposition := "none"
-	if dmarcResult.Result == auth.DMARCFail {
-		if dmarcResult.Policy == "reject" {
-			disposition = "reject"
-		} else if dmarcResult.Policy == "quarantine" {
-			disposition = "quarantine"
-		}
-	}
-	if err := s.db.SaveDMARCFeedback(fromDomain, clientIP, spfDomain, dkimResult, string(spfResult), disposition); err != nil {
-		logging.Warn(fmt.Sprintf("[smtp] warning: failed to save DMARC feedback: %v", err))
-	}
 
 	authResults := authBuilder.Build()
 
@@ -345,6 +451,16 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	// NOTE: Do NOT add ARC headers for inbound original emails.
 	// ARC headers are only added when FORWARDING/RELAYING messages.
 	// For original emails with no prior ARC chain, store without modification.
+	// Final delivery records the trusted SMTP reverse-path. Do this after
+	// authentication so forged sender headers cannot affect validation.
+	rawMessage, err = FinalDeliveryReturnPath(rawMessage, mailFrom)
+	if err != nil {
+		return fmt.Errorf("setting final Return-Path: %w", err)
+	}
+	parsed, err = parser.Parse(rawMessage)
+	if err != nil {
+		return fmt.Errorf("parsing final message: %w", err)
+	}
 
 	// --- Check for MDN request ---
 	mdnRequested := parsed.MDNRequestedBy != ""
@@ -374,6 +490,14 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			logging.Info(fmt.Sprintf("[smtp] [verp] received DSN: original-id=%s status=%s", dsnReport.OriginalMessageID, dsnReport.Status))
 		}
 	}
+	type pendingDelivery struct {
+		message           *store.Message
+		recipient         string
+		originalRecipient string
+		notifySuccess     bool
+	}
+	var pending []pendingDelivery
+	var bounces []store.InboundVERPBounce
 
 	// Deliver to each recipient
 	for _, rcpt := range rcptTo {
@@ -382,85 +506,49 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// p=none messages go to inbox normally
 
 		// Check if this recipient is a VERP bounce address
-		if s.db.IsVERPBounceAddress(rcpt) {
-			originalRecipient, err := s.db.DecodeVERP(rcpt)
-			if err == nil {
-				logging.Info(fmt.Sprintf("[smtp] [verp] detected bounce at VERP address %s for original recipient %s", rcpt, originalRecipient))
-
-				// Extract sender from the parsed From header
-				senderEmail := parsed.From
-				if senderEmail == "" {
-					senderEmail = mailFrom
-				}
-
-				// Extract bounce code and type from DSN if available, otherwise use subject heuristics
-				bounceCode := 0
-				bounceType := "unknown"
-				bounceReason := parsed.Subject
-
-				if isDSN && dsnReport != nil {
-					bounceType = parser.ExtractBounceType(dsnReport.Status)
-					bounceCode = parser.ExtractSMTPCode(dsnReport.DiagnosticCode)
-					if bounceCode == 0 && len(dsnReport.RecipientsStatus) > 0 {
-						bounceCode = parser.ExtractSMTPCode(dsnReport.RecipientsStatus[0].DiagnosticCode)
-					}
-					bounceReason = dsnReport.DiagnosticCode
-					if bounceReason == "" {
-						bounceReason = dsnReport.Status
-					}
-				} else {
-					// Fallback: try to extract SMTP code from message body or subject
-					if strings.Contains(strings.ToLower(parsed.Subject), "permanent") || strings.Contains(strings.ToLower(parsed.Subject), "failed") {
-						bounceType = "permanent"
-						bounceCode = 550 // Generic permanent failure
-					} else if strings.Contains(strings.ToLower(parsed.Subject), "temporary") || strings.Contains(strings.ToLower(parsed.Subject), "try again") {
-						bounceType = "temporary"
-						bounceCode = 421 // Service temporarily unavailable
-					}
-				}
-
-				// Record the bounce
-				if err := s.db.RecordVERPBounce(originalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
-					logging.Error(fmt.Sprintf("[smtp] [verp] error recording bounce: %v", err))
-				}
-
-				// Skip account lookup for VERP addresses (they don't have accounts)
-				continue
-			} else {
-				logging.Warn(fmt.Sprintf("[smtp] [verp] could not decode VERP address %s: %v", rcpt, err))
-			}
+		issuedVERP, verpErr := s.db.LookupIssuedVERP(rcpt)
+		if verpErr != nil {
+			logging.Error(fmt.Sprintf("[smtp] [verp] lookup failed for %s: %v", rcpt, verpErr))
+			return fmt.Errorf("looking up VERP recipient %s: %w", rcpt, verpErr)
 		}
+		if issuedVERP != nil {
+			logging.Info(fmt.Sprintf("[smtp] [verp] detected bounce at VERP address %s for original recipient %s", rcpt, issuedVERP.Recipient))
 
-		// --- Handle DSN bounces that came to the original sender (not VERP address) ---
-		if isDSN && dsnReport != nil && len(dsnReport.RecipientsStatus) > 0 {
-			// Try to match DSN recipients to our sent messages and record VERP bounces
-			for _, recipStatus := range dsnReport.RecipientsStatus {
-				if recipStatus.FinalRecipient != "" {
-					logging.Info(fmt.Sprintf("[smtp] [verp] DSN failure for recipient: %s status: %s", recipStatus.FinalRecipient, recipStatus.Status))
+			// Extract bounce code and type from DSN if available, otherwise use subject heuristics
+			bounceCode := 0
+			bounceType := "unknown"
+			bounceReason := parsed.Subject
 
-					// Extract sender - from Return-Path if available, otherwise From header
-					senderEmail := parsed.From
-					if senderEmail == "" {
-						senderEmail = mailFrom
-					}
-
-					bounceType := parser.ExtractBounceType(recipStatus.Status)
-					bounceCode := parser.ExtractSMTPCode(recipStatus.DiagnosticCode)
-					bounceReason := recipStatus.DiagnosticCode
-					if bounceReason == "" {
-						bounceReason = recipStatus.Status
-					}
-
-					// Record bounce with original recipient from DSN
-					if err := s.db.RecordVERPBounce(recipStatus.FinalRecipient, senderEmail, rcpt, bounceType, bounceCode, bounceReason); err != nil {
-						logging.Error(fmt.Sprintf("[smtp] [verp] error recording DSN bounce: %v", err))
-					}
+			if isDSN && dsnReport != nil {
+				bounceType = parser.ExtractBounceType(dsnReport.Status)
+				bounceCode = parser.ExtractSMTPCode(dsnReport.DiagnosticCode)
+				if bounceCode == 0 && len(dsnReport.RecipientsStatus) > 0 {
+					bounceCode = parser.ExtractSMTPCode(dsnReport.RecipientsStatus[0].DiagnosticCode)
+				}
+				bounceReason = dsnReport.DiagnosticCode
+				if bounceReason == "" {
+					bounceReason = dsnReport.Status
+				}
+			} else {
+				// Fallback: try to extract SMTP code from message body or subject
+				if strings.Contains(strings.ToLower(parsed.Subject), "permanent") || strings.Contains(strings.ToLower(parsed.Subject), "failed") {
+					bounceType = "permanent"
+					bounceCode = 550 // Generic permanent failure
+				} else if strings.Contains(strings.ToLower(parsed.Subject), "temporary") || strings.Contains(strings.ToLower(parsed.Subject), "try again") {
+					bounceType = "temporary"
+					bounceCode = 421 // Service temporarily unavailable
 				}
 			}
 
-			// DSN messages don't need to be stored as regular mail, skip account lookup
+			bounces = append(bounces, store.InboundVERPBounce{OriginalRecipient: issuedVERP.Recipient, SenderEmail: issuedVERP.Sender, BounceAddress: rcpt, BounceType: bounceType, BounceCode: bounceCode, BounceReason: bounceReason})
+
+			// Skip account lookup for VERP addresses (they don't have accounts)
 			continue
 		}
+
+		// DSNs sent to ordinary mailboxes are delivered as mail. Their body
+		// claims are not authenticated bounce-tracker evidence; only an issued
+		// VERP envelope address above can create a tracked bounce.
 
 		// Check if DMARC failed for this domain
 		if dmarcResult.Result == "fail" {
@@ -475,14 +563,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		}
 
 		// Look up the account for this recipient
-		account, err := s.db.GetAccountByEmail(rcpt)
+		account, err := s.db.GetDeliveryAccount(rcpt)
 		if err != nil {
 			logging.Warn(fmt.Sprintf("[smtp] account lookup error for %s: %v", rcpt, err))
-			continue
+			return err
 		}
 		if account == nil || !account.IsActive {
-			logging.Info(fmt.Sprintf("[smtp] no active account for %s, skipping", rcpt))
-			continue
+			return fmt.Errorf("recipient %s became unavailable after RCPT", rcpt)
 		}
 
 		accountID := account.ID
@@ -490,20 +577,11 @@ func (s *InboundServer) processMessage(sess *Session) error {
 		// Determine folder based on auth results
 		var folderID *int64
 
-		// Check if this is an automated message (DSN, MDN, read receipt, etc.)
-		// These legitimately have SPF "none" since they have no envelope sender
-		contentType := parsed.Headers.Get("Content-Type")
-		isAutomatedMessage := strings.Contains(strings.ToLower(contentType), "multipart/report") ||
-			strings.Contains(strings.ToLower(contentType), "multipart/delivery-status") ||
-			strings.Contains(strings.ToLower(parsed.Subject), "return receipt") ||
-			strings.Contains(strings.ToLower(parsed.Subject), "delivery report") ||
-			parsed.MDNRequestedBy != "" // MDN messages have this set
-
 		// DMARC passes when either aligned SPF or aligned DKIM passes. ARC is
 		// advisory evidence for forwarded mail and must not independently
-		// quarantine an otherwise valid message.
-		_ = isAutomatedMessage
-		authFailed := dmarcResult.Result == auth.DMARCFail && dmarcResult.Policy != auth.PolicyNone
+		// quarantine an otherwise valid message. Message subjects, MIME types and
+		// receipt headers are attacker-controlled and never bypass DMARC policy.
+		authFailed := shouldQuarantineDMARC(dmarcResult.Result, dmarcResult.Policy)
 
 		if authFailed {
 			// Any auth failure → spam folder
@@ -511,25 +589,25 @@ func (s *InboundServer) processMessage(sess *Session) error {
 				dmarcResult.Policy, spfResult, dkimResult, dmarcResult.Result))
 			spamFolder, err := s.db.GetFolderByType(accountID, "spam")
 			if err != nil {
-				logging.Error(fmt.Sprintf("[smtp] error getting spam folder: %v", err))
-			} else if spamFolder != nil {
-				folderID = &spamFolder.ID
-				logging.Info(fmt.Sprintf("[smtp] message routed to spam folder=%d", spamFolder.ID))
-			} else {
-				logging.Warn(fmt.Sprintf("[smtp] warning: spam folder not found for account %d, using NULL", accountID))
+				return fmt.Errorf("finding spam folder for account %d: %w", accountID, err)
 			}
+			if spamFolder == nil {
+				return fmt.Errorf("spam folder missing for account %d", accountID)
+			}
+			folderID = &spamFolder.ID
+			logging.Info(fmt.Sprintf("[smtp] message routed to spam folder=%d", spamFolder.ID))
 		} else {
 			// All auth passed - route to inbox
 			inboxFolder, err := s.db.GetFolderByType(accountID, "inbox")
 			if err != nil {
-				logging.Error(fmt.Sprintf("[smtp] error getting inbox folder for account %d: %v", accountID, err))
-			} else if inboxFolder != nil {
-				folderID = &inboxFolder.ID
-				logging.Info(fmt.Sprintf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
-					spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID))
-			} else {
-				logging.Warn(fmt.Sprintf("[smtp] warning: inbox folder not found for account %d, using NULL", accountID))
+				return fmt.Errorf("finding inbox folder for account %d: %w", accountID, err)
 			}
+			if inboxFolder == nil {
+				return fmt.Errorf("inbox folder missing for account %d", accountID)
+			}
+			folderID = &inboxFolder.ID
+			logging.Info(fmt.Sprintf("[smtp] all auth passed (SPF: %s, DKIM: %s, DMARC: %s) - assigning to inbox folder=%d",
+				spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID))
 		}
 
 		msg := &store.Message{
@@ -566,36 +644,99 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			logging.Info(fmt.Sprintf("[smtp] saving message subject=%q with folder_id=NULL (rcpt=%s)", parsed.Subject, rcpt))
 		}
 
-		msgID, err := s.db.SaveMessage(msg)
-		if err != nil {
-			logging.Error(fmt.Sprintf("[smtp] saving message for %s: %v", rcpt, err))
-			continue
+		pending = append(pending, pendingDelivery{message: msg, recipient: rcpt,
+			originalRecipient: sess.GetDSNOriginalRecipient(rcpt),
+			notifySuccess:     mailFrom != "" && dsnFlagRequested(sess.GetDSNNotify(rcpt), "SUCCESS")})
+	}
+	messages := make([]*store.Message, len(pending))
+	attachments := make([][]store.IMAPAppendAttachment, len(pending))
+	var reports []*store.QueueEntry
+	for index := range pending {
+		messages[index] = pending[index].message
+		for _, attachment := range parsed.Attachments {
+			attachments[index] = append(attachments[index], store.IMAPAppendAttachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: attachment.Data})
 		}
-
-		// Update folder counts
-		if folderID != nil {
-			s.db.UpdateFolderCounts(*folderID)
-		}
-
-		// Save attachments
-		if len(parsed.Attachments) > 0 {
-			records, err := parser.SaveAttachments(parsed.Attachments, msgID, s.db.AttachmentsPath())
+		if pending[index].notifySuccess {
+			report, err := s.prepareDeliveryDSN(mailFrom, pending[index].recipient, pending[index].originalRecipient, sess.GetDSNEnvelopeID(), rawMessage)
 			if err != nil {
-				logging.Error(fmt.Sprintf("[smtp] attachment save error: %v", err))
-			} else {
-				for _, rec := range records {
-					if _, err := s.db.SaveAttachment(rec); err != nil {
-						logging.Error(fmt.Sprintf("[smtp] attachment db save error: %v", err))
-					}
-				}
+				return fmt.Errorf("preparing requested success DSN: %w", err)
 			}
+			reports = append(reports, report)
 		}
-
+	}
+	messageIDs, err := s.db.SaveInboundDelivery(messages, reports, attachments, bounces)
+	if err != nil {
+		return err
+	}
+	// Feedback describes accepted mail and the disposition actually applied.
+	// Keep it after the delivery commit so failed/retried transactions do not
+	// inflate aggregate reports or claim that quarantined mail was rejected.
+	disposition := "none"
+	if shouldQuarantineDMARC(dmarcResult.Result, dmarcResult.Policy) {
+		disposition = "quarantine"
+	}
+	if err := s.db.SaveDMARCFeedbackEvaluated(fromDomain, dmarcResult.PolicyDomain, clientIP, spfDomain, dkimResult, dkimDomain, dkimSelector, string(spfResult), spfDomain, "mfrom", disposition, dmarcResult.DKIMAligned, dmarcResult.SPFAligned); err != nil {
+		logging.Warn(fmt.Sprintf("[smtp] warning: failed to save DMARC feedback: %v", err))
+	}
+	for index, delivery := range pending {
+		msgID := messageIDs[index]
+		if delivery.message.FolderID != nil {
+			_ = s.db.UpdateFolderCounts(*delivery.message.FolderID)
+		}
 		logging.Info(fmt.Sprintf("[smtp] message stored id=%d account=%d msgid=%s from=%s to=%s subject=%s",
-			msgID, accountID, messageID, mailFrom, rcpt, parsed.Subject))
+			msgID, delivery.message.AccountID, messageID, mailFrom, delivery.recipient, parsed.Subject))
 	}
 
 	return nil
+}
+
+func shouldQuarantineDMARC(result auth.DMARCResult, policy auth.DMARCPolicy) bool {
+	return result == auth.DMARCFail && policy != auth.PolicyNone
+}
+
+func dsnFlagRequested(value, wanted string) bool {
+	for _, flag := range strings.Split(strings.ToUpper(value), ",") {
+		if strings.TrimSpace(flag) == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareDeliveryDSN signs a successful local-delivery report before the
+// recipient and report queue entry are atomically committed. Its null reverse
+// path prevents notification loops if delivery of the report later fails.
+func (s *InboundServer) prepareDeliveryDSN(sender, recipient, originalRecipient, envID string, originalMessage []byte) (*store.QueueEntry, error) {
+	report, err := reporting.BuildDSNMessageWithSender(s.cfg.Server.Hostname, s.cfg.Server.DSNSenderAddress(), recipient, originalRecipient, sender, "delivered", "delivered to local mailbox", 250, envID, "HDRS", originalMessage)
+	if err != nil {
+		return nil, err
+	}
+	raw := []byte(report)
+	domain, err := s.db.GetDomainByName(s.cfg.Server.Domain)
+	if err != nil {
+		return nil, fmt.Errorf("loading DSN signing domain %s: %w", s.cfg.Server.Domain, err)
+	}
+	if domain != nil && domain.IsActive && domain.DKIMPrivateKey != "" {
+		signer, err := auth.NewDKIMSignerFromPEM(domain.Domain, domain.DKIMSelector, []byte(domain.DKIMPrivateKey), domain.DKIMAlgorithm)
+		if err != nil {
+			return nil, fmt.Errorf("initializing DSN DKIM signer: %w", err)
+		}
+		raw, err = signer.Sign(raw)
+		if err != nil {
+			return nil, fmt.Errorf("signing DSN: %w", err)
+		}
+	} else {
+		logging.Warn(fmt.Sprintf("[smtp] sending requested success DSN without DKIM: no active signing key for %s", s.cfg.Server.Domain))
+	}
+	return &store.QueueEntry{
+		MailFrom:          "",
+		RcptTo:            sender,
+		RawMessage:        raw,
+		MaxAttempts:       s.cfg.Delivery.MaxRetries,
+		NextRetry:         time.Now().UTC(),
+		DSNNotify:         "NEVER",
+		OriginalRecipient: sender,
+	}, nil
 }
 
 // extractDomain gets the domain part from an email address or From header.
@@ -612,4 +753,12 @@ func extractDomain(addr string) string {
 		return parts[1]
 	}
 	return addr
+}
+
+func spfIdentityDomain(mailFrom, helo string) string {
+	if mailFrom == "" {
+		// SPF checked postmaster@HELO for a null reverse-path.
+		return strings.TrimSuffix(helo, ".")
+	}
+	return extractDomain(mailFrom)
 }

@@ -43,6 +43,10 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 	if count != len(unique) {
 		return sql.ErrNoRows
 	}
+	var reclaimed int64
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(size),0) FROM messages WHERE account_id=? AND is_deleted=1 AND id IN (`+placeholders+`)`, args...).Scan(&reclaimed); err != nil {
+		return err
+	}
 	rows, err := tx.Query(`SELECT a.storage_path FROM attachments a JOIN messages m ON m.id=a.message_id
 		WHERE m.account_id=? AND m.is_deleted=1 AND m.id IN (`+placeholders+`)`, args...)
 	if err != nil {
@@ -60,6 +64,35 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	stateRows, err := tx.Query(`SELECT s.folder_id,s.uid FROM imap_message_state s JOIN messages m ON m.id=s.message_id
+		WHERE m.account_id=? AND m.is_deleted=1 AND m.id IN (`+placeholders+`) ORDER BY s.folder_id,s.uid`, args...)
+	if err != nil {
+		return err
+	}
+	type expungeState struct {
+		folderID int64
+		uid      uint32
+	}
+	var expunges []expungeState
+	for stateRows.Next() {
+		var state expungeState
+		if err := stateRows.Scan(&state.folderID, &state.uid); err != nil {
+			stateRows.Close()
+			return err
+		}
+		expunges = append(expunges, state)
+	}
+	if err := stateRows.Close(); err != nil {
+		return err
+	}
+	if len(expunges) != len(unique) {
+		return fmt.Errorf("missing IMAP state for permanent deletion")
+	}
+	for _, state := range expunges {
+		if _, err := db.recordIMAPExpunge(tx, state.folderID, state.uid); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM attachments WHERE message_id IN (`+placeholders+`)`, interfaceSlice(unique)...); err != nil {
 		return err
 	}
@@ -70,6 +103,9 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 	if affected, _ := result.RowsAffected(); affected != int64(len(unique)) {
 		return fmt.Errorf("deleted %d of %d messages", affected, len(unique))
 	}
+	if err := releaseMailboxBytes(tx, accountID, reclaimed); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE folders SET
 		total_count=(SELECT COUNT(*) FROM messages WHERE folder_id=folders.id AND is_deleted=(folders.folder_type='trash')),
 		unread_count=(SELECT COUNT(*) FROM messages WHERE folder_id=folders.id AND is_read=0 AND is_deleted=(folders.folder_type='trash'))
@@ -79,6 +115,7 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.NotifyIMAPChanges(accountID)
 	for _, path := range paths {
 		if fullPath, ok := db.safeAttachmentPath(path); ok {
 			_ = os.Remove(fullPath)

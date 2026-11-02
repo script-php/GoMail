@@ -39,7 +39,7 @@
 
         <div class="form-group">
             <label for="password">Password {{if not .IsNew}}(leave blank to keep current){{end}}</label>
-            <input type="password" id="password" name="password"
+            <input type="password" id="password" name="password" minlength="12"
                    {{if .IsNew}}required{{end}} autocomplete="new-password">
         </div>
 
@@ -64,6 +64,14 @@
                 <input type="checkbox" name="is_active" value="1" {{if .Acct.IsActive}}checked{{end}}>
                 Account is active
             </label>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="allow_aliases" value="1" {{if .Acct.AllowAliases}}checked{{end}}>
+                Allow this user to create aliases for their own mailbox
+            </label>
+            <p>Off by default. Turning this off removes aliases created by this user; admin-managed aliases are unaffected.</p>
         </div>
 
         <button type="submit" class="btn btn-primary">{{if .IsNew}}Create Account{{else}}Save Changes{{end}}</button>

@@ -1,0 +1,104 @@
+{{define "content"}}
+<div class="admin-panel queue-admin">
+    <div class="admin-header queue-page-header"><div><h2>Outbound Queue</h2><p>Track delivery attempts and manage entries that need attention.</p></div><a href="/admin" class="btn">&larr; Back to Admin</a></div>
+    <div class="queue-guidance"><p>Delivery metadata only; message bodies and attachments are not shown. Cancelling an entry does not remove its Sent copy.</p><p><strong>Before retrying:</strong> a failed delivery starts a new attempt cycle, even after a failure notice. A sending entry without a heartbeat for 30 minutes becomes <strong>Uncertain</strong>. Check recipient and delivery logs first; the previous attempt may have succeeded.</p></div>
+    {{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
+    {{if .Updated}}<div class="alert alert-success" role="status">{{if eq .Updated "retention"}}Queue retention settings saved.{{else if eq .Updated "verp_retention"}}VERP retention settings saved.{{else if eq .Updated "verp_cleanup"}}Archived VERP cleanup completed.{{else}}Updated {{.Updated}} queue entry or entries.{{end}}</div>{{end}}
+    <div class="queue-retention-grid">
+    <section class="settings-card queue-retention-card" aria-label="Queue retention">
+        <h3>Completed queue retention</h3>
+        <p>Remove old sent, failed, and cancelled entries, including their history and queued copy. Active or uncertain deliveries are retained.</p>
+        <form method="POST" action="/admin/queue" class="queue-retention-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <div class="queue-retention-field"><label for="retention-days">Keep completed entries for days</label><input id="retention-days" name="retention_days" type="number" min="0" max="3650" value="{{.RetentionDays}}" required><small>0 disables automatic cleanup.</small></div>
+            <div class="queue-retention-actions"><button class="btn btn-primary" type="submit" name="action" value="retention_save">Save</button><button class="btn" type="submit" name="action" value="retention_run">Run cleanup now</button></div>
+        </form>
+        <small>When enabled, cleanup runs hourly in batches of up to 500 entries.</small>
+    </section>
+    <section class="settings-card queue-retention-card" aria-label="Archived VERP retention">
+        <h3>Archived bounce-address retention</h3>
+        <p>Archived VERP mappings attribute late delivery bounces after their queue entries are removed. Keep them indefinitely (0, the default), or remove them after a chosen number of days. A bounce arriving after its mapping is removed will no longer be recognized.</p>
+        <form method="POST" action="/admin/queue" class="queue-retention-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <div class="queue-retention-field"><label for="verp-retention-days">Keep archived mappings for days</label><input id="verp-retention-days" name="verp_retention_days" type="number" min="0" max="3650" value="{{.VERPRetentionDays}}" required><small>0 keeps mappings indefinitely.</small></div>
+            <div class="queue-retention-actions"><button class="btn btn-primary" type="submit" name="action" value="verp_retention_save">Save</button><button class="btn" type="submit" name="action" value="verp_retention_run" onclick="return confirm('Old bounce mappings will be removed. Late bounces to those addresses may no longer be attributed. Continue?')">Run cleanup now</button></div>
+        </form>
+        <small>When enabled, cleanup runs hourly in batches of up to 500 mappings. Active queue references are retained.</small>
+    </section>
+    </div>
+    {{if .HistoryID}}
+    <section class="settings-card" id="history" aria-label="Delivery history">
+        <h3>Delivery history for queue #{{.HistoryID}}</h3>
+        <p>Worker success means GoMail observed delivery complete. An unfinished attempt has no confirmed outcome. Recent 50 events are shown.</p>
+        <div class="table-scroll"><table class="admin-table compact">
+            <thead><tr><th>Time</th><th>Event</th><th>Attempt</th><th>SMTP code</th><th>Detail</th></tr></thead>
+            <tbody>{{range .History}}<tr><td>{{.CreatedAt}}</td><td>{{.Type}}</td><td>{{.Attempt}}</td><td>{{if .SMTPCode}}{{.SMTPCode}}{{else}}&mdash;{{end}}</td><td class="queue-error">{{.Detail}}</td></tr>{{else}}<tr><td colspan="5">No recorded attempts yet. Older deliveries may predate this feature.</td></tr>{{end}}</tbody>
+        </table></div>
+    </section>
+    {{end}}
+
+    <h3 class="queue-section-heading">Delivery status</h3>
+    <div class="queue-summary" aria-label="Queue status summary">
+        <a href="/admin/queue?status=pending"><strong>{{index .Queue.StatusCount "pending"}}</strong><span>Pending</span></a>
+        <a href="/admin/queue?status=sending"><strong>{{index .Queue.StatusCount "sending"}}</strong><span>Sending</span></a>
+        <a href="/admin/queue?status=uncertain"><strong>{{index .Queue.StatusCount "uncertain"}}</strong><span>Uncertain</span></a>
+        <a href="/admin/queue?status=failed"><strong>{{index .Queue.StatusCount "failed"}}</strong><span>Failed</span></a>
+        <a href="/admin/queue?status=sent"><strong>{{index .Queue.StatusCount "sent"}}</strong><span>Sent</span></a>
+        <a href="/admin/queue?status=cancelled"><strong>{{index .Queue.StatusCount "cancelled"}}</strong><span>Cancelled</span></a>
+    </div>
+
+    <form method="GET" action="/admin/queue" class="queue-filters" role="search">
+        <label for="queue-status">Status</label>
+        <select id="queue-status" name="status">
+            <option value="all">All</option>
+            <option value="pending" {{if eq .Status "pending"}}selected{{end}}>Pending</option>
+            <option value="sending" {{if eq .Status "sending"}}selected{{end}}>Sending</option>
+            <option value="uncertain" {{if eq .Status "uncertain"}}selected{{end}}>Uncertain</option>
+            <option value="failed" {{if eq .Status "failed"}}selected{{end}}>Failed</option>
+            <option value="sent" {{if eq .Status "sent"}}selected{{end}}>Sent</option>
+            <option value="cancelled" {{if eq .Status "cancelled"}}selected{{end}}>Cancelled</option>
+        </select>
+        <label for="queue-search">Sender or recipient</label>
+        <input id="queue-search" type="search" name="q" value="{{.Query}}" maxlength="320">
+        <button class="btn" type="submit">Filter</button>
+        <a class="btn btn-ghost" href="/admin/queue">Clear</a>
+    </form>
+
+    <form method="POST" action="/admin/queue" class="queue-actions">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <div class="queue-toolbar">
+            <button class="btn" type="submit" name="action" value="retry">Retry selected failures</button>
+            <button class="btn btn-danger" type="submit" name="action" value="cancel">Cancel selected pending/failed</button>
+            <span>At most 100 entries per action. Active deliveries cannot be cancelled.</span>
+        </div>
+        <div class="table-scroll queue-table-wrap">
+            <table class="admin-table compact queue-table">
+                <thead><tr><th><span class="sr-only">Select</span></th><th>ID / Status</th><th>Envelope</th><th>Attempts</th><th>Timing</th><th>Last result</th><th>Action</th></tr></thead>
+                <tbody>
+                {{range .Queue.Entries}}
+                <tr>
+                    <td><input type="checkbox" name="queue_id" value="{{.ID}}" aria-label="Select queue entry {{.ID}}"></td>
+                    <td><div class="queue-entry-identity"><strong>#{{.ID}}</strong><span class="badge queue-status-{{.Status}}">{{.Status}}</span>{{if .DSNSent}}<small>DSN sent</small>{{end}}<a href="/admin/queue?history={{.ID}}#history">History</a></div></td>
+                    <td><div class="queue-entry-envelope"><span><strong>From</strong> {{.MailFrom}}</span><span><strong>To</strong> {{.RcptTo}}</span></div></td>
+                    <td>{{.Attempts}} / {{.MaxAttempts}}</td>
+                    <td><div class="queue-entry-timing"><span><strong>Created</strong> {{.CreatedAt}}</span>{{if eq .Status "pending"}}<span><strong>Next retry</strong> {{.NextRetry}}</span>{{end}}<span><strong>Updated</strong> {{.UpdatedAt}}</span></div></td>
+                    <td class="queue-error">{{if .LastError}}{{.LastError}}{{else}}&mdash;{{end}}</td>
+                    <td>
+                        {{if eq .Status "failed"}}<button class="btn" type="submit" name="single" value="retry:{{.ID}}">Retry</button>{{end}}
+                        {{if or (eq .Status "pending") (eq .Status "failed")}}<button class="btn btn-danger" type="submit" name="single" value="cancel:{{.ID}}">Cancel</button>{{end}}
+                        {{if eq .Status "sending"}}<button class="btn" type="submit" name="single" value="recover:{{.ID}}">Recover if stale</button>{{end}}
+                        {{if eq .Status "uncertain"}}
+                        <button class="btn" type="submit" name="single" value="delivered_uncertain:{{.ID}}" onclick="return confirm('Mark this delivery as complete only after confirming the recipient accepted it.')">Mark delivered</button>
+                        <button class="btn" type="submit" name="single" value="retry_uncertain:{{.ID}}" onclick="return confirm('Retry only after checking the recipient and delivery logs. This may deliver a duplicate. Continue?')">Retry after review</button>
+                        <button class="btn btn-danger" type="submit" name="single" value="cancel_uncertain:{{.ID}}" onclick="return confirm('Cancel this uncertain delivery after reviewing its outcome?')">Cancel</button>
+                        {{end}}
+                    </td>
+                </tr>
+                {{else}}<tr><td colspan="7">No queue entries match this filter.</td></tr>{{end}}
+                </tbody>
+            </table>
+        </div>
+    </form>
+    {{if or .PrevURL .NextURL}}<nav class="pagination" aria-label="Queue pages">{{if .PrevURL}}<a href="{{.PrevURL}}">Previous</a>{{end}}<span>Page {{.Queue.Page}} of {{.Queue.TotalPages}}</span>{{if .NextURL}}<a href="{{.NextURL}}">Next</a>{{end}}</nav>{{end}}
+</div>
+{{end}}

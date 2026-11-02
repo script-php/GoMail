@@ -38,11 +38,16 @@ func TestPermanentDeleteRequiresTrashAndRemovesAttachment(t *testing.T) {
 	if err := db.ApplyMessageAction(1, []int64{id}, "trash", 0); err != nil {
 		t.Fatal(err)
 	}
+	trash, _ := db.GetFolderByType(1, "trash")
 	if err := db.PermanentlyDeleteMessages(2, []int64{id}); err == nil {
 		t.Fatal("other account permanently deleted message")
 	}
 	if err := db.PermanentlyDeleteMessages(1, []int64{id}); err != nil {
 		t.Fatal(err)
+	}
+	expunges, err := db.GetIMAPExpunges(1, trash.ID, 0)
+	if err != nil || len(expunges) != 1 || expunges[0].UID == 0 {
+		t.Fatalf("permanent-delete expunge history=%#v err=%v", expunges, err)
 	}
 	if message, _ := db.GetMessage(id, 1); message != nil {
 		t.Fatal("message still exists")
