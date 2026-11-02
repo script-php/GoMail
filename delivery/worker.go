@@ -239,6 +239,15 @@ func (w *Worker) processQueue() {
 	stopHeartbeat()
 
 	if deliveryErr != nil {
+		if errors.Is(deliveryErr, smtp.ErrDeliveryOutcomeUnknown) {
+			entry.Attempts++
+			metrics.IncDelivery("uncertain")
+			log.Printf("[delivery] worker %d: outcome unknown for queue entry %d; operator review required: %v", w.id, entry.ID, deliveryErr)
+			if err := w.transitionOwnedQueue(entry.ID, token, "uncertain", entry.Attempts, time.Now().UTC(), deliveryErr.Error(), 0, ""); err != nil {
+				w.logStatePersistenceFailure(entry, "uncertain", err)
+			}
+			return
+		}
 		smtpCode := extractSMTPCode(deliveryErr.Error())
 		if errors.Is(deliveryErr, store.ErrQuotaExceeded) {
 			metrics.IncQuota("delivery")
@@ -692,9 +701,13 @@ func (w *Worker) deliverDSN(senderEmail string, dsnReport string, finalQueueID i
 
 	// Store in Inbox
 	inboxFolder, err := w.db.GetFolderByType(account.ID, "inbox")
-	if err == nil && inboxFolder != nil {
-		msg.FolderID = &inboxFolder.ID
+	if err != nil {
+		return fmt.Errorf("getting DSN inbox folder: %w", err)
 	}
+	if inboxFolder == nil {
+		return fmt.Errorf("account %s has no inbox folder for DSN", senderEmail)
+	}
+	msg.FolderID = &inboxFolder.ID
 
 	if finalQueueID != 0 {
 		_, err = w.db.SaveFinalDSNMessage(msg, finalQueueID)

@@ -64,7 +64,7 @@ func (db *DB) TransitionOwnedQueueEntry(id int64, token, status string, attempts
 }
 
 func (db *DB) TransitionOwnedQueueEntryWithCode(id int64, token, status string, attempts int, nextRetry time.Time, lastError string, smtpCode int, successDetail string) error {
-	if token == "" || (status != "pending" && status != "failed" && status != "sent" && status != "cancelled") {
+	if token == "" || (status != "pending" && status != "failed" && status != "sent" && status != "cancelled" && status != "uncertain") {
 		return fmt.Errorf("invalid owned queue transition")
 	}
 	tx, err := db.Begin()
@@ -96,6 +96,9 @@ func (db *DB) TransitionOwnedQueueEntryWithCode(id int64, token, status string, 
 	}
 	if status == "cancelled" {
 		eventType = "sender_inactive"
+	}
+	if status == "uncertain" {
+		eventType = "outcome_uncertain"
 	}
 	if err := appendQueueEvent(tx, id, eventType, attempts, smtpCode, detail); err != nil {
 		return err

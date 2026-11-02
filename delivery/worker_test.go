@@ -41,6 +41,31 @@ func TestNullEnvelopeDSNDeliversLocally(t *testing.T) {
 	}
 }
 
+func TestOutboundDSNRequiresInbox(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&store.Domain{Domain: "example.test", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&store.Account{DomainID: domainID, Email: "sender@example.test", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM folders WHERE account_id = ? AND folder_type = 'inbox'`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	w := &Worker{db: db, cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.test", Domain: "example.test"}}}
+	report := "From: mailer-daemon@example.test\r\nTo: sender@example.test\r\nSubject: Delivery failed\r\n\r\nFailure.\r\n"
+	if err := w.deliverDSN("sender@example.test", report, 0); err == nil {
+		t.Fatal("DSN saved without an inbox")
+	}
+}
+
 func TestDeliveryFailureClassification(t *testing.T) {
 	for _, tc := range []struct {
 		message   string

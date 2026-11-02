@@ -143,6 +143,30 @@ func TestQueueClaimHeartbeatAndFencing(t *testing.T) {
 	}
 }
 
+func TestUnknownRemoteOutcomeRequiresOperatorResolution(t *testing.T) {
+	db := mailboxDB(t)
+	id := queueAdminEntry(t, db, "pending", "a@example.com", "b@example.net")
+	token, claimed, err := db.ClaimQueueEntry(id)
+	if err != nil || !claimed {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	if err := db.TransitionOwnedQueueEntryWithCode(id, token, "uncertain", 1, time.Now(), "final reply lost", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := db.QueueEntryStatus(id); err != nil || status != "uncertain" {
+		t.Fatalf("status: %s %v", status, err)
+	}
+	if pending, err := db.GetPendingQueue(10); err != nil || len(pending) != 0 {
+		t.Fatalf("unknown outcome automatically retried: %d %v", len(pending), err)
+	}
+	if err := db.TransitionOwnedQueueEntry(id, token, "sent", 1, time.Now(), ""); err == nil {
+		t.Fatal("cleared claim could finalize unknown outcome")
+	}
+	if resolved, err := db.ResolveUncertainQueueEntry(id, "retry"); err != nil || !resolved {
+		t.Fatalf("operator retry: %v %v", resolved, err)
+	}
+}
+
 func TestStartupRecoveryQuarantinesUnknownOutcome(t *testing.T) {
 	db := mailboxDB(t)
 	id := queueAdminEntry(t, db, "sending", "a@example.com", "b@example.net")

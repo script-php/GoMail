@@ -212,6 +212,90 @@ func TestWriteSMTPDataDotTransparency(t *testing.T) {
 	}
 }
 
+type shortSMTPWriter struct{ bytes.Buffer }
+
+func (w *shortSMTPWriter) Write(data []byte) (int, error) {
+	if len(data) > 1 {
+		data = data[:1]
+	}
+	return w.Buffer.Write(data)
+}
+
+func TestWriteSMTPDataHandlesShortWrites(t *testing.T) {
+	w := &shortSMTPWriter{}
+	if err := writeSMTPData(w, []byte("Subject: test\r\n\r\n.line")); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := w.String(), "Subject: test\r\n\r\n..line\r\n.\r\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestOutboundLostFinalReplyIsUncertain(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		r := bufio.NewReader(conn)
+		write := func(s string) error { _, err := conn.Write([]byte(s)); return err }
+		if err := write("220 mx.example.test ESMTP\r\n"); err != nil {
+			done <- err
+			return
+		}
+		for i, prefix := range []string{"EHLO ", "MAIL FROM:", "RCPT TO:", "DATA"} {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				done <- err
+				return
+			}
+			if !strings.HasPrefix(line, prefix) {
+				done <- errors.New("unexpected SMTP command: " + line)
+				return
+			}
+			reply := "250 ok\r\n"
+			if i == 0 {
+				reply = "250 mx.example.test\r\n"
+			}
+			if i == 3 {
+				reply = "354 continue\r\n"
+			}
+			if err := write(reply); err != nil {
+				done <- err
+				return
+			}
+		}
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				done <- err
+				return
+			}
+			if line == ".\r\n" {
+				break
+			}
+		}
+		// Simulate a peer that accepted DATA but lost its final reply.
+		done <- nil
+	}()
+	err = deliverToHostAt(listener.Addr().String(), "mx.example.test", "sender@example.test", "recipient@example.test", []byte("From: sender@example.test\r\nTo: recipient@example.test\r\n\r\nhello\r\n"), "mail.example.test", nil, false, "", "", "", "tcp", nil, "example.test", "disabled", nil)
+	if !errors.Is(err, ErrDeliveryOutcomeUnknown) {
+		t.Fatalf("expected uncertain outcome, got %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWriteSMTPDataPreservesCanonicalEightBitBytes(t *testing.T) {
 	message := []byte("Subject: café\r\n\r\nnaïve\r\n")
 	var out bytes.Buffer

@@ -23,6 +23,10 @@ import (
 var errMissingSMTPUTF8 = errors.New("SMTPUTF8 not advertised")
 var errMissing8BITMIME = errors.New("8BITMIME not advertised")
 
+// ErrDeliveryOutcomeUnknown means DATA may have been accepted, but its final
+// reply was not received. Retrying automatically could duplicate the message.
+var ErrDeliveryOutcomeUnknown = errors.New("remote delivery outcome unknown")
+
 // A delivery attempt is retryable if any candidate MX failed transiently.
 // The last MX's permanent reply must not hide a retryable earlier attempt.
 func preferredMXFailure(previous, current error) error {
@@ -188,6 +192,9 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 				if err == nil {
 					return nil // Success
 				}
+				if errors.Is(err, ErrDeliveryOutcomeUnknown) {
+					return err
+				}
 				lastErr = preferredMXFailure(lastErr, err)
 				log.Printf("[mta-sts] ENFORCE delivery to %s failed: %v, trying next MX", mx.Host, err)
 			} else if policy.Mode == "testing" {
@@ -200,6 +207,9 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 					log.Printf("[mta-sts] TESTING delivery to %s succeeded", mx.Host)
 					return nil
 				}
+				if errors.Is(err, ErrDeliveryOutcomeUnknown) {
+					return err
+				}
 				lastErr = preferredMXFailure(lastErr, err)
 				log.Printf("[mta-sts] TESTING violation for %s: %v", mx.Host, err)
 			}
@@ -208,6 +218,9 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 			err := deliverToHost(mx.Host, from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, daneEnforcement, nil, originalRecipient)
 			if err == nil {
 				return nil // Success
+			}
+			if errors.Is(err, ErrDeliveryOutcomeUnknown) {
+				return err
 			}
 			lastErr = preferredMXFailure(lastErr, err)
 			log.Printf("[smtp] delivery to %s failed: %v, trying next MX", mx.Host, err)
@@ -224,8 +237,11 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 // recipientDomain: recipient domain for TLS failure reporting (optional, used only if db != nil)
 // daneEnforcement is resolved once before MX lookup; DB errors cannot downgrade it.
 func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, daneEnforcement string, stsPolicy *mta_sts.Policy, originalRecipients ...string) error {
-	// Connect to port 25
-	addr := host + ":25"
+	return deliverToHostAt(net.JoinHostPort(host, "25"), host, from, to, msg, myHostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, daneEnforcement, stsPolicy, originalRecipients...)
+}
+
+// deliverToHostAt permits loopback interoperability tests without binding port 25.
+func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, daneEnforcement string, stsPolicy *mta_sts.Policy, originalRecipients ...string) error {
 	conn, err := net.DialTimeout(network, addr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", addr, err)
@@ -503,12 +519,12 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 
 	// Send message with RFC 5321 dot transparency and exactly one terminator.
 	if err := writeSMTPData(smtpDeadlineWriter{conn: conn, timeout: 3 * time.Minute}, msg); err != nil {
-		return fmt.Errorf("writing message to %s: %w", host, err)
+		return fmt.Errorf("writing message to %s: %w: %v", host, ErrDeliveryOutcomeUnknown, err)
 	}
 
 	finalReply, err := readReplyWithTimeout(conn, 10*time.Minute)
 	if err != nil {
-		return fmt.Errorf("reading final reply from %s: %w", host, err)
+		return fmt.Errorf("reading final reply from %s: %w: %v", host, ErrDeliveryOutcomeUnknown, err)
 	}
 	if !strings.HasPrefix(finalReply, "250") {
 		return fmt.Errorf("message rejected by %s: %s", host, finalReply)
@@ -865,24 +881,40 @@ func writeSMTPData(w io.Writer, msg []byte) error {
 	lines := bytes.Split(msg, []byte("\r\n"))
 	for i, line := range lines {
 		if len(line) > 0 && line[0] == '.' {
-			if _, err := w.Write([]byte{'.'}); err != nil {
+			if err := writeSMTPChunk(w, []byte{'.'}); err != nil {
 				return err
 			}
 		}
-		if _, err := w.Write(line); err != nil {
+		if err := writeSMTPChunk(w, line); err != nil {
 			return err
 		}
 		if i < len(lines)-1 {
-			if _, err := w.Write([]byte("\r\n")); err != nil {
+			if err := writeSMTPChunk(w, []byte("\r\n")); err != nil {
 				return err
 			}
 		}
 	}
 	if !bytes.HasSuffix(msg, []byte("\r\n")) {
-		if _, err := w.Write([]byte("\r\n")); err != nil {
+		if err := writeSMTPChunk(w, []byte("\r\n")); err != nil {
 			return err
 		}
 	}
-	_, err := w.Write([]byte(".\r\n"))
-	return err
+	return writeSMTPChunk(w, []byte(".\r\n"))
+}
+
+func writeSMTPChunk(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n < 0 || n > len(data) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
