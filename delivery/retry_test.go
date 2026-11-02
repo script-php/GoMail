@@ -36,3 +36,25 @@ func TestDefaultRetryLifetimeExceedsFiveDays(t *testing.T) {
 		t.Fatalf("default temporary-failure lifetime is only %s", lifetime)
 	}
 }
+
+func TestRetryScheduleNeverOverflowsIntoImmediateRetry(t *testing.T) {
+	schedule := NewRetrySchedule([]int{31557600})
+	before := time.Now().UTC()
+	next := schedule.NextRetry(1_000_000)
+	if next.Before(before.Add(48*time.Hour)) || next.After(time.Now().UTC().Add(48*time.Hour+time.Second)) {
+		t.Fatalf("overflowed retry schedule: %s", next)
+	}
+	if got := NewRetrySchedule(nil).NextRetry(1); got.Before(time.Now().Add(29 * time.Minute)) {
+		t.Fatalf("empty schedule did not delay retry: %s", got)
+	}
+}
+
+func TestConfigRejectsNonPositiveRetryIntervals(t *testing.T) {
+	for _, intervals := range [][]int{{-1}, {30, 0}, {31557601}} {
+		cfg := &config.Config{Server: config.ServerConfig{Hostname: "mail.example.test"}, TLS: config.TLSConfig{Mode: "none"}}
+		cfg.Delivery.RetryIntervals = intervals
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted invalid retry intervals %v", intervals)
+		}
+	}
+}

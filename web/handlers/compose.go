@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"mime"
+	"mime/quotedprintable"
 	"net/http"
 	"net/mail"
 	"os"
@@ -181,6 +183,11 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No valid recipients", http.StatusBadRequest)
 		return
 	}
+	toHeader, _ := formatRecipientHeader(to) // parseRecipients validated this input.
+	ccHeader := ""
+	if cc != "" {
+		ccHeader, _ = formatRecipientHeader(cc)
+	}
 	if limits := h.db.OutboundLimits(); limits.Enabled && len(recipients) > limits.MaxRecipientsPerMessage {
 		http.Error(w, fmt.Sprintf("A message can have at most %d recipients", limits.MaxRecipientsPerMessage), http.StatusUnprocessableEntity)
 		return
@@ -253,6 +260,10 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		if i >= 10 {
 			attachmentErrors = append(attachmentErrors, "Maximum 10 attachments allowed")
 			break
+		}
+		if _, _, err := composeAttachmentHeaders(fileHeader.Filename); err != nil {
+			attachmentErrors = append(attachmentErrors, "Invalid or overlong attachment filename")
+			continue
 		}
 
 		if fileHeader.Size > 25*1024*1024 {
@@ -328,15 +339,16 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	clientIP := getRealClientIP(r)
 
 	var msg strings.Builder
+	encodedBody := encodeComposeTextBody(body)
 
-	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID, strings.Join(recipients, ", "), time.Now()))
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
+	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID, recipients, time.Now()))
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", toHeader))
 	if cc != "" {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(cc)))
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", ccHeader))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(subject)))
+	msg.WriteString(formatUnstructuredHeader("Subject", subject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	msg.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
 	if replyMessageID > 0 {
@@ -358,7 +370,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("Priority: %s\r\n", priorityToText(priority)))
 	msg.WriteString(fmt.Sprintf("Importance: %s\r\n", priorityToImportance(priority)))
 	if readReceipt {
-		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", encodeHeaderValue(from)))
+		msg.WriteString(fmt.Sprintf("Disposition-Notification-To: %s\r\n", from))
 	}
 
 	msg.WriteString("MIME-Version: 1.0\r\n")
@@ -372,9 +384,9 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		// Add body as first part
 		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-		msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+		msg.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
 		msg.WriteString("\r\n")
-		msg.WriteString(body)
+		msg.WriteString(encodedBody)
 		msg.WriteString("\r\n")
 
 		// Add attachments
@@ -383,9 +395,10 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 			content := attach["content"].([]byte)
 
 			msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-			msg.WriteString(fmt.Sprintf("Content-Type: application/octet-stream; name=\"%s\"\r\n", encodeHeaderValue(filename)))
+			contentType, disposition, _ := composeAttachmentHeaders(filename)
+			msg.WriteString("Content-Type: " + contentType + "\r\n")
 			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
-			msg.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n", encodeHeaderValue(filename)))
+			msg.WriteString("Content-Disposition: " + disposition + "\r\n")
 			msg.WriteString("\r\n")
 
 			// Encode content as base64 with line wrapping
@@ -399,15 +412,19 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// No attachments - simple text/plain message
 		msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-		msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+		msg.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
 		msg.WriteString("\r\n")
-		msg.WriteString(body)
+		msg.WriteString(encodedBody)
 	}
 
 	// Enqueue for delivery (queue handles per-domain DKIM signing and message saving)
 	enqueueErr := h.queue.Enqueue(from, recipients, []byte(msg.String()), account.ID)
 	if enqueueErr != nil {
 		log.Printf("[web] enqueue error: %v", enqueueErr)
+		if errors.Is(enqueueErr, delivery.ErrInvalidMessage) {
+			http.Error(w, "Message headers are too long or contain invalid line endings. Shorten the subject or recipients and try again.", http.StatusUnprocessableEntity)
+			return
+		}
 		if errors.Is(enqueueErr, store.ErrOutboundLimit) {
 			metrics.IncOutboundLimit("webmail")
 			http.Error(w, "Your outbound sending limit was reached. Try again later or contact an administrator.", http.StatusTooManyRequests)
@@ -431,6 +448,30 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[web] message enqueued from=%s to=%v subject=%s attachments=%d", from, recipients, subject, len(attachmentData))
 	http.Redirect(w, r, "/sent", http.StatusSeeOther)
+}
+
+func composeAttachmentHeaders(filename string) (contentType, disposition string, err error) {
+	// RFC 2231 may expand UTF-8 octets to percent-encoded triplets. Bound
+	// the source so each generated SMTP header remains below 1000 octets.
+	if filename == "" || len(filename) > 180 || strings.ContainsAny(filename, "\r\n\x00") {
+		return "", "", fmt.Errorf("invalid attachment filename")
+	}
+	contentType = mime.FormatMediaType("application/octet-stream", map[string]string{"name": filename})
+	disposition = mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	if contentType == "" || disposition == "" || len("Content-Type: ")+len(contentType)+2 > 1000 || len("Content-Disposition: ")+len(disposition)+2 > 1000 {
+		return "", "", fmt.Errorf("attachment MIME header is too long")
+	}
+	return contentType, disposition, nil
+}
+
+// encodeComposeTextBody emits canonical, bounded SMTP lines before DKIM signs
+// the message. Browser textareas commonly submit LF-only line breaks.
+func encodeComposeTextBody(body string) string {
+	var encoded strings.Builder
+	writer := quotedprintable.NewWriter(&encoded)
+	_, _ = writer.Write([]byte(normalizeBodyLineEndings(body)))
+	_ = writer.Close()
+	return encoded.String()
 }
 
 func replySubject(subject string) string {

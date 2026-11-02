@@ -40,6 +40,57 @@ func TestSubmissionAcceptsPHPMailerDSNAndRejectsUnsupportedRCPTParameters(t *tes
 	}
 }
 
+func TestSubmissionRepeatedRecipientDoesNotQueueTwice(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "mail.db"), filepath.Join(t.TempDir(), "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p := &submissionSession{server: &Server{db: db, cfg: &config.Config{SMTP: config.SMTPConfig{MaxRecipients: 2}, Clients: config.MailClientsConfig{WriteTimeout: 5}}}, conn: server, writer: bufio.NewWriter(server), mailFrom: "alice@example.test", greeted: true, ehlo: true}
+	reader := bufio.NewReader(client)
+	for _, command := range []string{
+		"TO:<Bob@example.net> NOTIFY=FAILURE",
+		"TO:<Bob@EXAMPLE.NET> NOTIFY=SUCCESS",
+		"TO:<bob@example.net> NOTIFY=DELAY",
+	} {
+		done := make(chan struct{})
+		go func() { p.handleRCPT(command); close(done) }()
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		line, err := reader.ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, "250 ") {
+			t.Fatalf("RCPT %q response=%q err=%v", command, line, err)
+		}
+		<-done
+	}
+	if len(p.recipients) != 2 || p.recipients[0] != "Bob@example.net" || p.recipients[1] != "bob@example.net" {
+		t.Fatalf("recipients=%v", p.recipients)
+	}
+	if len(p.dsnNotify) != 2 || p.dsnNotify[0] != "FAILURE" || p.dsnNotify[1] != "DELAY" {
+		t.Fatalf("DSN options=%v", p.dsnNotify)
+	}
+}
+
+func TestSubmissionRejectsInternationalizedRecipientWithoutSMTPUTF8(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p := &submissionSession{server: &Server{cfg: &config.Config{SMTP: config.SMTPConfig{MaxRecipients: 10}, Clients: config.MailClientsConfig{WriteTimeout: 5}}}, conn: server, writer: bufio.NewWriter(server), mailFrom: "alice@example.test", greeted: true, ehlo: true}
+	done := make(chan struct{})
+	go func() { p.handleRCPT("TO:<josé@example.net>"); close(done) }()
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	line, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "553 ") {
+		t.Fatalf("RCPT response=%q err=%v", line, err)
+	}
+	<-done
+	if len(p.recipients) != 0 {
+		t.Fatalf("internationalized recipient queued: %v", p.recipients)
+	}
+}
+
 func TestSubmissionDSNParameterParsing(t *testing.T) {
 	for _, tc := range []struct {
 		name, command, wantReply, wantReturn, wantEnvID string

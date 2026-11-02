@@ -187,6 +187,11 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No valid recipients", http.StatusBadRequest)
 		return
 	}
+	toHeader, _ := formatRecipientHeader(to) // parseRecipients validated this input.
+	ccHeader := ""
+	if cc != "" {
+		ccHeader, _ = formatRecipientHeader(cc)
+	}
 	if limits := h.db.OutboundLimits(); limits.Enabled && len(recipients) > limits.MaxRecipientsPerMessage {
 		http.Error(w, fmt.Sprintf("A message can have at most %d recipients", limits.MaxRecipientsPerMessage), http.StatusUnprocessableEntity)
 		return
@@ -223,19 +228,19 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	// Build forwarded message
 	var msg strings.Builder
 
-	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID2, strings.Join(recipients, ", "), time.Now()))
+	msg.WriteString(originatingHeaders(h.cfg.Mail.StripOriginatingIP, clientIP, h.cfg.Server.Hostname, msgID2, recipients, time.Now()))
 
 	// A user forward is a new message, not a resend of the original.
 	// From identifies the forwarder; the original sender remains in the body
 	// and attached message/rfc822, not in Reply-To.
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", encodeHeaderValue(from)))
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 
 	// Use the actual forward recipient, not the original message's recipient
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", encodeHeaderValue(to)))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", toHeader))
 	if cc != "" {
-		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeHeaderValue(cc)))
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", ccHeader))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeHeaderValue(subject)))
+	msg.WriteString(formatUnstructuredHeader("Subject", subject))
 	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 
 	// Message-ID for the wrapper message (not the original)
@@ -258,26 +263,9 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	msg.WriteString("Content-Disposition: inline\r\n")
-	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+	msg.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
 	msg.WriteString("\r\n")
-	if forwardNotes != "" {
-		msg.WriteString(normalizeBodyLineEndings(forwardNotes))
-		msg.WriteString("\r\n\r\n")
-	}
-	msg.WriteString("---------- Forwarded message ----------\r\n")
-	msg.WriteString("From: " + singleLineBodyValue(originalMsg.FromAddr) + "\r\n")
-	msg.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
-	msg.WriteString("Subject: " + singleLineBodyValue(originalMsg.Subject) + "\r\n")
-	msg.WriteString("To: " + singleLineBodyValue(originalMsg.ToAddr) + "\r\n")
-	if originalMsg.CcAddr != "" {
-		msg.WriteString("Cc: " + singleLineBodyValue(originalMsg.CcAddr) + "\r\n")
-	}
-	msg.WriteString("\r\n")
-	if originalMsg.TextBody != "" {
-		msg.WriteString(normalizeBodyLineEndings(originalMsg.TextBody))
-	} else if originalMsg.HTMLBody != "" {
-		msg.WriteString("[The original message contains HTML content. See the attached original message.]\r\n")
-	}
+	msg.WriteString(encodeComposeTextBody(forwardInlineText(forwardNotes, originalMsg)))
 	msg.WriteString("\r\n")
 
 	// Part 2 attaches the complete source message. RawMessage preserves the
@@ -299,7 +287,9 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if err := h.queue.Enqueue(from, recipients, messageToEnqueue, account.ID); err != nil {
 		log.Printf("[forward] enqueue error: %v", err)
 		message := "The message could not be queued. Please try again."
-		if errors.Is(err, store.ErrOutboundLimit) {
+		if errors.Is(err, delivery.ErrInvalidMessage) {
+			message = "Message headers are too long or contain invalid line endings. Shorten the subject or recipients and try again."
+		} else if errors.Is(err, store.ErrOutboundLimit) {
 			metrics.IncOutboundLimit("forward")
 			message = "Your outbound sending limit was reached. Try again later or contact an administrator."
 		} else if errors.Is(err, store.ErrDiskPressure) {
@@ -317,6 +307,29 @@ func (h *ForwardHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[forward] message forwarded from=%s to=%v msgID=%d", from, recipients, msgID)
 	http.Redirect(w, r, "/message/"+msgIDStr, http.StatusSeeOther)
+}
+
+func forwardInlineText(notes string, original *store.Message) string {
+	var body strings.Builder
+	if notes != "" {
+		body.WriteString(normalizeBodyLineEndings(notes))
+		body.WriteString("\r\n\r\n")
+	}
+	body.WriteString("---------- Forwarded message ----------\r\n")
+	body.WriteString("From: " + singleLineBodyValue(original.FromAddr) + "\r\n")
+	body.WriteString("Date: " + original.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
+	body.WriteString("Subject: " + singleLineBodyValue(original.Subject) + "\r\n")
+	body.WriteString("To: " + singleLineBodyValue(original.ToAddr) + "\r\n")
+	if original.CcAddr != "" {
+		body.WriteString("Cc: " + singleLineBodyValue(original.CcAddr) + "\r\n")
+	}
+	body.WriteString("\r\n")
+	if original.TextBody != "" {
+		body.WriteString(normalizeBodyLineEndings(original.TextBody))
+	} else if original.HTMLBody != "" {
+		body.WriteString("[The original message contains HTML content. See the attached original message.]\r\n")
+	}
+	return body.String()
 }
 
 // forwardedRFC822Bytes keeps a stored source message byte-for-byte intact.
@@ -382,16 +395,16 @@ func buildForwardedRFC822(originalMsg *store.Message) string {
 	var rfc822Message strings.Builder
 
 	// Essential headers only (From, To, Cc, Date, Subject, Message-ID, Reply-To)
-	rfc822Message.WriteString("From: " + encodeHeaderValue(originalMsg.FromAddr) + "\r\n")
-	rfc822Message.WriteString("To: " + encodeHeaderValue(originalMsg.ToAddr) + "\r\n")
+	rfc822Message.WriteString("From: " + formatLegacyAddressHeader(originalMsg.FromAddr) + "\r\n")
+	rfc822Message.WriteString("To: " + formatLegacyAddressHeader(originalMsg.ToAddr) + "\r\n")
 	if originalMsg.CcAddr != "" {
-		rfc822Message.WriteString("Cc: " + encodeHeaderValue(originalMsg.CcAddr) + "\r\n")
+		rfc822Message.WriteString("Cc: " + formatLegacyAddressHeader(originalMsg.CcAddr) + "\r\n")
 	}
 	if originalMsg.ReplyTo != "" {
-		rfc822Message.WriteString("Reply-To: " + encodeHeaderValue(originalMsg.ReplyTo) + "\r\n")
+		rfc822Message.WriteString("Reply-To: " + formatLegacyAddressHeader(originalMsg.ReplyTo) + "\r\n")
 	}
 	rfc822Message.WriteString("Date: " + originalMsg.ReceivedAt.Format(time.RFC1123Z) + "\r\n")
-	rfc822Message.WriteString("Subject: " + encodeHeaderValue(originalMsg.Subject) + "\r\n")
+	rfc822Message.WriteString(formatUnstructuredHeader("Subject", originalMsg.Subject))
 
 	// Message-ID must be wrapped in angle brackets per RFC 5322
 	messageID := originalMsg.MessageID

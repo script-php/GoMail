@@ -406,6 +406,11 @@ func (c *Config) Validate() error {
 	if len(c.Delivery.RetryIntervals) == 0 {
 		c.Delivery.RetryIntervals = []int{1800, 3600, 7200, 14400, 28800, 43200, 86400, 86400, 86400, 86400}
 	}
+	for i, seconds := range c.Delivery.RetryIntervals {
+		if seconds <= 0 || seconds > 31557600 {
+			return fmt.Errorf("delivery.retry_intervals[%d] must be between 1 second and 1 year", i)
+		}
+	}
 	if c.Delivery.DSNDelayAfterSeconds <= 0 {
 		c.Delivery.DSNDelayAfterSeconds = 14400
 	}

@@ -245,7 +245,7 @@ func (s *InboundServer) runSession(sess *Session) {
 	for sess.state != StateQuit {
 		sess.conn.SetReadDeadline(time.Now().Add(sess.readTimeout))
 
-		line, err := security.ReadLineLimited(sess.reader, 1000)
+		line, err := security.ReadLineLimited(sess.reader, security.SMTPCommandLineLimit)
 		if err != nil {
 			return
 		}

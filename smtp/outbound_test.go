@@ -3,6 +3,7 @@ package smtp
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"net"
 	"path/filepath"
@@ -39,6 +40,31 @@ func TestDANETransportPolicy(t *testing.T) {
 				t.Fatalf("got TLS=%v auth=%v err=%v", requireTLS, authenticate, err)
 			}
 		})
+	}
+}
+
+func TestOutboundPreservesConfiguredTLSMinimum(t *testing.T) {
+	for _, tc := range []struct{ configured, want uint16 }{
+		{0, tls.VersionTLS12},
+		{tls.VersionTLS10, tls.VersionTLS12},
+		{tls.VersionTLS12, tls.VersionTLS12},
+		{tls.VersionTLS13, tls.VersionTLS13},
+	} {
+		if got := outboundMinTLSVersion(tc.configured); got != tc.want {
+			t.Fatalf("configured %#x became %#x, want %#x", tc.configured, got, tc.want)
+		}
+	}
+}
+
+func TestDANESNIUsesTLSABaseDomain(t *testing.T) {
+	for _, tc := range []struct{ mx, owner, want string }{
+		{"mx.example.test", "_25._tcp.canonical.example.test.", "canonical.example.test"},
+		{"mx.example.test", "_25._tcp.mx.example.test.", "mx.example.test"},
+		{"mx.example.test", "", "mx.example.test"},
+	} {
+		if got := tlsaBaseDomain(tc.mx, tc.owner); got != tc.want {
+			t.Fatalf("MX %q TLSA %q: SNI %q, want %q", tc.mx, tc.owner, got, tc.want)
+		}
 	}
 }
 
@@ -87,8 +113,8 @@ func TestPreferredMXFailureDoesNotHideRetryableFailure(t *testing.T) {
 	if got := preferredMXFailure(nil, extensionErr); !errors.Is(got, errMissing8BITMIME) {
 		t.Fatalf("all-incompatible MX result lost permanent failure: %v", got)
 	}
-	transientReply := errors.New("RCPT TO rejected by mx1.example: 451 4.3.0 try later")
-	permanentReply := errors.New("RCPT TO rejected by mx2.example: 550 5.1.1 unknown user")
+	transientReply := &replyFailure{"RCPT TO rejected by mx1.example", "451 4.3.0 try later"}
+	permanentReply := &replyFailure{"RCPT TO rejected by mx2.example", "550 5.1.1 unknown user"}
 	if got := preferredMXFailure(transientReply, permanentReply); got != transientReply {
 		t.Fatalf("later 5xx concealed earlier 4xx: %v", got)
 	}
@@ -97,6 +123,17 @@ func TestPreferredMXFailureDoesNotHideRetryableFailure(t *testing.T) {
 	}
 	if got := preferredMXFailure(permanentReply, extensionErr); got != permanentReply {
 		t.Fatalf("all-permanent MX outcome changed unexpectedly: %v", got)
+	}
+}
+
+func TestSMTPFailureCodeIgnoresNonSMTPStatusNumbers(t *testing.T) {
+	for _, message := range []string{"MTA-STS policy for example.test: policy endpoint returned HTTP 503", "TLS handshake failed: remote port 550", "DNS lookup failed: resolver 503"} {
+		if code := SMTPFailureCode(errors.New(message)); code != 0 {
+			t.Fatalf("non-SMTP error %q classified as %d", message, code)
+		}
+	}
+	if code := SMTPFailureCode(&replyFailure{"RCPT TO rejected by mx.example", "550 5.1.1 unknown user"}); code != 550 {
+		t.Fatalf("real SMTP failure code = %d", code)
 	}
 }
 

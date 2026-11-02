@@ -104,7 +104,7 @@ func (s *Session) Handle() {
 	for s.state != StateQuit {
 		s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
-		line, err := security.ReadLineLimited(s.reader, 1000)
+		line, err := security.ReadLineLimited(s.reader, security.SMTPCommandLineLimit)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("[smtp] read error from %s: %v", s.clientAddr, err)

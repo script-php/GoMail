@@ -1,9 +1,6 @@
 package delivery
 
-import (
-	"math"
-	"time"
-)
+import "time"
 
 // RetrySchedule calculates the next retry time based on the attempt number
 // and configured retry intervals.
@@ -25,17 +22,29 @@ func (r *RetrySchedule) NextRetry(attempt int) time.Time {
 	if index < 0 {
 		index = 0
 	}
-	if index < len(r.Intervals) {
+	if len(r.Intervals) == 0 {
+		delaySec = 1800
+	} else if index < len(r.Intervals) {
 		delaySec = r.Intervals[index]
 	} else {
-		// Exponential backoff from last interval
-		lastInterval := r.Intervals[len(r.Intervals)-1]
+		// Saturating integer backoff avoids floating-point overflow for
+		// unusually large attempt numbers.
+		delaySec = r.Intervals[len(r.Intervals)-1]
 		extra := index - len(r.Intervals) + 1
-		delaySec = lastInterval * int(math.Pow(2, float64(extra)))
-		// Cap at 48 hours
+		for extra > 0 && delaySec < 172800 {
+			if delaySec > 86400 {
+				delaySec = 172800
+			} else {
+				delaySec *= 2
+			}
+			extra--
+		}
 		if delaySec > 172800 {
 			delaySec = 172800
 		}
+	}
+	if delaySec <= 0 {
+		delaySec = 1800
 	}
 
 	return time.Now().UTC().Add(time.Duration(delaySec) * time.Second)

@@ -248,7 +248,7 @@ func (w *Worker) processQueue() {
 			}
 			return
 		}
-		smtpCode := extractSMTPCode(deliveryErr.Error())
+		smtpCode := smtp.SMTPFailureCode(deliveryErr)
 		if errors.Is(deliveryErr, store.ErrQuotaExceeded) {
 			metrics.IncQuota("delivery")
 			smtpCode = 452
@@ -499,6 +499,16 @@ func parseRecipientDomain(email string) string {
 // extractSMTPCode extracts SMTP reply code from error message.
 // Example: "message rejected by host.com: 550 5.1.1 user unknown"
 func extractSMTPCode(errMsg string) int {
+	// This is only for the diagnostic code of persisted, pre-existing queue
+	// failures. Live retry decisions use typed SMTPFailureCode instead.
+	knownReply := strings.Contains(errMsg, "rejected by ") || strings.Contains(errMsg, "unexpected greeting from ") ||
+		strings.Contains(errMsg, "EHLO rejected:") || strings.Contains(errMsg, "HELO rejected:") ||
+		strings.Contains(errMsg, "invalid queued message") || strings.Contains(errMsg, "SMTPUTF8 required") ||
+		strings.Contains(errMsg, "8BITMIME required") || strings.Contains(errMsg, "recipient domain has no MX") ||
+		strings.Contains(errMsg, "recipient domain does not accept mail")
+	if !knownReply {
+		return 0
+	}
 	parts := strings.Fields(errMsg)
 	for _, part := range parts {
 		if len(part) == 3 {

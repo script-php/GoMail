@@ -9,6 +9,10 @@ import (
 var ErrLineTooLong = errors.New("protocol line too long")
 var ErrInvalidLineEnding = errors.New("protocol line requires CRLF framing")
 
+// SMTPCommandLineLimit includes CRLF. RFC 3461 requires DSN-capable SMTP
+// servers to accept command lines of at least 1036 octets.
+const SMTPCommandLineLimit = 1036
+
 // ParseCRLFCommandLine accepts exactly one CRLF-terminated command line.
 // A bare CR inside the command is invalid, not whitespace to be trimmed.
 func ParseCRLFCommandLine(line string) (string, error) {

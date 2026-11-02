@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,10 +21,40 @@ import (
 
 var errMissingSMTPUTF8 = errors.New("SMTPUTF8 not advertised")
 var errMissing8BITMIME = errors.New("8BITMIME not advertised")
+var errInvalidQueuedMessage = errors.New("invalid queued message")
 
 // ErrDeliveryOutcomeUnknown means DATA may have been accepted, but its final
 // reply was not received. Retrying automatically could duplicate the message.
 var ErrDeliveryOutcomeUnknown = errors.New("remote delivery outcome unknown")
+
+type replyFailure struct {
+	context string
+	reply   string
+}
+
+func (e *replyFailure) Error() string { return e.context + ": " + e.reply }
+
+// SMTPFailureCode reports only actual SMTP replies or locally generated
+// permanent address/format failures, never numbers found in HTTP/DNS errors.
+func SMTPFailureCode(err error) int {
+	var reply *replyFailure
+	if errors.As(err, &reply) {
+		code := smtpReplyCode(reply.reply)
+		if len(code) == 3 && code[0] >= '4' && code[0] <= '5' {
+			return int(code[0]-'0')*100 + int(code[1]-'0')*10 + int(code[2]-'0')
+		}
+	}
+	if errors.Is(err, godns.ErrNullMX) {
+		return 556
+	}
+	if errors.Is(err, godns.ErrNoMailRoute) {
+		return 550
+	}
+	if errors.Is(err, errInvalidQueuedMessage) || isMissingMessageExtension(err) {
+		return 554
+	}
+	return 0
+}
 
 // A delivery attempt is retryable if any candidate MX failed transiently.
 // The last MX's permanent reply must not hide a retryable earlier attempt.
@@ -43,24 +72,8 @@ func preferredMXFailure(previous, current error) error {
 }
 
 func isPermanentMXFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	if isMissingMessageExtension(err) {
-		return true
-	}
-	// Remote SMTP replies are embedded in contextual errors as bare three-digit
-	// tokens. Network, DNS and TLS failures have no reply code and must retry.
-	for _, field := range strings.Fields(err.Error()) {
-		if len(field) != 3 {
-			continue
-		}
-		code, parseErr := strconv.Atoi(field)
-		if parseErr == nil && code >= 400 && code <= 599 {
-			return code >= 500
-		}
-	}
-	return false
+	code := SMTPFailureCode(err)
+	return code >= 500 && code < 600
 }
 
 func isMissingMessageExtension(err error) bool {
@@ -107,7 +120,7 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 		return fmt.Errorf("invalid envelope address")
 	}
 	if err := validateSMTPDataLines(msg); err != nil {
-		return fmt.Errorf("554 5.6.0 invalid queued message: %w", err)
+		return fmt.Errorf("554 5.6.0 invalid queued message: %w: %v", errInvalidQueuedMessage, err)
 	}
 	// Extract sender domain (for DANE/TLS settings lookup)
 	fromParts := strings.SplitN(from, "@", 2)
@@ -254,7 +267,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return fmt.Errorf("reading greeting from %s: %w", host, err)
 	}
 	if !strings.HasPrefix(reply, "220") {
-		return fmt.Errorf("unexpected greeting from %s: %s", host, reply)
+		return &replyFailure{fmt.Sprintf("unexpected greeting from %s", host), reply}
 	}
 
 	// Check if server supports DSN (Delivery Status Notifications) and SMTPUTF8
@@ -304,17 +317,17 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 			}
 			if strings.HasPrefix(startTLSReply, "220") {
 				clientConfig := tlsCfg.Clone()
-				clientConfig.ServerName = host
-				clientConfig.MinVersion = tls.VersionTLS12
+				tlsaHost := host
+				if daneLookup.Authenticated && (len(daneLookup.Records) > 0 || daneLookup.UnusableRecords) {
+					tlsaHost = tlsaBaseDomain(host, daneLookup.Name)
+				}
+				clientConfig.ServerName = tlsaHost
+				clientConfig.MinVersion = outboundMinTLSVersion(clientConfig.MinVersion)
 				stsMode := ""
 				if stsPolicy != nil {
 					stsMode = stsPolicy.Mode
 				}
 				if daneAuthenticate {
-					verifyHost := host
-					if strings.HasPrefix(daneLookup.Name, "_25._tcp.") {
-						verifyHost = strings.TrimSuffix(strings.TrimPrefix(daneLookup.Name, "_25._tcp."), ".")
-					}
 					clientConfig.InsecureSkipVerify = true // VerifyConnection below replaces default verification.
 					clientConfig.VerifyConnection = func(state tls.ConnectionState) error {
 						if stsMode == "enforce" || stsMode == "testing" {
@@ -324,7 +337,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 						if daneEnforcement == "required" {
 							extraNames = append(extraNames, recipientDomain)
 						}
-						daneVerifyResult, daneVerifyErr = tlsconfig.VerifyDANECertificates(verifyHost, state.PeerCertificates, daneLookup.Records, clientConfig.RootCAs, time.Now(), extraNames...)
+						daneVerifyResult, daneVerifyErr = tlsconfig.VerifyDANECertificates(tlsaHost, state.PeerCertificates, daneLookup.Records, clientConfig.RootCAs, time.Now(), extraNames...)
 						if daneVerifyErr == nil && daneVerifyResult.Matched {
 							if stsMode == "enforce" {
 								return stsVerifyErr
@@ -356,6 +369,11 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 						stsVerifyErr = verifySTSCertificate(state.PeerCertificates, host, clientConfig.RootCAs)
 						return nil
 					}
+				} else if !effectiveRequireTLS && stsMode != "enforce" {
+					// Ordinary opportunistic SMTP encrypts the connection without
+					// authenticating the peer. Never apply this to an enforced policy.
+					clientConfig.InsecureSkipVerify = true
+					clientConfig.VerifyConnection = nil
 				}
 				clientTLS := tls.Client(conn, clientConfig)
 				if err := conn.SetDeadline(time.Now().Add(5 * time.Minute)); err != nil {
@@ -432,7 +450,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 						return fmt.Errorf("reading post-STARTTLS EHLO from %s: %w", host, err)
 					}
 					if !strings.HasPrefix(postTLSEhlo, "250 ") && !strings.HasPrefix(postTLSEhlo, "250-") {
-						return fmt.Errorf("post-STARTTLS EHLO rejected by %s: %s", host, postTLSEhlo)
+						return &replyFailure{fmt.Sprintf("post-STARTTLS EHLO rejected by %s", host), postTLSEhlo}
 					}
 					capabilities = ehloCapabilities(postTLSEhlo)
 					supportsDSN = capabilities["DSN"]
@@ -440,7 +458,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 					supports8Bit = capabilities["8BITMIME"]
 				}
 			} else if effectiveRequireTLS {
-				return fmt.Errorf("TLS required but STARTTLS was rejected by %s: %s", host, startTLSReply)
+				return &replyFailure{fmt.Sprintf("TLS required but STARTTLS was rejected by %s", host), startTLSReply}
 			}
 		}
 	} else if !capabilities["STARTTLS"] {
@@ -488,7 +506,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return err
 	}
 	if !strings.HasPrefix(mailReply, "250") {
-		return fmt.Errorf("MAIL FROM rejected by %s: %s", host, mailReply)
+		return &replyFailure{fmt.Sprintf("MAIL FROM rejected by %s", host), mailReply}
 	}
 
 	// SMTPUTF8 is a MAIL FROM parameter, not an RCPT TO parameter.
@@ -502,7 +520,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return err
 	}
 	if code := smtpReplyCode(rcptReply); code != "250" && code != "251" {
-		return fmt.Errorf("RCPT TO rejected by %s: %s", host, rcptReply)
+		return &replyFailure{fmt.Sprintf("RCPT TO rejected by %s", host), rcptReply}
 	}
 
 	// DATA
@@ -514,7 +532,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return err
 	}
 	if !strings.HasPrefix(dataReply, "354") {
-		return fmt.Errorf("DATA rejected by %s: %s", host, dataReply)
+		return &replyFailure{fmt.Sprintf("DATA rejected by %s", host), dataReply}
 	}
 
 	// Send message with RFC 5321 dot transparency and exactly one terminator.
@@ -527,7 +545,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return fmt.Errorf("reading final reply from %s: %w: %v", host, ErrDeliveryOutcomeUnknown, err)
 	}
 	if !strings.HasPrefix(finalReply, "250") {
-		return fmt.Errorf("message rejected by %s: %s", host, finalReply)
+		return &replyFailure{fmt.Sprintf("message rejected by %s", host), finalReply}
 	}
 
 	// QUIT
@@ -536,6 +554,24 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 
 	log.Printf("[smtp] delivered to %s via %s", to, host)
 	return nil
+}
+
+func outboundMinTLSVersion(configured uint16) uint16 {
+	if configured > tls.VersionTLS12 {
+		return configured
+	}
+	return tls.VersionTLS12
+}
+
+func tlsaBaseDomain(mxHost, owner string) string {
+	const prefix = "_25._tcp."
+	if strings.HasPrefix(strings.ToLower(owner), prefix) {
+		base := strings.TrimSuffix(owner[len(prefix):], ".")
+		if base != "" {
+			return base
+		}
+	}
+	return strings.TrimSuffix(mxHost, ".")
 }
 
 func recipientCommand(to string, supportsDSN, supportsUTF8 bool, dsnNotify string, originalRecipients ...string) string {
@@ -581,7 +617,7 @@ func smtpGreetingCapabilities(conn net.Conn, hostname string) (map[string]bool, 
 		return ehloCapabilities(reply), nil
 	}
 	if code := smtpReplyCode(reply); code != "500" && code != "502" {
-		return nil, fmt.Errorf("EHLO rejected: %s", reply)
+		return nil, &replyFailure{"EHLO rejected", reply}
 	}
 	if err := sendCmd(conn, "HELO "+hostname); err != nil {
 		return nil, err
@@ -591,7 +627,7 @@ func smtpGreetingCapabilities(conn net.Conn, hostname string) (map[string]bool, 
 		return nil, fmt.Errorf("reading HELO reply: %w", err)
 	}
 	if smtpReplyCode(heloReply) != "250" {
-		return nil, fmt.Errorf("HELO rejected: %s", heloReply)
+		return nil, &replyFailure{"HELO rejected", heloReply}
 	}
 	return map[string]bool{}, nil
 }
@@ -604,8 +640,7 @@ func sendCmdWithTimeout(conn net.Conn, cmd string, timeout time.Duration) error 
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(conn, "%s\r\n", cmd)
-	return err
+	return writeSMTPChunk(conn, []byte(cmd+"\r\n"))
 }
 
 type smtpDeadlineWriter struct {
@@ -873,6 +908,10 @@ func validateSMTPDataLines(msg []byte) error {
 	}
 	return nil
 }
+
+// ValidateSMTPDataLines checks the DATA framing accepted by outbound SMTP.
+// Queue admission uses the same check so an unsendable message is not saved.
+func ValidateSMTPDataLines(msg []byte) error { return validateSMTPDataLines(msg) }
 
 func writeSMTPData(w io.Writer, msg []byte) error {
 	if err := validateSMTPDataLines(msg); err != nil {

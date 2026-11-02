@@ -140,6 +140,40 @@ func TestQueueConvertsBeforeDKIMSigning(t *testing.T) {
 	}
 }
 
+func TestSentCopyRetainsWireMessageID(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	private, public, _, err := auth.GenerateDKIMKeyPair("ed25519")
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainID, err := db.CreateDomain(&store.Domain{Domain: "sender.example", IsActive: true, DKIMSelector: "mail", DKIMAlgorithm: "ed25519", DKIMPrivateKey: private, DKIMPublicKey: public})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&store.Account{DomainID: domainID, Email: "alice@sender.example", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := NewQueue(db, &config.Config{Server: config.ServerConfig{Hostname: "mail.sender.example", Domain: "sender.example"}})
+	raw := []byte("Message-ID: <client-123@sender.example>\r\nFrom: alice@sender.example\r\nTo: bob@receiver.example\r\nSubject: hello\r\n\r\nbody\r\n")
+	if err := q.Enqueue("alice@sender.example", []string{"bob@receiver.example"}, raw, accountID); err != nil {
+		t.Fatal(err)
+	}
+	var storedID, envID string
+	var queued []byte
+	if err := db.QueryRow(`SELECT m.message_id, q.dsn_envid, q.raw_message FROM messages m JOIN outbound_queue q ON q.message_id=m.id WHERE m.account_id=?`, accountID).Scan(&storedID, &envID, &queued); err != nil {
+		t.Fatal(err)
+	}
+	if storedID != "client-123@sender.example" || envID != storedID || !bytes.Contains(queued, []byte("Message-ID: <client-123@sender.example>")) {
+		t.Fatalf("stored Message-ID=%q ENVID=%q queued header=%q", storedID, envID, queued)
+	}
+}
+
 func TestSubmissionDSNOptionsPersistPerRecipient(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))

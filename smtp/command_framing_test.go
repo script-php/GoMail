@@ -42,3 +42,30 @@ func TestInboundRejectsNonCRLFCommands(t *testing.T) {
 		})
 	}
 }
+
+func TestInboundAcceptsDSNLengthCommandLine(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	sess := NewSession(server, "mail.example.test", nil, nil, nil, 1024, 10, time.Second, time.Second, "", false, nil)
+	done := make(chan struct{})
+	go func() { (&InboundServer{}).runSession(sess); close(done) }()
+	_ = client.SetDeadline(time.Now().Add(time.Second))
+	reader := bufio.NewReader(client)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	// RFC 3461 requires accepting at least 1036 octets, including CRLF.
+	command := "NOOP " + strings.Repeat("x", 1029) + "\r\n"
+	if len(command) != 1036 {
+		t.Fatalf("command length=%d", len(command))
+	}
+	if _, err := client.Write([]byte(command)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(response, "250 ") {
+		t.Fatalf("response=%q err=%v", response, err)
+	}
+	_ = client.Close()
+	<-done
+}

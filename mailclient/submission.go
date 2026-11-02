@@ -54,11 +54,11 @@ func (s *Server) handleSubmission(conn net.Conn) {
 	p.reply(220, fmt.Sprintf("%s ESMTP GoMail submission ready", s.cfg.Server.Hostname))
 	for {
 		_ = p.conn.SetReadDeadline(time.Now().Add(s.readTimeout()))
-		line, err := security.ReadLineLimited(p.reader, 1000)
+		line, err := security.ReadLineLimited(p.reader, security.SMTPCommandLineLimit)
 		if err != nil {
 			return
 		}
-		if len(line) > 1000 {
+		if len(line) > security.SMTPCommandLineLimit {
 			p.reply(500, "Command line too long")
 			return
 		}
@@ -405,6 +405,14 @@ func (p *submissionSession) handleRCPT(argument string) {
 		p.reply(501, "Invalid RCPT TO")
 		return
 	}
+	// This listener does not advertise SMTPUTF8. Do not accept an envelope
+	// destination that a downstream non-SMTPUTF8 peer cannot receive.
+	for _, b := range []byte(address) {
+		if b >= 0x80 {
+			p.reply(553, "SMTPUTF8 is required for internationalized recipient address")
+			return
+		}
+	}
 	if !p.ehlo && strings.TrimSpace(parameters) != "" {
 		p.reply(555, "RCPT TO parameters require EHLO")
 		return
@@ -443,6 +451,14 @@ func (p *submissionSession) handleRCPT(argument string) {
 		p.reply(553, "Invalid recipient address")
 		return
 	}
+	// A repeated RCPT must not create a second queued delivery. Preserve the
+	// local-part's case: remote mailboxes may distinguish it (RFC 5321 §2.4).
+	for _, existing := range p.recipients {
+		if sameSMTPRecipient(existing, address) {
+			p.reply(250, "OK (already a recipient)")
+			return
+		}
+	}
 	if len(p.recipients) >= p.server.cfg.SMTP.MaxRecipients {
 		p.reply(452, "Too many recipients")
 		return
@@ -455,6 +471,11 @@ func (p *submissionSession) handleRCPT(argument string) {
 	p.dsnNotify = append(p.dsnNotify, notify)
 	p.dsnOriginal = append(p.dsnOriginal, original)
 	p.reply(250, "OK")
+}
+
+func sameSMTPRecipient(a, b string) bool {
+	aAt, bAt := strings.LastIndexByte(a, '@'), strings.LastIndexByte(b, '@')
+	return aAt >= 0 && bAt >= 0 && a[:aAt] == b[:bAt] && strings.EqualFold(a[aAt+1:], b[bAt+1:])
 }
 
 func parseSubmissionNotify(value string) (string, bool) {

@@ -37,6 +37,29 @@ func TestSubmissionRejectsNonCRLFCommands(t *testing.T) {
 	}
 }
 
+func TestSubmissionAcceptsDSNLengthCommandLine(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	s := &Server{cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.test"}, Clients: config.MailClientsConfig{ReadTimeout: 1, WriteTimeout: 1}}}
+	done := make(chan struct{})
+	go func() { s.handleSubmission(server); close(done) }()
+	_ = client.SetDeadline(time.Now().Add(time.Second))
+	reader := bufio.NewReader(client)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	command := "NOOP " + strings.Repeat("x", 1029) + "\r\n"
+	if _, err := client.Write([]byte(command)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(response, "250 ") {
+		t.Fatalf("response=%q err=%v", response, err)
+	}
+	_ = client.Close()
+	<-done
+}
+
 func TestSubmissionRejectsNonCRLFAuthResponse(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()

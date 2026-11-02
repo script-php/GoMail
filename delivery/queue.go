@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,8 +11,12 @@ import (
 	"gomail/config"
 	"gomail/logging"
 	"gomail/parser"
+	"gomail/smtp"
 	"gomail/store"
 )
+
+// ErrInvalidMessage indicates that the message cannot be transmitted as SMTP DATA.
+var ErrInvalidMessage = errors.New("invalid outbound message")
 
 // Queue manages the outbound message delivery queue.
 type Queue struct {
@@ -91,6 +96,9 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 	// seven-bit representation can be delivered to both modern and legacy
 	// SMTP peers without changing the queued signature at delivery time.
 	rawMessage = sevenBitMIME(rawMessage)
+	if err := smtp.ValidateSMTPDataLines(rawMessage); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	}
 	// Per-domain DKIM signing
 	signer, signerErr := q.getDKIMSigner(from)
 	if signerErr != nil {
@@ -105,6 +113,9 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 		} else {
 			logging.Info(fmt.Sprintf("[delivery] DKIM signed with selector=%s domain=%s", signer.Selector, signer.Domain))
 		}
+	}
+	if err := smtp.ValidateSMTPDataLines(signedMessage); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidMessage, err)
 	}
 
 	// Store the outbound message in the messages table
@@ -129,10 +140,16 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 	if toAddr == "" {
 		toAddr = joinAddrs(to)
 	}
+	messageID := parsed.MessageID
+	if messageID == "" {
+		// The identifier is only a local placeholder when the submitted
+		// message omitted Message-ID; do not modify MIME after DKIM signing.
+		messageID = fmt.Sprintf("%d@%s", time.Now().UnixNano(), q.cfg.Server.Hostname)
+	}
 
 	msg := &store.Message{
 		AccountID:      accountID,
-		MessageID:      fmt.Sprintf("%d@%s", time.Now().UnixNano(), q.cfg.Server.Hostname),
+		MessageID:      messageID,
 		Direction:      "outbound",
 		MailFrom:       from,
 		RcptTo:         string(rcptJSON),
