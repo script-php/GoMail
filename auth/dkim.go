@@ -159,7 +159,7 @@ func (s *DKIMSigner) Sign(message []byte) ([]byte, error) {
 	bh := base64.StdEncoding.EncodeToString(bodyCanonBytes)
 
 	// Headers to sign (in order)
-	signHeaders := []string{"from", "to", "subject", "date", "message-id"}
+	signHeaders := []string{"from", "to", "subject", "date", "message-id", "tls-report-domain", "tls-report-submitter"}
 	var signedHeaderNames []string
 
 	// Find which headers are present in the message

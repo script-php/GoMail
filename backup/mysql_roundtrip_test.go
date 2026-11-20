@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,33 +31,95 @@ func TestMySQLBackupRestoreIsolatedRoundTrip(t *testing.T) {
 	if base.Store.Database != "mysql" {
 		t.Fatal("test config must use MySQL")
 	}
+	fixedDB := os.Getenv("GOMAIL_TEST_MYSQL_FIXED_DB")
+	if fixedDB != "" {
+		if fixedDB != "gomailtest" || fixedDB == base.Store.MySQL.Name {
+			t.Fatal("fixed test database must be gomailtest and differ from the configured database")
+		}
+		base.Store.MySQL.Name = fixedDB
+		base.Store.MySQL.User = os.Getenv("GOMAIL_TEST_MYSQL_USER")
+		base.Store.MySQL.Password = os.Getenv("GOMAIL_TEST_MYSQL_PASSWORD")
+		if base.Store.MySQL.User == "" || base.Store.MySQL.Password == "" {
+			t.Fatal("fixed test database credentials are required")
+		}
+		probe, err := sql.Open("mysql", mysqlDSN(base.Store.MySQL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tables int
+		err = probe.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?", fixedDB).Scan(&tables)
+		probe.Close()
+		if err != nil || tables != 0 {
+			t.Fatalf("fixed test database must be empty before the drill (tables=%d): %v", tables, err)
+		}
+		t.Cleanup(func() {
+			conn, err := sql.Open("mysql", mysqlDBDSN(base.Store.MySQL))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			rows, err := conn.Query("SELECT table_name FROM information_schema.tables WHERE table_schema = ?", fixedDB)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			var names []string
+			for rows.Next() {
+				var name string
+				if err := rows.Scan(&name); err != nil {
+					t.Error(err)
+					break
+				}
+				names = append(names, "`"+name+"`")
+			}
+			rows.Close()
+			if len(names) > 0 {
+				if _, err := conn.Exec("SET FOREIGN_KEY_CHECKS=0"); err != nil {
+					t.Error(err)
+				} else if _, err := conn.Exec("DROP TABLE IF EXISTS " + strings.Join(names, ",")); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
 	root := t.TempDir()
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	sourceName := "gomail_backup_src_" + suffix
 	targetName := "gomail_backup_dst_" + suffix
+	if fixedDB != "" {
+		sourceName, targetName = fixedDB, fixedDB
+	}
 	created := make(map[string]bool)
 	source := *base
 	source.Store = base.Store
 	source.Store.MySQL = base.Store.MySQL
 	source.Store.MySQL.Name = sourceName
 	source.Store.AttachmentsPath = filepath.Join(root, "source-attachments")
+	source.TLS = base.TLS
+	source.TLS.ACMEDir = filepath.Join(root, "source-acme")
+	if err := os.MkdirAll(source.TLS.ACMEDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	target := source
 	target.Store = source.Store
 	target.Store.MySQL = source.Store.MySQL
 	target.Store.MySQL.Name = targetName
 	target.Store.AttachmentsPath = filepath.Join(root, "target-attachments")
+	target.TLS.ACMEDir = filepath.Join(root, "target-acme")
+	if err := os.MkdirAll(target.TLS.ACMEDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	// DROP is restricted to exact generated names, never a configured database.
 	t.Cleanup(func() {
+		if fixedDB != "" {
+			return // The fixed database is cleaned by the earlier scoped cleanup.
+		}
 		for _, name := range []string{sourceName, targetName} {
 			if !created[name] {
 				continue
 			}
-			driverCfg := mysql.NewConfig()
-			driverCfg.User = base.Store.MySQL.User
-			driverCfg.Passwd = base.Store.MySQL.Password
-			driverCfg.Net = "tcp"
-			driverCfg.Addr = net.JoinHostPort(base.Store.MySQL.Host, fmt.Sprint(base.Store.MySQL.Port))
-			conn, err := sql.Open("mysql", driverCfg.FormatDSN())
+			conn, err := sql.Open("mysql", mysqlDSN(base.Store.MySQL))
 			if err != nil {
 				t.Error(err)
 				continue
@@ -126,6 +189,17 @@ func TestMySQLBackupRestoreIsolatedRoundTrip(t *testing.T) {
 	if _, err := Verify(archivePath); err != nil {
 		t.Fatal(err)
 	}
+	if fixedDB != "" {
+		mutated, err := store.OpenConfig(source.Store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = mutated.CreateDomain(&store.Domain{Domain: "after-backup.invalid", IsActive: true})
+		mutated.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	targetDB, err := store.OpenConfig(target.Store)
 	if err != nil {
 		t.Fatalf("creating disposable target database: %v", err)
@@ -139,9 +213,15 @@ func TestMySQLBackupRestoreIsolatedRoundTrip(t *testing.T) {
 	if _, err := Restore(&target, targetConfigPath, archivePath, true); err != nil {
 		t.Fatal(err)
 	}
-	restoredConfig, err := os.ReadFile(targetConfigPath)
-	if err != nil || string(restoredConfig) != string(configBytes) {
-		t.Fatalf("config restore mismatch: %v", err)
+	if err := CheckRestoreJournal(targetConfigPath); err != nil {
+		t.Fatalf("successful MySQL restore retained incomplete marker: %v", err)
+	}
+	restoredConfig, err := config.Load(targetConfigPath)
+	if err != nil {
+		t.Fatalf("loading restored config: %v", err)
+	}
+	if restoredConfig.Store.MySQL.Name != targetName || restoredConfig.Store.AttachmentsPath != target.Store.AttachmentsPath || restoredConfig.TLS.ACMEDir != target.TLS.ACMEDir {
+		t.Fatalf("restored config points outside target: database=%q attachments=%q acme=%q", restoredConfig.Store.MySQL.Name, restoredConfig.Store.AttachmentsPath, restoredConfig.TLS.ACMEDir)
 	}
 	attachment, err := os.ReadFile(filepath.Join(target.Store.AttachmentsPath, "fixture.bin"))
 	if err != nil || string(attachment) != "attachment fixture" {
@@ -165,4 +245,23 @@ func TestMySQLBackupRestoreIsolatedRoundTrip(t *testing.T) {
 	if err != nil || len(events) != 2 || events[0].SMTPCode != 550 {
 		t.Fatalf("history restore mismatch: %+v %v", events, err)
 	}
+}
+
+func mysqlDSN(cfg config.MySQLConfig) string {
+	driverCfg := mysql.NewConfig()
+	driverCfg.User = cfg.User
+	driverCfg.Passwd = cfg.Password
+	driverCfg.Net = "tcp"
+	driverCfg.Addr = net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port))
+	return driverCfg.FormatDSN()
+}
+
+func mysqlDBDSN(cfg config.MySQLConfig) string {
+	driverCfg := mysql.NewConfig()
+	driverCfg.User = cfg.User
+	driverCfg.Passwd = cfg.Password
+	driverCfg.Net = "tcp"
+	driverCfg.Addr = net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port))
+	driverCfg.DBName = cfg.Name
+	return driverCfg.FormatDSN()
 }

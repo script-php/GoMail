@@ -46,6 +46,58 @@ func TestMAILRejectsMalformedReversePath(t *testing.T) {
 	}
 }
 
+func TestOversizedDATAReceivesPermanentSizeReply(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	s := &Session{conn: server, reader: bufio.NewReader(server), writer: bufio.NewWriter(server), state: StateRcpt, rcptTo: []string{"user@example.test"}, maxSize: 16, readTimeout: time.Second, writeTimeout: time.Second}
+	done := make(chan struct{})
+	go func() { s.handleDATA(); close(done) }()
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(client)
+	if reply, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(reply, "354 ") {
+		t.Fatalf("DATA invitation = %q, %v", reply, err)
+	}
+	if _, err := client.Write([]byte("Subject: much-too-long-for-limit\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(reply, "552 5.3.4 ") {
+		t.Fatalf("oversized DATA reply = %q, %v", reply, err)
+	}
+	<-done
+	if s.state != StateQuit || s.data.Len() != 0 {
+		t.Fatal("oversized DATA left a reusable transaction")
+	}
+}
+
+func TestDATARejectsEmbeddedCarriageReturn(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	s := &Session{conn: server, reader: bufio.NewReader(server), writer: bufio.NewWriter(server), state: StateRcpt, rcptTo: []string{"user@example.test"}, maxSize: 1024, readTimeout: time.Second, writeTimeout: time.Second}
+	done := make(chan struct{})
+	go func() { s.handleDATA(); close(done) }()
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(client)
+	if reply, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(reply, "354 ") {
+		t.Fatalf("DATA invitation = %q, %v", reply, err)
+	}
+	if _, err := client.Write([]byte("Subject: first\rsecond\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(reply, "554 5.6.0 ") {
+		t.Fatalf("malformed DATA reply = %q, %v", reply, err)
+	}
+	<-done
+	if s.state != StateQuit || s.data.Len() != 0 {
+		t.Fatal("malformed DATA left a reusable transaction")
+	}
+}
+
 func TestRecipientLookupErrorIsTemporary(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
@@ -59,6 +111,28 @@ func TestRecipientLookupErrorIsTemporary(t *testing.T) {
 		t.Fatalf("RCPT reply %q: %v", reply, err)
 	}
 	<-done
+}
+
+func TestSMTPUTF8RecipientUnicodeDomainRoutesToHostedALabel(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	const canonical = "alice@xn--bcher-kva.example"
+	lookup := func(address string) (bool, error) { return address == canonical, nil }
+	s := &Session{conn: server, writer: bufio.NewWriter(server), state: StateMail, domains: []string{"xn--bcher-kva.example"}, smtputf8Enabled: true, accountExists: lookup, maxRcpt: 100, writeTimeout: time.Second}
+	for _, recipient := range []string{"alice@bücher.example", canonical} {
+		done := make(chan struct{})
+		go func() { s.handleRCPT("TO:<" + recipient + ">"); close(done) }()
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		reply, err := bufio.NewReader(client).ReadString('\n')
+		if err != nil || !strings.HasPrefix(reply, "250 ") {
+			t.Fatalf("RCPT %q reply %q: %v", recipient, reply, err)
+		}
+		<-done
+	}
+	if len(s.rcptTo) != 1 || s.rcptTo[0] != canonical {
+		t.Fatalf("canonical recipients = %v", s.rcptTo)
+	}
 }
 
 func TestFailedSTARTTLSClosesSMTPConnection(t *testing.T) {

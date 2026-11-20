@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/idna"
 	_ "modernc.org/sqlite"
 
 	"gomail/config"
@@ -196,6 +197,7 @@ func (db *DB) RegisteredMigrations() []Migration {
 				WHERE origin_account_id = -1 AND message_id IS NOT NULL`)
 			return err
 		}},
+		{Name: "outbound_local_recipient_v1", Run: func(db *DB) error { return db.backfillQueuedLocalRecipients() }},
 		{Name: "received_report_domain_unique_v1", Run: func(db *DB) error { return db.migrateReceivedReportDomainUnique() }},
 		// Example: Data migrations (not schema changes)
 		// {
@@ -205,6 +207,72 @@ func (db *DB) RegisteredMigrations() []Migration {
 		//         return nil
 		//     },
 		// },
+	}
+}
+
+func (db *DB) backfillQueuedLocalRecipients() error {
+	rows, err := db.Query(`SELECT domain FROM domains`)
+	if err != nil {
+		return err
+	}
+	hosted := make(map[string]bool)
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			rows.Close()
+			return err
+		}
+		hosted[strings.ToLower(domain)] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	type recipientRow struct {
+		id      int64
+		address string
+	}
+	var cursor int64
+	for {
+		rows, err := db.Query(`SELECT id, rcpt_to FROM outbound_queue WHERE id>? AND local_recipient=0 ORDER BY id LIMIT 500`, cursor)
+		if err != nil {
+			return err
+		}
+		var queued []recipientRow
+		for rows.Next() {
+			var row recipientRow
+			if err := rows.Scan(&row.id, &row.address); err != nil {
+				rows.Close()
+				return err
+			}
+			queued = append(queued, row)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(queued) == 0 {
+			return nil
+		}
+		for _, row := range queued {
+			at := strings.LastIndexByte(row.address, '@')
+			if at < 0 {
+				continue
+			}
+			domain, err := idna.Lookup.ToASCII(row.address[at+1:])
+			if err == nil && hosted[strings.ToLower(domain)] {
+				if _, err := db.Exec(`UPDATE outbound_queue SET local_recipient=1 WHERE id=?`, row.id); err != nil {
+					return err
+				}
+			}
+		}
+		cursor = queued[len(queued)-1].id
 	}
 }
 

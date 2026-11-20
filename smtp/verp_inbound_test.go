@@ -38,7 +38,9 @@ func TestInboundAcceptsOnlyIssuedVERPBounceAddress(t *testing.T) {
 	sess := NewSession(server, cfg.Server.Hostname, []string{"example.com"}, func(email string) (bool, error) { return email == "sender@example.com", nil }, nil, 1024*1024, 10, 2*time.Second, 2*time.Second, "", false, db)
 	done := make(chan struct{})
 	go func() { inbound.runSession(sess); close(done) }()
-	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	// This test exercises VERP routing, but DATA still performs real DNS-backed
+	// authentication checks. Do not make resolver latency a false VERP failure.
+	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
 	reader := bufio.NewReader(client)
 	read := func(prefix string) {
 		t.Helper()

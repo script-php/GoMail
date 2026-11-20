@@ -16,18 +16,32 @@ func NewAuthResultsBuilder(hostname string) *AuthResultsBuilder {
 	return &AuthResultsBuilder{hostname: hostname}
 }
 
-// AddSPF adds an SPF result to the authentication results.
-func (b *AuthResultsBuilder) AddSPF(result SPFResult, detail, domain string) {
-	b.results = append(b.results, fmt.Sprintf(
-		"spf=%s (%s) smtp.mailfrom=%s", result, authResultComment(detail), authResultValue(domain),
-	))
+// AddSPF reports the SMTP identity actually evaluated by SPF. The reverse
+// path's local part is not authenticated by the domain's SPF policy.
+func (b *AuthResultsBuilder) AddSPF(result SPFResult, detail, mailFrom, helo string) {
+	entry := fmt.Sprintf("spf=%s (%s)", result, authResultComment(detail))
+	if mailFrom == "" {
+		if identity := authResultValue(strings.TrimSuffix(helo, ".")); identity != "unknown" {
+			entry += " smtp.helo=" + identity
+		}
+	} else if at := strings.LastIndexByte(mailFrom, '@'); at >= 0 {
+		if identity := authResultValue(mailFrom[at+1:]); identity != "unknown" {
+			entry += " smtp.mailfrom=" + identity
+		}
+	}
+	b.results = append(b.results, entry)
 }
 
 // AddDKIM adds a DKIM result to the authentication results.
 func (b *AuthResultsBuilder) AddDKIM(result, detail, domain, selector string) {
-	b.results = append(b.results, fmt.Sprintf(
-		"dkim=%s (%s) header.d=%s header.s=%s", result, authResultComment(detail), authResultValue(domain), authResultValue(selector),
-	))
+	entry := fmt.Sprintf("dkim=%s (%s)", result, authResultComment(detail))
+	if domain != "" {
+		entry += " header.d=" + authResultValue(domain)
+	}
+	if selector != "" {
+		entry += " header.s=" + authResultValue(selector)
+	}
+	b.results = append(b.results, entry)
 }
 
 // AddDMARC adds a DMARC result to the authentication results.

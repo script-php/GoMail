@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,10 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 		}
 		paths = append(paths, path)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("reading attachment paths: %w", err)
+	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
@@ -81,6 +86,10 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 			return err
 		}
 		expunges = append(expunges, state)
+	}
+	if err := stateRows.Err(); err != nil {
+		stateRows.Close()
+		return fmt.Errorf("reading IMAP expunge state: %w", err)
 	}
 	if err := stateRows.Close(); err != nil {
 		return err
@@ -118,7 +127,9 @@ func (db *DB) PermanentlyDeleteMessages(accountID int64, ids []int64) error {
 	db.NotifyIMAPChanges(accountID)
 	for _, path := range paths {
 		if fullPath, ok := db.safeAttachmentPath(path); ok {
-			_ = os.Remove(fullPath)
+			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[store] attachment cleanup after message deletion failed: %v", err)
+			}
 		}
 	}
 	return nil

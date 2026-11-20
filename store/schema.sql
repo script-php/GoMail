@@ -168,6 +168,8 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id          INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     origin_account_id   INTEGER NOT NULL DEFAULT -1, -- 0 = system; -1 = legacy unknown
+    local_recipient     INTEGER NOT NULL DEFAULT 0, -- recipient domain was hosted at enqueue
+    tls_report          INTEGER NOT NULL DEFAULT 0,
     mail_from           TEXT    NOT NULL,
     rcpt_to             TEXT    NOT NULL,      -- Single recipient per queue entry
     raw_message         BLOB    NOT NULL,      -- DKIM-signed message to send

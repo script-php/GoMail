@@ -38,7 +38,11 @@ func (db *DB) ListPOP3Messages(accountID int64) ([]POP3Message, error) {
 // GetPOP3MessageRaw loads one message body when RETR or TOP needs it.
 func (db *DB) GetPOP3MessageRaw(accountID, messageID int64) ([]byte, error) {
 	var raw []byte
-	err := db.QueryRow(`SELECT raw_message FROM messages WHERE id = ? AND account_id = ?`, messageID, accountID).Scan(&raw)
+	err := db.QueryRow(`SELECT m.raw_message FROM messages m
+		JOIN folders f ON f.id=m.folder_id
+		WHERE m.id=? AND m.account_id=? AND f.account_id=?
+		AND f.folder_type='inbox' AND m.direction='inbound' AND m.is_deleted=0`,
+		messageID, accountID, accountID).Scan(&raw)
 	return raw, err
 }
 
@@ -99,11 +103,12 @@ func (db *DB) DeletePOP3Messages(accountID int64, messageIDs []int64) error {
 			return fmt.Errorf("updating IMAP state for POP3 message %d: %w", id, err)
 		}
 	}
+	if err := updateAccountFolderCounts(tx, accountID); err != nil {
+		return fmt.Errorf("updating POP3 folder counts: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	_ = db.UpdateFolderCounts(inboxID)
-	_ = db.UpdateFolderCounts(trashID)
 	db.NotifyIMAPChanges(accountID)
 	return nil
 }

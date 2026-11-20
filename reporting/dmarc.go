@@ -7,9 +7,13 @@ import (
 	"time"
 )
 
-// DMARCReport represents a DMARC aggregate report (RFC 7489).
+const dmarcReportNamespace = "urn:ietf:params:xml:ns:dmarc-2.0"
+
+// DMARCReport represents an aggregate report. Parsing also accepts legacy
+// unnamespaced reports received from other systems.
 type DMARCReport struct {
 	XMLName  xml.Name        `xml:"feedback"`
+	XMLNS    string          `xml:"xmlns,attr,omitempty"`
 	Metadata ReportMetadata  `xml:"report_metadata"`
 	Policy   PolicyPublished `xml:"policy_published"`
 	Records  []ReportRecord  `xml:"record"`
@@ -28,12 +32,15 @@ type DateRange struct {
 }
 
 type PolicyPublished struct {
-	Domain string `xml:"domain"`
-	ADKIM  string `xml:"adkim"`
-	ASPF   string `xml:"aspf"`
-	P      string `xml:"p"`
-	SP     string `xml:"sp"`
-	Pct    int    `xml:"pct"`
+	Domain          string `xml:"domain"`
+	ADKIM           string `xml:"adkim,omitempty"`
+	ASPF            string `xml:"aspf,omitempty"`
+	P               string `xml:"p"`
+	SP              string `xml:"sp,omitempty"`
+	NP              string `xml:"np,omitempty"`
+	Testing         string `xml:"testing,omitempty"`
+	DiscoveryMethod string `xml:"discovery_method,omitempty"`
+	FO              string `xml:"fo,omitempty"`
 }
 
 type ReportRecord struct {
@@ -56,7 +63,7 @@ type PolicyEvaluated struct {
 
 type Identifiers struct {
 	HeaderFrom   string `xml:"header_from"`
-	EnvelopeFrom string `xml:"envelope_from"`
+	EnvelopeFrom string `xml:"envelope_from,omitempty"`
 }
 
 type AuthResults struct {
@@ -85,7 +92,7 @@ func ParseDMARCReport(r io.Reader) (*DMARCReport, error) {
 	return &report, nil
 }
 
-// GenerateDMARCAggregateReport generates an RFC 7489-compliant DMARC aggregate report.
+// GenerateDMARCAggregateReport generates an RFC 9990 aggregate report.
 func GenerateDMARCAggregateReport(
 	domain string,
 	reporterEmail string,
@@ -103,6 +110,7 @@ func GenerateDMARCAggregateReport(
 
 	report := DMARCReport{
 		XMLName: xml.Name{Local: "feedback"},
+		XMLNS:   dmarcReportNamespace,
 		Metadata: ReportMetadata{
 			OrgName:  reporterOrg,
 			Email:    reporterEmail,

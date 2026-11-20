@@ -1,11 +1,47 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestDeleteDomainBlocksUnfinishedLocalQueue(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&Domain{Domain: "xn--bcher-kva.example", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueID, err := db.EnqueueMessage(&QueueEntry{MailFrom: "sender@remote.test", RcptTo: "bob@bücher.example", RawMessage: []byte("From: sender@remote.test\r\n\r\nbody\r\n"), MaxAttempts: 3, NextRetry: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteDomain(domainID); !errors.Is(err, ErrDomainHasQueuedMail) {
+		t.Fatalf("deleted domain with pending local mail: %v", err)
+	}
+	if domain, err := db.GetDomain(domainID); err != nil || domain == nil {
+		t.Fatalf("failed deletion removed domain: domain=%v err=%v", domain, err)
+	}
+	if _, err := db.Exec(`UPDATE outbound_queue SET status='uncertain' WHERE id=?`, queueID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteDomain(domainID); !errors.Is(err, ErrDomainHasQueuedMail) {
+		t.Fatalf("deleted domain with uncertain local mail: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbound_queue SET status='cancelled' WHERE id=?`, queueID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteDomain(domainID); err != nil {
+		t.Fatalf("terminal queue entry blocked deletion: %v", err)
+	}
+}
 
 func TestCreateAccountRollsBackWhenFolderProvisioningFails(t *testing.T) {
 	root := t.TempDir()

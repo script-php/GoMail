@@ -8,6 +8,7 @@ import (
 )
 
 const AdminQueuePageSize = 50
+const adminCancellationReason = "delivery cancelled by administrator"
 
 // QueueAdminEntry intentionally omits raw_message so the administration page
 // cannot expose message bodies or attachments.
@@ -125,6 +126,9 @@ func (db *DB) queueAdminTransition(id int64, from []string, to string, eventType
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(from)), ",")
 	set := "status = ?, claim_token = '', next_retry = ?, last_error = '', updated_at = CURRENT_TIMESTAMP"
+	if eventType == "admin_cancel" {
+		set = "status = ?, claim_token = '', next_retry = ?, last_error = '" + adminCancellationReason + "', updated_at = CURRENT_TIMESTAMP"
+	}
 	if resetAttempts {
 		set += ", attempts = 0"
 	}

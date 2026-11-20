@@ -46,10 +46,13 @@ type AdminHandler struct {
 	tmplReportInbox    *template.Template
 	tmplAliases        *template.Template
 	enqueueFunc        reporting.EnqueueFunc
+	tlsReportEnqueue   reporting.EnqueueFunc
 	backupManager      *backupops.Manager
 }
 
 // NewAdminHandler creates an admin handler.
+func (h *AdminHandler) SetTLSReportEnqueue(fn reporting.EnqueueFunc) { h.tlsReportEnqueue = fn }
+
 func NewAdminHandler(cfg *config.Config, db *store.DB, sm *security.SessionManager, enqueueFunc reporting.EnqueueFunc, backupManager *backupops.Manager) *AdminHandler {
 	funcMap := template.FuncMap{
 		"formatSize": func(size int64) string {
@@ -963,6 +966,10 @@ func (h *AdminHandler) DomainDelete(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.DeleteDomain(id); err != nil {
 		log.Printf("[admin] delete domain %d: %v", id, err)
+		if err == store.ErrDomainHasQueuedMail {
+			http.Error(w, "This domain has unfinished queued mail. Resolve or cancel those deliveries before deleting it.", http.StatusConflict)
+			return
+		}
 		http.Error(w, "Unable to delete domain", http.StatusInternalServerError)
 		return
 	}
@@ -1549,7 +1556,7 @@ func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Reque
 
 	sent := 0
 	for _, domain := range domains {
-		report, err := reporting.GenerateTLSReport(h.db, h.cfg.Server.Hostname, domain, startTime, endTime)
+		report, err := reporting.GenerateTLSReport(h.db, h.cfg.Server.Domain, domain, startTime, endTime)
 		if err != nil {
 			log.Printf("[admin] failed to generate TLS-RPT for %s: %v", domain, err)
 			continue
@@ -1563,9 +1570,13 @@ func (h *AdminHandler) SendTLSRPTReportsNow(w http.ResponseWriter, r *http.Reque
 
 		// Use our organization's domain as sender
 		senderEmail := h.cfg.Server.TLSReportSenderAddress()
-		messageBody := reporting.BuildTLSRPTEmail(h.cfg.Server.Domain, senderEmail, report, recipientEmail)
+		messageBody := reporting.BuildTLSRPTEmail(h.cfg.Server.Domain, senderEmail, domain, report, recipientEmail)
 
-		if err := h.enqueueFunc(senderEmail, recipientEmail, messageBody); err != nil {
+		if h.tlsReportEnqueue == nil {
+			log.Printf("[admin] TLS-RPT queue unavailable")
+			continue
+		}
+		if err := h.tlsReportEnqueue(senderEmail, recipientEmail, messageBody); err != nil {
 			log.Printf("[admin] failed to enqueue TLS-RPT report for %s: %v", domain, err)
 			continue
 		}

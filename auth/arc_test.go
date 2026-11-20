@@ -18,6 +18,36 @@ import (
 
 const arcDKIMPyPublicKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA+yT0r1FSXBt979b6MFfoJstrfiR9aKIn5UCFEELXgKk6nESbfiVKMSI/+2ZivyLL/aTdSCpmKmDOL4r+swHw2AmNJxqiYOYDZ8ET96DeCZ9rdsYqkYrUi8IlnVsbJ1zo/D/II5sZIkS/fmqx/fChIZBAE1EzS2S/dj7OlbZHqe9jJMlOeOSgH3RcOQONHeVNV5ZpXghs4QuUipkYjDNM8EZIWIBEzTeAkzrHcqaVK4/wUxMKO8hzykB8mRgY27wIIHQZEf/aCdwaYJ9gWwGGnHMZAtlx2CElqFakEgiEm6xh679gMQcx+qaP9Of4MhoPsd/xyVZvFDf0pDiatruPOQIDAQAB"
 
+const arcDKIMPyThreeHopPublicKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAquB25+t0JSbjRT8/bXKBczd3sK2VltOo/GZ9Vc6fKPtHZPk84sPfaOmbjWn7ZCvQBwl+u7VKGfxUr7EcmiQLvwdxeNbBOCvKeUiUreVvMluh/+Zos0/UOSWs+32z9zwnKXdR1gDQhPa/BYufoFYEFTmm4UmdAIzSi+Y+Xr8yvkCmtRxN6OlrVN7q9xWxorGDyA5PE1JLyZydjgDnf2hOdihpzVd4kGL9TXeA7Q1GmrJgDjPzNw/JyfRbxfCGq9MED2UmOv1N+aMF8CmbMO2X8mrxZFpyjUjXpCnLq+ya2lrGh1RugXKJs4EpQLaogjj0PVmX+zWKYIXsw4/1F65mWwIDAQAB"
+
+// A separate dkimpy 1.1.8 signer generated all three RFC 8617 sets. The
+// public key is pinned, so validation never needs live DNS or GoMail's signer.
+func TestARCIndependentDKIMPyThreeHopRFC8617Fixture(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "arc_dkimpy_three_hop.eml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := bytes.ReplaceAll(fixture, []byte("\n"), []byte("\r\n"))
+	previousLookup := lookupARCKey
+	lookupARCKey = func(selector, domain string) (*DKIMRecord, error) {
+		if selector != "arc" || domain != "example.test" {
+			return nil, fmt.Errorf("unexpected ARC key %s._domainkey.%s", selector, domain)
+		}
+		return &DKIMRecord{RawKey: arcDKIMPyThreeHopPublicKey}, nil
+	}
+	defer func() { lookupARCKey = previousLookup }()
+	if result := ValidateARCChain(message); !result.IsValid || result.HighestValid != 3 {
+		t.Fatalf("independent three-hop ARC fixture rejected: %+v", result)
+	}
+	tampered := bytes.Replace(message, []byte("ARC-Authentication-Results: i=2; mx2.example.test;"), []byte("ARC-Authentication-Results: i=2; forged.example.test;"), 1)
+	if bytes.Equal(tampered, message) {
+		t.Fatal("fixture tamper target not found")
+	}
+	if result := ValidateARCChain(tampered); result.IsValid {
+		t.Fatalf("tampered three-hop ARC chain accepted: %+v", result)
+	}
+}
+
 // This static fixture was signed by dkimpy 1.1.8, not GoMail. Its public key
 // is pinned here so the test never depends on external DNS or private keys.
 func TestARCIndependentDKIMPyRFC8617Fixture(t *testing.T) {

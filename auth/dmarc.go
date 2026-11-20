@@ -3,13 +3,12 @@ package auth
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
-	"strconv"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
 
+	gomaildns "gomail/dns"
 	"gomail/logging"
 )
 
@@ -43,8 +42,10 @@ type DMARCCheckResult struct {
 	Details      string
 	ReportMailto []string // rua= aggregate report recipients
 	ForensicMail []string // ruf= forensic report recipients
-	PercentApply int      // pct= percentage (0-100)
+	PercentApply int      // Retained for callers; RFC 9989 no longer samples by pct=.
 }
+
+var lookupDMARCDomainExists = gomaildns.DomainExists
 
 // CheckDMARC evaluates DMARC policy for a message given SPF and DKIM results.
 // fromDomain is the domain in the From header (RFC5322.From).
@@ -87,7 +88,7 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 
 	// Parse DMARC tags
 	tags := parseDMARCTags(dmarcRecord)
-	if tags["v"] != "DMARC1" || tags["p"] == "" || (tags["p"] != "none" && tags["p"] != "quarantine" && tags["p"] != "reject") {
+	if tags["v"] != "DMARC1" || (tags["p"] != "" && tags["p"] != "none" && tags["p"] != "quarantine" && tags["p"] != "reject") {
 		return DMARCCheckResult{Result: DMARCPermError, Policy: PolicyNone, Details: "invalid DMARC policy record", PercentApply: 100}
 	}
 
@@ -96,10 +97,20 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 	isSubdomain := !strings.EqualFold(fromDomain, policyDomain)
 
 	var policyTag string
-	if isSubdomain && tags["sp"] != "" {
+	if isSubdomain && validDMARCDisposition(tags["np"]) {
+		exists, lookupErr := lookupDMARCDomainExists(fromDomain)
+		if lookupErr != nil {
+			return dmarcLookupError(lookupErr)
+		}
+		if !exists {
+			policyTag = tags["np"]
+		}
+	}
+	if policyTag == "" && isSubdomain && validDMARCDisposition(tags["sp"]) {
 		// Subdomain has sp= policy
 		policyTag = tags["sp"]
-	} else {
+	}
+	if policyTag == "" {
 		// Use main policy
 		policyTag = tags["p"]
 	}
@@ -164,21 +175,14 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 		return dmarcLookupError(alignmentErr)
 	}
 
-	// Check pct= (percentage sampling) for failures: only apply policy to pct% of messages
-	pct := 100
-	if tags["pct"] != "" {
-		pct = parsePct(tags["pct"])
-		if !shouldApplyPolicy(pct) {
-			// Sampling changes requested disposition, never authentication.
-			return DMARCCheckResult{
-				Result:       DMARCFail,
-				Policy:       PolicyNone,
-				PolicyDomain: policyDomain,
-				Details:      fmt.Sprintf("failed auth but excluded by pct=%s sampling", tags["pct"]),
-				ReportMailto: parseReportAddresses(tags["rua"]),
-				ForensicMail: parseReportAddresses(tags["ruf"]),
-				PercentApply: pct,
-			}
+	// RFC 9989 removed pct=. Test mode lowers the requested disposition by
+	// one level without changing the authentication result or report routing.
+	if tags["t"] == "y" {
+		switch policy {
+		case PolicyReject:
+			policy = PolicyQuarantine
+		case PolicyQuarantine:
+			policy = PolicyNone
 		}
 	}
 
@@ -190,32 +194,17 @@ func CheckDMARC(fromDomain string, spfResult SPFResult, spfDomain string, dkimRe
 		Details:      details,
 		ReportMailto: parseReportAddresses(tags["rua"]),
 		ForensicMail: parseReportAddresses(tags["ruf"]),
-		PercentApply: pct,
+		PercentApply: 100,
 	}
+}
+
+func validDMARCDisposition(value string) bool {
+	return value == "none" || value == "quarantine" || value == "reject"
 }
 
 // isSubdomainOfOrg returns true if domain is a subdomain of its organizational domain.
 func isSubdomainOfOrg(domain string) bool {
 	return !strings.EqualFold(strings.TrimSuffix(domain, "."), getOrgDomain(domain))
-}
-
-// parsePct parses the pct= tag value (percentage, 0-100).
-// Returns 100 if invalid or not specified (default: apply to all).
-func parsePct(pctStr string) int {
-	if pctStr == "" {
-		return 100
-	}
-	pct, err := strconv.Atoi(pctStr)
-	if err != nil {
-		return 100
-	}
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 100 {
-		pct = 100
-	}
-	return pct
 }
 
 // parseReportAddresses parses rua= or ruf= values into individual email addresses.
@@ -237,18 +226,6 @@ func parseReportAddresses(reportTag string) []string {
 		}
 	}
 	return addresses
-}
-
-// shouldApplyPolicy returns true if the message should have the policy applied
-// based on the percentage sampling. Returns true with probability pct/100.
-func shouldApplyPolicy(pct int) bool {
-	if pct >= 100 {
-		return true
-	}
-	if pct <= 0 {
-		return false
-	}
-	return rand.Intn(100) < pct
 }
 
 type dmarcTreeRecord struct {
@@ -394,7 +371,7 @@ func queryDMARC(domain string) (string, error) {
 
 	var found []string
 	for _, txt := range txtRecords {
-		if strings.HasPrefix(txt, "v=DMARC1") {
+		if IsDMARCVersionRecord(txt) {
 			found = append(found, txt)
 		}
 	}
@@ -405,6 +382,14 @@ func queryDMARC(domain string) (string, error) {
 		return "", fmt.Errorf("%w at %s", errMultipleDMARC, dmarcDomain)
 	}
 	return found[0], nil
+}
+
+// IsDMARCVersionRecord recognizes only a first v tag with the exact,
+// case-sensitive DMARC1 value. RFC 9989 permits WSP around the equals sign.
+func IsDMARCVersionRecord(record string) bool {
+	first, _, _ := strings.Cut(record, ";")
+	key, value, ok := strings.Cut(first, "=")
+	return ok && strings.TrimSpace(key) == "v" && strings.TrimSpace(value) == "DMARC1" && strings.HasPrefix(first, "v")
 }
 
 func parseDMARCTags(record string) map[string]string {

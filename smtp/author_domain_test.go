@@ -37,3 +37,12 @@ func TestSPFIdentityDomainForNullReversePath(t *testing.T) {
 		t.Fatalf("MAIL FROM SPF identity = %q", got)
 	}
 }
+
+func TestReportEnvelopeFromDomainForNullReversePath(t *testing.T) {
+	if got := reportEnvelopeFromDomain(""); got != "" {
+		t.Fatalf("null reverse-path report envelope domain = %q", got)
+	}
+	if got := reportEnvelopeFromDomain("alice@example.com"); got != "example.com" {
+		t.Fatalf("ordinary report envelope domain = %q", got)
+	}
+}

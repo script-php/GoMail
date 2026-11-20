@@ -106,11 +106,6 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[web] View message: id=%d, subject=%q, textLen=%d, htmlLen=%d",
-		id, msg.Subject, len(msg.TextBody), len(msg.HTMLBody))
-	log.Printf("[web] View message: id=%d, MDNRequested=%v, MDNAddress=%s, MDNSent=%v, Config.MDN.Enabled=%s, Config.MDN.Mode=%s",
-		id, msg.MDNRequested, msg.MDNAddress, msg.MDNSent, h.cfg.MDN.Enabled, h.cfg.MDN.Mode)
-
 	// Mark as read
 	if !msg.IsRead {
 		if err := h.db.MarkRead(id); err != nil {
@@ -139,7 +134,7 @@ func (h *MessageHandler) View(w http.ResponseWriter, r *http.Request) {
 	// Raw MIME is authoritative. A previous sidecar write may have failed after
 	// acceptance; repair it on an account-scoped view instead of hiding it.
 	attachments, attachmentErr := h.db.GetAttachments(id)
-	if attachmentErr == nil && msg.HasAttachments && len(attachments) == 0 {
+	if attachmentErr == nil && msg.HasAttachments {
 		if err := parser.RepairAttachments(h.db, msg, h.db.AttachmentsPath()); err != nil {
 			attachmentErr = err
 			log.Printf("[web] attachment repair for message %d: %v", id, err)
@@ -308,7 +303,6 @@ func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) err
 	if msg.MDNAddress == "" {
 		return fmt.Errorf("MDN destination is empty")
 	}
-	log.Printf("[web] sendMDN: starting for msg=%d, recipient=%s", msg.ID, msg.MDNAddress)
 	// Generate MDN message using multipart/report format per RFC 3798
 	mdnBody := mdn.GenerateMDNMultipart(
 		msg.MessageID,
@@ -326,7 +320,7 @@ func (h *MessageHandler) sendMDN(msg *store.Message, account *store.Account) err
 	}
 
 	msg.MDNSent = true
-	log.Printf("[web] MDN sent for message %d to %s", msg.ID, msg.MDNAddress)
+	log.Printf("[web] MDN queued for message %d", msg.ID)
 	return nil
 }
 
@@ -427,7 +421,7 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 	file := os.NewFile(uintptr(fileFD), name)
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if err != nil || !info.Mode().IsRegular() || info.Size() != att.Size {
 		http.NotFound(w, r)
 		return
 	}
@@ -437,8 +431,14 @@ func (h *MessageHandler) DownloadAttachment(w http.ResponseWriter, r *http.Reque
 		contentType = "application/octet-stream"
 	}
 	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(att.Filename)})
+	if disposition == "" {
+		disposition = "attachment"
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", disposition)
+	// An attachment must never execute with the webmail application's origin,
+	// even if a client ignores the download disposition and renders HTML.
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'")
 	http.ServeContent(w, r, filepath.Base(att.Filename), info.ModTime(), file)
 }
 

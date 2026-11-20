@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -9,8 +11,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// newAttachmentName avoids collisions with files left behind when a process
+// crashes after writing a sidecar but before committing its message row.
+func newAttachmentName(messageID int64, kind string, index int, data []byte, extension string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generating attachment filename: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%d_%s_%d_%x_%x%s", messageID, kind, index, digest[:8], nonce[:], extension), nil
+}
+
+var syncAttachmentDirectory = unix.Fsync
+
 // WriteAttachmentFile creates a new attachment without following a pre-existing
-// symlink or replacing an existing file.
+// symlink or replacing an existing file. The contents and directory entry are
+// durable before the caller commits a database reference to this path.
 func WriteAttachmentFile(path string, data []byte) error {
 	dir, name := filepath.Split(path)
 	if name == "" || name == "." || name == ".." {
@@ -28,12 +44,18 @@ func WriteAttachmentFile(path string, data []byte) error {
 	file := os.NewFile(uintptr(fd), name)
 	_, err = file.Write(data)
 	if err == nil {
-		err = file.Close()
-	} else {
-		_ = file.Close()
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = syncAttachmentDirectory(dirFD)
 	}
 	if err != nil {
 		_ = unix.Unlinkat(dirFD, name, 0)
+		_ = syncAttachmentDirectory(dirFD)
 	}
 	return err
 }

@@ -8,9 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/mail"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 
 	godns "gomail/dns"
 	"gomail/metrics"
@@ -22,6 +28,9 @@ import (
 var errMissingSMTPUTF8 = errors.New("SMTPUTF8 not advertised")
 var errMissing8BITMIME = errors.New("8BITMIME not advertised")
 var errInvalidQueuedMessage = errors.New("invalid queued message")
+
+// ErrInvalidEnvelopeAddress is a permanent local address-syntax failure.
+var ErrInvalidEnvelopeAddress = errors.New("invalid envelope address")
 
 // ErrDeliveryOutcomeUnknown means DATA may have been accepted, but its final
 // reply was not received. Retrying automatically could duplicate the message.
@@ -52,6 +61,9 @@ func SMTPFailureCode(err error) int {
 	}
 	if errors.Is(err, errInvalidQueuedMessage) || isMissingMessageExtension(err) {
 		return 554
+	}
+	if errors.Is(err, ErrInvalidEnvelopeAddress) {
+		return 553
 	}
 	return 0
 }
@@ -116,18 +128,31 @@ func daneTransportPolicy(enforcement string, result godns.TLSAResult, lookupErr 
 // network: "tcp" (both IPv4 and IPv6), "tcp4" (IPv4 only), "tcp6" (IPv6 only)
 // db: database for recording TLS failures (optional, can be nil)
 func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, policyDomain ...string) error {
-	if strings.ContainsAny(from, "\r\n<>") || strings.ContainsAny(to, "\r\n<>") {
-		return fmt.Errorf("invalid envelope address")
+	return sendMail(from, to, msg, hostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, false, policyDomain...)
+}
+
+// SendTLSReport sends a trusted system TLS-RPT message without honoring the
+// destination's MTA-STS or DANE failures (RFC 8460 section 5.3.1).
+func SendTLSReport(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, policyDomain ...string) error {
+	return sendMail(from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, db, true, policyDomain...)
+}
+
+func sendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, tlsReport bool, policyDomain ...string) error {
+	if invalidSMTPEnvelopePath(from) || invalidSMTPEnvelopePath(to) {
+		return ErrInvalidEnvelopeAddress
 	}
+	if err := ValidateOutboundDSNOptions(dsnNotify, dsnRet); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidQueuedMessage, err)
+	}
+	if err := ValidateOutboundDSNEnvelopeID(dsnEnvID); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidQueuedMessage, err)
+	}
+	dsnNotify, dsnRet = strings.ToUpper(dsnNotify), strings.ToUpper(dsnRet)
 	if err := validateSMTPDataLines(msg); err != nil {
 		return fmt.Errorf("554 5.6.0 invalid queued message: %w: %v", errInvalidQueuedMessage, err)
 	}
 	// Extract sender domain (for DANE/TLS settings lookup)
-	fromParts := strings.SplitN(from, "@", 2)
-	senderDomain := ""
-	if len(fromParts) == 2 {
-		senderDomain = fromParts[1]
-	}
+	senderDomain := smtpEnvelopeDomain(from)
 	if from == "" && len(policyDomain) != 0 {
 		senderDomain = policyDomain[0]
 	}
@@ -135,13 +160,22 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 	if len(policyDomain) > 1 && policyDomain[1] != "" {
 		originalRecipient = policyDomain[1]
 	}
+	if err := validateOutboundOriginalRecipient(originalRecipient); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidQueuedMessage, err)
+	}
 
 	// Extract recipient domain
-	parts := strings.SplitN(to, "@", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid recipient address: %s", to)
+	recipientDomain := smtpEnvelopeDomain(to)
+	if recipientDomain == "" {
+		return fmt.Errorf("%w: invalid recipient address: %s", ErrInvalidEnvelopeAddress, to)
 	}
-	recipientDomain := parts[1]
+	// DNS, MTA-STS and TLS reporting use the IDNA A-label. Keep the original
+	// envelope recipient for RCPT TO, where SMTPUTF8 is negotiated separately.
+	var domainErr error
+	recipientDomain, domainErr = outboundDNSDomain(recipientDomain)
+	if domainErr != nil {
+		return fmt.Errorf("%w: recipient domain: %v", ErrInvalidEnvelopeAddress, domainErr)
+	}
 
 	// Mandatory DANE authenticates the MX path as well as the TLSA RRset.
 	// A TLSA match for an attacker-chosen, insecure MX does not authenticate
@@ -155,8 +189,27 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 		if domainObj == nil || !domainObj.IsActive {
 			return fmt.Errorf("sender domain is missing or inactive")
 		}
-		daneEnforcement = domainObj.DANEEnforcement
-		requireTLS = requireTLS || domainObj.RequireTLS
+		if !tlsReport {
+			daneEnforcement = domainObj.DANEEnforcement
+			requireTLS = requireTLS || domainObj.RequireTLS
+		}
+	}
+	if tlsReport {
+		// Report sessions are excluded from TLS-RPT aggregation to avoid
+		// recursive reports. MX lookup and SMTP delivery still apply.
+		mxRecords, err := godns.LookupMX(recipientDomain)
+		if err != nil {
+			return fmt.Errorf("MX lookup for %s: %w", recipientDomain, err)
+		}
+		var lastErr error
+		for _, mx := range mxRecords {
+			err := deliverTLSReportHostAt(net.JoinHostPort(mx.Host, "25"), mx.Host, from, to, msg, hostname, tlsCfg, dsnNotify, dsnRet, dsnEnvID, network, recipientDomain, originalRecipient)
+			if err == nil || errors.Is(err, ErrDeliveryOutcomeUnknown) {
+				return err
+			}
+			lastErr = preferredMXFailure(lastErr, err)
+		}
+		return mxDeliveryFailure(recipientDomain, lastErr, false)
 	}
 	// Fetch after validating the local sender policy, but before any MX or
 	// network delivery. A cache read failure must not downgrade enforcement.
@@ -180,22 +233,18 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 
 	// Try each MX in preference order
 	var lastErr error
+	skippedBySTSPolicy := false
 	for _, mx := range mxRecords {
 		// Check MTA-STS policy: validate MX host is in policy if policy exists
 		if policy != nil && policy.Mode != "none" {
 			// Check if this MX host is allowed by the policy
-			hostAllowed := false
-			for _, policyMX := range policy.MXHosts {
-				if matchSTSMX(mx.Host, policyMX) {
-					hostAllowed = true
-					break
-				}
-			}
+			hostAllowed := stsPolicyAllowsMX(mx.Host, policy)
 
 			// Enforce TLS requirements based on policy mode
 			if policy.Mode == "enforce" {
 				// Enforce mode: skip hosts not in policy and require TLS
 				if !hostAllowed {
+					skippedBySTSPolicy = true
 					log.Printf("[mta-sts] MX host %s not in policy for %s, skipping", mx.Host, recipientDomain)
 					recordTLSResults(db, tlsReportEvents(recipientDomain, mx.Host, nil, policy, godns.TLSAResult{}), false,
 						"validation-failure", "MX hostname is not permitted by the MTA-STS policy")
@@ -240,7 +289,106 @@ func SendMail(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, 
 		}
 	}
 
+	return mxDeliveryFailure(recipientDomain, lastErr, skippedBySTSPolicy)
+}
+
+func invalidSMTPEnvelopePath(address string) bool {
+	for i := 0; i < len(address); i++ {
+		if address[i] < 32 || address[i] == 127 || address[i] == '<' || address[i] == '>' {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateOutboundDSNOptions checks queue metadata before it becomes SMTP
+// command text. It is also used at authenticated-submission queue admission.
+func ValidateOutboundDSNOptions(notify, ret string) error {
+	if ret != "" && !strings.EqualFold(ret, "FULL") && !strings.EqualFold(ret, "HDRS") {
+		return fmt.Errorf("invalid DSN RET option")
+	}
+	if notify == "" || strings.EqualFold(notify, "NEVER") {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, item := range strings.Split(strings.ToUpper(notify), ",") {
+		if item != "SUCCESS" && item != "FAILURE" && item != "DELAY" || seen[item] {
+			return fmt.Errorf("invalid DSN NOTIFY option")
+		}
+		seen[item] = true
+	}
+	return nil
+}
+
+// ValidateOutboundDSNEnvelopeID ensures that a queued ID remains legal when
+// encoded into an RFC 3461 ENVID parameter on the next SMTP hop.
+func ValidateOutboundDSNEnvelopeID(value string) error {
+	if value == "" {
+		return nil
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\t' && (value[i] < 32 || value[i] > 126) {
+			return fmt.Errorf("invalid DSN ENVID character")
+		}
+	}
+	if len(encodeXText(value)) > 100 {
+		return fmt.Errorf("DSN ENVID exceeds 100 encoded characters")
+	}
+	return nil
+}
+
+func validateOutboundOriginalRecipient(value string) error {
+	if value == "" || !utf8.ValidString(value) {
+		return fmt.Errorf("invalid DSN original recipient")
+	}
+	for _, r := range value {
+		if r < 32 || r == 127 {
+			return fmt.Errorf("invalid DSN original recipient character")
+		}
+	}
+	if len(originalRecipientParameter(value, hasNonASCII(value))) > 500 {
+		return fmt.Errorf("DSN ORCPT exceeds 500 encoded characters")
+	}
+	return nil
+}
+
+func mxDeliveryFailure(recipientDomain string, lastErr error, skippedBySTSPolicy bool) error {
+	if lastErr == nil && skippedBySTSPolicy {
+		return fmt.Errorf("MTA-STS policy for %s permits none of the current MX hosts; retry after policy or DNS update", recipientDomain)
+	}
 	return fmt.Errorf("all MX hosts failed for %s: %w", recipientDomain, lastErr)
+}
+
+// smtpEnvelopeDomain uses the final @: a quoted SMTP local-part may contain @.
+func smtpEnvelopeDomain(address string) string {
+	at := strings.LastIndexByte(address, '@')
+	if at < 0 || at == len(address)-1 {
+		return ""
+	}
+	return address[at+1:]
+}
+
+func outboundDNSDomain(domain string) (string, error) {
+	if !utf8.ValidString(domain) {
+		return "", fmt.Errorf("invalid UTF-8")
+	}
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil || name == "" || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
+		return "", fmt.Errorf("invalid DNS name")
+	}
+	return strings.ToLower(name), nil
+}
+
+func asciiEnvelopeDomain(address string) (string, error) {
+	domain := smtpEnvelopeDomain(address)
+	if domain == "" || !hasNonASCII(domain) {
+		return address, nil
+	}
+	ascii, err := outboundDNSDomain(domain)
+	if err != nil {
+		return "", err
+	}
+	return address[:len(address)-len(domain)] + ascii, nil
 }
 
 // deliverToHost connects to a specific SMTP host and delivers the message.
@@ -255,6 +403,21 @@ func deliverToHost(host, from, to string, msg []byte, myHostname string, tlsCfg 
 
 // deliverToHostAt permits loopback interoperability tests without binding port 25.
 func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, daneEnforcement string, stsPolicy *mta_sts.Policy, originalRecipients ...string) error {
+	return deliverToHostAtMode(addr, host, from, to, msg, myHostname, tlsCfg, requireTLS, dsnNotify, dsnRet, dsnEnvID, network, db, recipientDomain, daneEnforcement, stsPolicy, false, false, originalRecipients...)
+}
+
+var errReportTLSHandshake = errors.New("TLS report opportunistic STARTTLS handshake failed")
+
+func deliverTLSReportHostAt(addr, host, from, to string, msg []byte, hostname string, tlsCfg *tls.Config, dsnNotify, dsnRet, dsnEnvID, network, recipientDomain, originalRecipient string) error {
+	err := deliverToHostAtMode(addr, host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, nil, recipientDomain, "disabled", nil, false, true, originalRecipient)
+	if errors.Is(err, errReportTLSHandshake) {
+		// STARTTLS acceptance changes the wire protocol; use a fresh socket.
+		return deliverToHostAtMode(addr, host, from, to, msg, hostname, tlsCfg, false, dsnNotify, dsnRet, dsnEnvID, network, nil, recipientDomain, "disabled", nil, true, true, originalRecipient)
+	}
+	return err
+}
+
+func deliverToHostAtMode(addr, host, from, to string, msg []byte, myHostname string, tlsCfg *tls.Config, requireTLS bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, recipientDomain, daneEnforcement string, stsPolicy *mta_sts.Policy, skipSTARTTLS, tlsReport bool, originalRecipients ...string) error {
 	conn, err := net.DialTimeout(network, addr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", addr, err)
@@ -301,13 +464,20 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 	}
 	effectiveRequireTLS := transportTLSRequired(requireTLS, daneEnforcement) || daneRequireTLS
 	reportEvents := tlsReportEvents(recipientDomain, host, conn, stsPolicy, daneLookup)
+	if stsPolicy != nil && stsPolicy.Mode == "testing" && !stsPolicyAllowsMX(host, stsPolicy) {
+		// Testing mode permits delivery, but the disallowed MX is still a
+		// policy failure. Do not count a later TLS handshake as STS success.
+		recordTLSResults(db, filterTLSReportEvents(reportEvents, "sts"), false,
+			"validation-failure", "MX hostname is not permitted by the MTA-STS policy")
+		reportEvents = excludeTLSReportEvents(reportEvents, "sts")
+	}
 	tlsEstablished := false
 	var daneVerifyResult tlsconfig.DANEResult
 	var daneVerifyErr error
 	var stsVerifyErr error
 
 	// Try STARTTLS if supported
-	if capabilities["STARTTLS"] && tlsCfg != nil {
+	if !skipSTARTTLS && capabilities["STARTTLS"] && tlsCfg != nil {
 		if err := sendCmd(conn, "STARTTLS"); err != nil {
 			return fmt.Errorf("sending STARTTLS to %s: %w", host, err)
 		} else {
@@ -407,6 +577,9 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 
 					// After STARTTLS acceptance, the connection speaks TLS, not
 					// plaintext SMTP. A later cleartext attempt needs a new socket.
+					if tlsReport {
+						return fmt.Errorf("%w with %s: %v", errReportTLSHandshake, host, err)
+					}
 					return fmt.Errorf("STARTTLS handshake with %s failed: %w", host, err)
 				} else {
 					conn = clientTLS
@@ -441,24 +614,21 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 					}
 					recordTLSResults(db, reportEvents, true, "", "")
 
-					// Re-EHLO after STARTTLS and update DSN/UTF8 support flags
-					if err := sendCmd(conn, fmt.Sprintf("EHLO %s", myHostname)); err != nil {
-						return fmt.Errorf("sending post-STARTTLS EHLO to %s: %w", host, err)
-					}
-					postTLSEhlo, err := readReply(conn)
+					// STARTTLS resets the SMTP session. Re-negotiate from scratch,
+					// including the legacy HELO fallback, and never reuse pre-TLS
+					// extension advertisements.
+					capabilities, err = smtpGreetingCapabilities(conn, myHostname)
 					if err != nil {
-						return fmt.Errorf("reading post-STARTTLS EHLO from %s: %w", host, err)
+						return fmt.Errorf("post-STARTTLS greeting with %s: %w", host, err)
 					}
-					if !strings.HasPrefix(postTLSEhlo, "250 ") && !strings.HasPrefix(postTLSEhlo, "250-") {
-						return &replyFailure{fmt.Sprintf("post-STARTTLS EHLO rejected by %s", host), postTLSEhlo}
-					}
-					capabilities = ehloCapabilities(postTLSEhlo)
 					supportsDSN = capabilities["DSN"]
 					supportsUTF8 = capabilities["SMTPUTF8"]
 					supports8Bit = capabilities["8BITMIME"]
 				}
 			} else if effectiveRequireTLS {
-				return &replyFailure{fmt.Sprintf("TLS required but STARTTLS was rejected by %s", host), startTLSReply}
+				// A remote 5xx to STARTTLS is a TLS-policy failure, not a
+				// permanent recipient failure. Retry after policy/DNS changes.
+				return fmt.Errorf("TLS required but STARTTLS was rejected by %s: %s", host, strings.TrimSpace(startTLSReply))
 			}
 		}
 	} else if !capabilities["STARTTLS"] {
@@ -471,13 +641,25 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 		return fmt.Errorf("TLS required but a secure STARTTLS session could not be established with %s", host)
 	}
 
+	// An internationalized domain can be represented by an ASCII A-label even
+	// on a peer without SMTPUTF8. The local part and message headers cannot be
+	// downgraded this way and still require the advertised extension.
+	wireFrom, err := asciiEnvelopeDomain(from)
+	if err != nil {
+		return fmt.Errorf("%w: sender domain: %v", ErrInvalidEnvelopeAddress, err)
+	}
+	wireTo, err := asciiEnvelopeDomain(to)
+	if err != nil {
+		return fmt.Errorf("%w: recipient domain: %v", ErrInvalidEnvelopeAddress, err)
+	}
+
 	// MAIL FROM with SMTPUTF8 parameter (if supported)
 	// Format: MAIL FROM:<addr> [SMTPUTF8] [RET=FULL|HDRS] [ENVID=<id>]
 	// RFC 6531: Include SMTPUTF8 parameter when server supports it and sender is non-ASCII
 	// Even if not advertised, try anyway - some servers support it without advertising
-	mailFromCmd := fmt.Sprintf("MAIL FROM:<%s>", from)
+	mailFromCmd := fmt.Sprintf("MAIL FROM:<%s>", wireFrom)
 
-	needsUTF8, needs8Bit, formatErr := outboundFormatRequirements(from, to, msg, supportsUTF8, supports8Bit, host)
+	needsUTF8, needs8Bit, formatErr := outboundFormatRequirements(wireFrom, wireTo, msg, supportsUTF8, supports8Bit, host)
 	if formatErr != nil {
 		return formatErr
 	}
@@ -486,6 +668,9 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 	}
 	if needs8Bit {
 		mailFromCmd += " BODY=8BITMIME"
+	}
+	if capabilities["SIZE"] {
+		mailFromCmd += fmt.Sprintf(" SIZE=%d", smtpDataSize(msg))
 	}
 
 	if supportsDSN {
@@ -510,7 +695,17 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 	}
 
 	// SMTPUTF8 is a MAIL FROM parameter, not an RCPT TO parameter.
-	rcptToCmd := recipientCommand(to, supportsDSN, supportsUTF8, dsnNotify, originalRecipients...)
+	originalForCommand := to
+	if len(originalRecipients) > 0 && originalRecipients[0] != "" {
+		originalForCommand = originalRecipients[0]
+	}
+	if supportsDSN && len(originalRecipientParameter(originalForCommand, supportsUTF8)) > 500 {
+		return fmt.Errorf("%w: DSN ORCPT exceeds 500 encoded characters for %s", errInvalidQueuedMessage, host)
+	}
+	if len(originalRecipients) == 0 && dsnNotify != "" {
+		originalRecipients = []string{to}
+	}
+	rcptToCmd := recipientCommand(wireTo, supportsDSN, supportsUTF8, dsnNotify, originalRecipients...)
 
 	if err := sendCmd(conn, rcptToCmd); err != nil {
 		return err
@@ -519,7 +714,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 	if err != nil {
 		return err
 	}
-	if code := smtpReplyCode(rcptReply); code != "250" && code != "251" {
+	if code := smtpReplyCode(rcptReply); code != "250" && code != "251" && code != "252" {
 		return &replyFailure{fmt.Sprintf("RCPT TO rejected by %s", host), rcptReply}
 	}
 
@@ -544,7 +739,7 @@ func deliverToHostAt(addr, host, from, to string, msg []byte, myHostname string,
 	if err != nil {
 		return fmt.Errorf("reading final reply from %s: %w: %v", host, ErrDeliveryOutcomeUnknown, err)
 	}
-	if !strings.HasPrefix(finalReply, "250") {
+	if code := smtpReplyCode(finalReply); len(code) != 3 || code[0] != '2' {
 		return &replyFailure{fmt.Sprintf("message rejected by %s", host), finalReply}
 	}
 
@@ -595,11 +790,23 @@ func outboundFormatRequirements(from, to string, msg []byte, supportsUTF8, suppo
 	if needsUTF8 && !supportsUTF8 {
 		return false, false, fmt.Errorf("554 5.6.0 SMTPUTF8 required but not advertised by %s: %w", host, errMissingSMTPUTF8)
 	}
-	needs8Bit := has8Bit(msg)
+	// RFC 6531 uses the 8BITMIME transport parameter with SMTPUTF8 even
+	// when the non-ASCII octets occur only in an envelope address.
+	needs8Bit := has8Bit(msg) || needsUTF8
 	if needs8Bit && !supports8Bit {
 		return false, false, fmt.Errorf("554 5.6.3 8BITMIME required but not advertised by %s: %w", host, errMissing8BITMIME)
 	}
 	return needsUTF8, needs8Bit, nil
+}
+
+// RFC 1870 counts the message octets after DATA's 354 reply, excluding dot
+// transparency and the terminating dot. writeSMTPData adds CRLF when absent.
+func smtpDataSize(msg []byte) int {
+	size := len(msg)
+	if !bytes.HasSuffix(msg, []byte("\r\n")) {
+		size += 2
+	}
+	return size
 }
 
 // smtpGreetingCapabilities falls back to legacy HELO only when EHLO is not
@@ -637,6 +844,14 @@ func sendCmd(conn net.Conn, cmd string) error {
 }
 
 func sendCmdWithTimeout(conn net.Conn, cmd string, timeout time.Duration) error {
+	// Commands are assembled from configuration and stored envelope metadata.
+	// Only this function may add the SMTP line terminator; embedded controls
+	// would otherwise turn one command into multiple protocol commands.
+	for i := 0; i < len(cmd); i++ {
+		if cmd[i] < 32 || cmd[i] == 127 {
+			return fmt.Errorf("invalid control character in SMTP command")
+		}
+	}
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
@@ -780,6 +995,18 @@ func matchSTSMX(host, pattern string) bool {
 	return strings.HasSuffix(host, suffix) && prefix != "" && !strings.Contains(prefix, ".")
 }
 
+func stsPolicyAllowsMX(host string, policy *mta_sts.Policy) bool {
+	if policy == nil {
+		return true
+	}
+	for _, pattern := range policy.MXHosts {
+		if matchSTSMX(host, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func verifySTSCertificate(certs []*x509.Certificate, host string, roots *x509.CertPool) error {
 	if len(certs) == 0 {
 		return fmt.Errorf("SMTP peer sent no certificate")
@@ -814,7 +1041,7 @@ func tlsReportEvents(recipientDomain, host string, conn net.Conn, stsPolicy *mta
 	if dane.Authenticated && len(dane.Records) > 0 {
 		event := base
 		event.PolicyType = "tlsa"
-		event.PolicyDomain = strings.TrimSuffix(host, ".")
+		event.PolicyDomain = tlsaBaseDomain(host, dane.Name)
 		for _, record := range dane.Records {
 			event.PolicyString = append(event.PolicyString, fmt.Sprintf("%d %d %d %s", record.Usage, record.Selector, record.MatchingType, record.CertData))
 		}
@@ -879,6 +1106,32 @@ func has8Bit(data []byte) bool {
 	return false
 }
 
+type highBitReader struct {
+	reader io.Reader
+	seen   bool
+}
+
+func (r *highBitReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if has8Bit(p[:n]) {
+		r.seen = true
+	}
+	return n, err
+}
+
+func readerContains8Bit(reader io.Reader) bool {
+	var buf [32 * 1024]byte
+	for {
+		n, err := reader.Read(buf[:])
+		if has8Bit(buf[:n]) {
+			return true
+		}
+		if err != nil {
+			return err != io.EOF // An interrupted scan cannot prove the headers are ASCII.
+		}
+	}
+}
+
 func requiresSMTPUTF8(from, to string, msg []byte) bool {
 	if hasNonASCII(from) || hasNonASCII(to) {
 		return true
@@ -890,7 +1143,89 @@ func requiresSMTPUTF8(from, to string, msg []byte) bool {
 	if end < 0 {
 		end = len(msg)
 	}
-	return has8Bit(msg[:end])
+	if has8Bit(msg[:end]) {
+		return true
+	}
+	if end == len(msg) {
+		return false
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(msg))
+	if err != nil {
+		// An unparseable MIME tree must not bypass the SMTPUTF8 check.
+		return has8Bit(msg[end:])
+	}
+	remaining := 1000
+	return mimeHeadersNeedSMTPUTF8(parsed.Header.Get("Content-Type"), parsed.Header.Get("Content-Transfer-Encoding"), parsed.Body, 0, &remaining)
+}
+
+// MessageRequiresSMTPUTF8 reports whether a message has internationalized
+// headers at any MIME level. Submission listeners that do not advertise
+// SMTPUTF8 must reject such messages before acknowledging them.
+func MessageRequiresSMTPUTF8(msg []byte) bool {
+	return requiresSMTPUTF8("", "", msg)
+}
+
+// RFC 6531 applies to headers at every MIME level, including attached messages.
+// Bound the MIME depth and part count, but stream arbitrary-size bodies.
+// On malformed MIME, require SMTPUTF8 if non-ASCII bytes might be a header.
+func mimeHeadersNeedSMTPUTF8(contentType, encoding string, body io.Reader, depth int, remaining *int) bool {
+	if strings.EqualFold(strings.TrimSpace(encoding), "base64") || strings.EqualFold(strings.TrimSpace(encoding), "quoted-printable") {
+		return false // Encoded wire bytes cannot contain UTF-8 headers.
+	}
+	if depth >= 12 || *remaining <= 0 {
+		return readerContains8Bit(body)
+	}
+	if strings.TrimSpace(contentType) == "" {
+		return false // MIME defaults to text/plain; its body is not a header.
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return readerContains8Bit(body)
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return readerContains8Bit(body)
+		}
+		tracked := &highBitReader{reader: body}
+		reader := multipart.NewReader(tracked, boundary)
+		for {
+			part, err := reader.NextRawPart()
+			if err == io.EOF {
+				return false
+			}
+			if err != nil {
+				return tracked.seen || readerContains8Bit(tracked) // Malformed MIME may conceal a UTF-8 header.
+			}
+			*remaining--
+			for _, values := range part.Header {
+				for _, value := range values {
+					if has8Bit([]byte(value)) {
+						return true
+					}
+				}
+			}
+			if mimeHeadersNeedSMTPUTF8(part.Header.Get("Content-Type"), part.Header.Get("Content-Transfer-Encoding"), part, depth+1, remaining) {
+				return true
+			}
+		}
+	}
+	if mediaType == "message/rfc822" || mediaType == "message/global" {
+		tracked := &highBitReader{reader: body}
+		message, err := mail.ReadMessage(tracked)
+		if err != nil {
+			return tracked.seen || readerContains8Bit(tracked)
+		}
+		for _, values := range message.Header {
+			for _, value := range values {
+				if has8Bit([]byte(value)) {
+					return true
+				}
+			}
+		}
+		return mimeHeadersNeedSMTPUTF8(message.Header.Get("Content-Type"), message.Header.Get("Content-Transfer-Encoding"), message.Body, depth+1, remaining)
+	}
+	return false
 }
 
 func validateSMTPDataLines(msg []byte) error {

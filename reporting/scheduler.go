@@ -11,10 +11,10 @@ import (
 	"net/mail"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
+	"gomail/auth"
 	"gomail/config"
 	"gomail/logging"
 	"gomail/metrics"
@@ -191,8 +191,8 @@ func sendDMARCReportWindow(cfg *config.Config, db *store.DB, enqueueFunc Enqueue
 		return false
 	}
 
-	if dmarcRecord == nil || (len(dmarcRecord.ReportMailto) == 0 && len(dmarcRecord.ForensicMail) == 0) {
-		logging.Info(fmt.Sprintf("[dmarc]  %s: no rua=/ruf= addresses configured", domain.Domain))
+	if dmarcRecord == nil || len(dmarcRecord.ReportMailto) == 0 {
+		logging.Info(fmt.Sprintf("[dmarc]  %s: no rua= aggregate-report addresses configured", domain.Domain))
 		return false
 	}
 
@@ -210,7 +210,7 @@ func sendDMARCReportWindow(cfg *config.Config, db *store.DB, enqueueFunc Enqueue
 
 	// Generate XML report
 	// Use our organization's domain as sender
-	policy := PolicyPublished{Domain: domain.Domain, P: dmarcRecord.P, SP: dmarcRecord.SP, ADKIM: dmarcRecord.ADKIM, ASPF: dmarcRecord.ASPF, Pct: dmarcRecord.Pct}
+	policy := PolicyPublished{Domain: domain.Domain, P: dmarcRecord.P, SP: dmarcRecord.SP, NP: dmarcRecord.NP, ADKIM: dmarcRecord.ADKIM, ASPF: dmarcRecord.ASPF, Testing: dmarcRecord.Testing, DiscoveryMethod: "treewalk", FO: dmarcRecord.FO}
 	reportXML, err := GenerateDMARCAggregateReport(
 		domain.Domain,
 		fmt.Sprintf("postmaster@%s", cfg.Server.Domain),
@@ -295,18 +295,18 @@ func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 		return nil, err
 	}
 	policy.P = parts["p"]
+	if policy.P == "" {
+		policy.P = "none"
+	}
 	if policy.P != "none" && policy.P != "quarantine" && policy.P != "reject" {
 		return nil, fmt.Errorf("invalid DMARC policy for %s", domain)
 	}
 	policy.SP = parts["sp"]
+	policy.NP = parts["np"]
+	policy.Testing = parts["t"]
+	policy.FO = parts["fo"]
 	policy.ADKIM = parts["adkim"]
 	policy.ASPF = parts["aspf"]
-	policy.Pct = 100
-	if raw := parts["pct"]; raw != "" {
-		if n, e := strconv.Atoi(raw); e == nil && n >= 0 && n <= 100 {
-			policy.Pct = n
-		}
-	}
 	if ruaVal, ok := parts["rua"]; ok {
 		policy.ReportMailto = parseReportAddresses(ruaVal)
 	}
@@ -319,10 +319,9 @@ func lookupDMARCForReporting(domain string) (*DMARCReportPolicy, error) {
 
 // DMARCReportPolicy holds report recipient addresses
 type DMARCReportPolicy struct {
-	ReportMailto       []string
-	ForensicMail       []string
-	P, SP, ADKIM, ASPF string
-	Pct                int
+	ReportMailto                        []string
+	ForensicMail                        []string
+	P, SP, NP, Testing, FO, ADKIM, ASPF string
 }
 
 func authorizedDMARCReportDestination(policyDomain, address string) bool {
@@ -391,12 +390,7 @@ func resolvedDMARCReportDestinations(policyDomain, address string) []string {
 
 // extractDMARCTags parses DMARC record tags from a TXT record value
 func dmarcVersionRecord(record string) bool {
-	const version = "v=DMARC1"
-	if !strings.HasPrefix(record, version) {
-		return false
-	}
-	rest := strings.TrimLeft(record[len(version):], " \t")
-	return rest == "" || strings.HasPrefix(rest, ";")
+	return auth.IsDMARCVersionRecord(record)
 }
 
 func extractDMARCTags(record string) (map[string]string, error) {
@@ -544,8 +538,7 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 
 		if err := rows.Scan(&headerFrom, &sourceIP, &count, &dkimResult, &dkimDomain, &dkimSelector,
 			&spfResult, &spfDomain, &spfScope, &disposition, &envelopeDomain, &dkimAligned, &spfAligned); err != nil {
-			logging.Error(fmt.Sprintf("[dmarc] error scanning feedback: %v", err))
-			continue
+			return nil, fmt.Errorf("scan DMARC feedback: %w", err)
 		}
 
 		record := ReportRecord{
@@ -562,10 +555,14 @@ func getDMARCFeedbackRecords(db *store.DB, domain string, startTime, endTime tim
 				HeaderFrom:   headerFrom,
 				EnvelopeFrom: envelopeDomain,
 			},
-			AuthResults: AuthResults{
-				DKIM: []DKIMAuthResult{{Domain: dkimDomain, Result: dkimResult, Selector: dkimSelector}},
-				SPF:  []SPFAuthResult{{Domain: spfDomain, Result: spfResult, Scope: spfScope}},
-			},
+		}
+		// A DKIM result describes a signature and must carry its d= and s=
+		// identities. No signature must not become an empty signature in XML.
+		if dkimDomain != "" && dkimSelector != "" && dkimResult != "none" {
+			record.AuthResults.DKIM = []DKIMAuthResult{{Domain: dkimDomain, Result: dkimResult, Selector: dkimSelector}}
+		}
+		if spfDomain != "" {
+			record.AuthResults.SPF = []SPFAuthResult{{Domain: spfDomain, Result: spfResult, Scope: spfScope}}
 		}
 
 		records = append(records, record)
@@ -702,7 +699,7 @@ func sendTLSRPTReportForDomain(cfg *config.Config, db *store.DB, enqueueFunc Enq
 		parsed, _ := url.Parse(destination)
 		var sendErr error
 		if parsed.Scheme == "mailto" {
-			messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, report, parsed.Opaque)
+			messageBody := BuildTLSRPTEmail(cfg.Server.Domain, senderEmail, domain, report, parsed.Opaque)
 			sendErr = enqueueFunc(envelopeSender, parsed.Opaque, messageBody)
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

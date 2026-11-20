@@ -31,7 +31,7 @@ func TestReceivedReportScannerIsOptInAndIdempotent(t *testing.T) {
 		DateRange: TLSDateRange{StartDatetime: start.Format(time.RFC3339), EndDatetime: start.Add(24 * time.Hour).Format(time.RFC3339)},
 		Policies:  []TLSPolicy{{Policy: TLSPolicyDesc{PolicyType: "sts", PolicyDomain: "example.test"}, Summary: TLSPolicySummary{TotalSuccessfulSessionCount: 7, TotalFailureSessionCount: 2}}},
 	}
-	tlsRaw := BuildTLSRPTEmail("google.com", "noreply@google.com", tlsReport, "reports@example.test")
+	tlsRaw := BuildTLSRPTEmail("google.com", "noreply@google.com", "example.test", tlsReport, "reports@example.test")
 	save := func(id, raw string) {
 		t.Helper()
 		if _, err := db.SaveMessage(&store.Message{AccountID: accountID, MessageID: id, Direction: "inbound", RawMessage: []byte(raw), ReceivedAt: time.Now()}); err != nil {
@@ -166,13 +166,13 @@ func TestReceivedReportsOnlyIncludeHostedDomains(t *testing.T) {
 		{Policy: TLSPolicyDesc{PolicyType: "sts", PolicyDomain: "HOSTED.TEST."}, Summary: TLSPolicySummary{TotalSuccessfulSessionCount: 2, TotalFailureSessionCount: 1}},
 		{Policy: TLSPolicyDesc{PolicyType: "sts", PolicyDomain: "second.test"}, Summary: TLSPolicySummary{TotalSuccessfulSessionCount: 4, TotalFailureSessionCount: 3}},
 	}
-	raw := BuildTLSRPTEmail("sender.test", "sender@sender.test", &base, "reports@hosted.test")
+	raw := BuildTLSRPTEmail("sender.test", "sender@sender.test", "hosted.test", &base, "reports@hosted.test")
 	if _, err := db.SaveMessage(&store.Message{AccountID: accountID, MessageID: "mixed", Direction: "inbound", RawMessage: []byte(raw), ReceivedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	base.ReportID = "external-only"
 	base.Policies = base.Policies[:1]
-	raw = BuildTLSRPTEmail("sender.test", "sender@sender.test", &base, "reports@hosted.test")
+	raw = BuildTLSRPTEmail("sender.test", "sender@sender.test", "hosted.test", &base, "reports@hosted.test")
 	if _, err := db.SaveMessage(&store.Message{AccountID: accountID, MessageID: "external-only", Direction: "inbound", RawMessage: []byte(raw), ReceivedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}

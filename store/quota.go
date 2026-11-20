@@ -26,6 +26,7 @@ func reserveMailboxBytes(tx *sql.Tx, accountID, bytes int64) error {
 	result, err := tx.Exec(`UPDATE accounts
 		SET mailbox_used_bytes = mailbox_used_bytes + ?
 		WHERE id = ? AND is_active = 1
+		  AND EXISTS (SELECT 1 FROM domains WHERE domains.id = accounts.domain_id AND domains.is_active = 1)
 		  AND (quota_bytes = 0 OR mailbox_used_bytes + ? <= quota_bytes)`, bytes, accountID, bytes)
 	if err != nil {
 		return fmt.Errorf("reserving mailbox quota: %w", err)
@@ -36,7 +37,7 @@ func reserveMailboxBytes(tx *sql.Tx, accountID, bytes int64) error {
 	}
 	if affected != 1 {
 		var exists int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM accounts WHERE id = ? AND is_active = 1`, accountID).Scan(&exists); err != nil {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM accounts a JOIN domains d ON d.id = a.domain_id WHERE a.id = ? AND a.is_active = 1 AND d.is_active = 1`, accountID).Scan(&exists); err != nil {
 			return err
 		}
 		if exists == 0 {

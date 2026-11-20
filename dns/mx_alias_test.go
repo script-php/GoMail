@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -8,6 +9,43 @@ import (
 
 	mdns "github.com/miekg/dns"
 )
+
+func TestSecureMXAddressNameRejectsContradictoryAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		qtype   uint16
+		answers []string
+	}{
+		{"CNAME with A", mdns.TypeA, []string{"mx.example.test. 60 IN CNAME alias.example.test.", "mx.example.test. 60 IN A 192.0.2.1"}},
+		{"CNAME with AAAA", mdns.TypeAAAA, []string{"mx.example.test. 60 IN CNAME alias.example.test.", "mx.example.test. 60 IN AAAA 2001:db8::1"}},
+		{"multiple CNAME targets", mdns.TypeA, []string{"mx.example.test. 60 IN CNAME one.example.test.", "mx.example.test. 60 IN CNAME two.example.test."}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &mdns.Server{PacketConn: packet, Handler: mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
+				response := new(mdns.Msg)
+				response.SetReply(req)
+				response.AuthenticatedData = true
+				if req.Question[0].Qtype == tc.qtype {
+					for _, text := range tc.answers {
+						rr, _ := mdns.NewRR(text)
+						response.Answer = append(response.Answer, rr)
+					}
+				}
+				_ = w.WriteMsg(response)
+			})}
+			go func() { _ = server.ActivateAndServe() }()
+			defer server.Shutdown()
+			_, secure, err := querySecureMXAddressName("mx.example.test", packet.LocalAddr().String())
+			if err == nil || secure || errors.Is(err, ErrNoMailRoute) {
+				t.Fatalf("contradictory address alias accepted or treated as absence: secure=%v err=%v", secure, err)
+			}
+		})
+	}
+}
 
 func TestLookupTLSAForMXAddressAliasCandidates(t *testing.T) {
 	InitCache(60)

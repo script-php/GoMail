@@ -2,6 +2,7 @@ package reporting
 
 import (
 	"encoding/base64"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,53 @@ import (
 	"gomail/config"
 	"gomail/store"
 )
+
+func TestDMARC9990AggregateReportShape(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	data, err := GenerateDMARCAggregateReport("example.test", "reports@receiver.test", "receiver.test",
+		PolicyPublished{Domain: "example.test", P: "none", NP: "reject", Testing: "y", DiscoveryMethod: "treewalk"},
+		[]ReportRecord{{Row: Row{SourceIP: "192.0.2.1", Count: 1, PolicyEval: PolicyEvaluated{Disposition: "none", DKIM: "fail", SPF: "fail"}}, Identifiers: Identifiers{HeaderFrom: "example.test"}}}, start, start.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		XMLName xml.Name
+		Policy  struct {
+			NP      string `xml:"np"`
+			Testing string `xml:"testing"`
+		} `xml:"policy_published"`
+	}
+	if err := xml.Unmarshal([]byte(data), &root); err != nil {
+		t.Fatal(err)
+	}
+	if root.XMLName.Space != dmarcReportNamespace || root.Policy.NP != "reject" || root.Policy.Testing != "y" || strings.Contains(data, "<pct>") {
+		t.Fatalf("not an RFC 9990 report: %s", data)
+	}
+}
+
+func TestDMARC9990MissingPDefaultsToNoneForReporting(t *testing.T) {
+	previous := lookupReportingTXT
+	lookupReportingTXT = func(string) ([]string, error) {
+		return []string{"v=DMARC1; rua=mailto:reports@example.test; t=y; np=reject; pct=0"}, nil
+	}
+	t.Cleanup(func() { lookupReportingTXT = previous })
+	policy, err := lookupDMARCForReporting("example.test")
+	if err != nil || policy.P != "none" || policy.NP != "reject" || policy.Testing != "y" {
+		t.Fatalf("policy=%+v err=%v", policy, err)
+	}
+}
+
+func TestDMARCReportingUsesExactVersionRecognition(t *testing.T) {
+	previous := lookupReportingTXT
+	lookupReportingTXT = func(string) ([]string, error) {
+		return []string{"v=DMARC12; p=none", "v = DMARC1; p=reject; rua=mailto:reports@example.test"}, nil
+	}
+	t.Cleanup(func() { lookupReportingTXT = previous })
+	policy, err := lookupDMARCForReporting("example.test")
+	if err != nil || policy.P != "reject" || len(policy.ReportMailto) != 1 {
+		t.Fatalf("policy=%+v err=%v", policy, err)
+	}
+}
 
 func TestDMARCFeedbackProducesAuthenticationResults(t *testing.T) {
 	db, err := store.Open(t.TempDir()+"/mail.db", t.TempDir()+"/attachments")
@@ -36,7 +84,7 @@ func TestDMARCFeedbackProducesAuthenticationResults(t *testing.T) {
 		t.Fatalf("authentication identities lost: %+v", record.AuthResults)
 	}
 	xmlReport, err := GenerateDMARCAggregateReport("header.example", "postmaster@receiver.example", "receiver.example",
-		PolicyPublished{Domain: "header.example", P: "reject", Pct: 100}, records, time.Now().Add(-time.Hour), time.Now())
+		PolicyPublished{Domain: "header.example", P: "reject"}, records, time.Now().Add(-time.Hour), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +92,38 @@ func TestDMARCFeedbackProducesAuthenticationResults(t *testing.T) {
 		if !strings.Contains(xmlReport, want) {
 			t.Errorf("report missing %q:\n%s", want, xmlReport)
 		}
+	}
+}
+
+func TestDMARCFeedbackOmitsAbsentAuthenticationIdentities(t *testing.T) {
+	db, err := store.Open(t.TempDir()+"/mail.db", t.TempDir()+"/attachments")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveDMARCFeedbackDetailed("header.example", "192.0.2.2", "",
+		"none", "", "", "none", "", "mfrom", "none"); err != nil {
+		t.Fatal(err)
+	}
+	records, err := getDMARCFeedbackRecords(db, "header.example", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+	if len(records[0].AuthResults.DKIM) != 0 || len(records[0].AuthResults.SPF) != 0 {
+		t.Fatalf("absent identities reported: %+v", records[0].AuthResults)
+	}
+	xmlReport, err := GenerateDMARCAggregateReport("header.example", "postmaster@receiver.example", "receiver.example",
+		PolicyPublished{Domain: "header.example", P: "none"}, records, time.Now().Add(-time.Hour), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"<envelope_from>", "<auth_results><dkim>", "<auth_results><spf>"} {
+		if strings.Contains(xmlReport, absent) {
+			t.Errorf("report invented %q:\n%s", absent, xmlReport)
+		}
+	}
+	if !strings.Contains(xmlReport, "<auth_results></auth_results>") {
+		t.Errorf("report omitted required auth_results container:\n%s", xmlReport)
 	}
 }
 
@@ -75,7 +155,7 @@ func TestDMARCReportMailUsesCurrentSubjectAndFilename(t *testing.T) {
 	start := time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)
 	end := start.Add(24 * time.Hour)
 	xmlReport, err := GenerateDMARCAggregateReport("example.com", "postmaster@receiver.example", "mail.receiver.example",
-		PolicyPublished{Domain: "example.com", P: "reject", Pct: 100}, nil, start, end)
+		PolicyPublished{Domain: "example.com", P: "reject"}, nil, start, end)
 	if err != nil {
 		t.Fatal(err)
 	}

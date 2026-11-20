@@ -30,7 +30,10 @@ generated through the admin domain UI after the initial account is bootstrapped.
 
 Create `config.json` from [config.md](config.md). At minimum set:
 
-- `server.hostname` to the public mail hostname.
+- `server.hostname` to a public, fully qualified mail hostname (for example,
+  `mail.example.com`). GoMail validates its SMTP wire syntax at startup;
+  `localhost` is accepted only as a local-development exception. DNS and PTR
+  correctness still require deployment checks.
 - `tls.mode` and ACME or manual certificate settings.
 - persistent database/attachment paths.
 - long random web secrets.
@@ -169,14 +172,43 @@ that can create and drop those databases; the configured production database is
 not used as either target. Normal application accounts usually lack those
 privileges. This does not replace a separately observed operator restore drill.
 
+If the test account has rights only to an existing, empty `gomailtest` database,
+use the fixed-database mode instead:
+
+```sh
+GOMAIL_TEST_MYSQL_CONFIG=/absolute/path/to/config.local.json \
+GOMAIL_TEST_MYSQL_FIXED_DB=gomailtest \
+GOMAIL_TEST_MYSQL_USER=gomailtest \
+GOMAIL_TEST_MYSQL_PASSWORD='your-test-password' \
+  go test ./backup -run TestMySQLBackupRestoreIsolatedRoundTrip -count=1
+```
+
+The test refuses a nonempty database or the database named in the supplied
+config, restores into that same dedicated test database, then removes its test
+tables. It also checks that a change made after backup disappears on restore.
+The MySQL storage integration test accepts the same dedicated database through
+`GOMAIL_TEST_MYSQL_ADDR`, `GOMAIL_TEST_MYSQL_DATABASE`, and the user/password
+variables; it leaves the schema in place, so reset the test database before
+rerunning the backup/restore test.
+
 GoMail provides a versioned `tar.gz` backup containing a consistent SQLite
 snapshot or MySQL dump, attachments, configuration, ACME state and manual TLS
 key/certificate files. Its manifest records GoMail/format versions, database
 row counts, sizes and SHA-256 hashes.
+Creation checks that attachment references in the captured SQLite snapshot
+or current MySQL database point to regular files of the recorded size before
+publishing the archive. This catches already-broken source data early.
+Verification rejects missing, negative, or unknown table counts before a
+restore begins. A completed archive is synced to disk along with its directory
+entry before backup success is reported. Restore rechecks each extracted file's
+size and SHA-256 hash against the verified manifest, so a changed archive is
+rejected before the database or live files are touched.
 
 The running server and backup/restore commands use the same exclusive instance
 lock. Stop GoMail before creating or restoring an archive; the command refuses
-to proceed if another new-version GoMail process owns the instance.
+to proceed if another GoMail process owns the instance. For MySQL the lock now
+lives beside, not inside, the attachment directory so a restore cannot replace
+the locked inode. It also honors the previous in-tree lock during upgrades.
 
 ```bash
 sudo systemctl stop gomail
@@ -187,7 +219,11 @@ sudo systemctl start gomail
 
 For MySQL, `mysqldump` must be installed. GoMail invokes it with
 `--single-transaction`; the configured password is supplied through the child
-process environment rather than command arguments.
+process environment rather than command arguments. When `store.mysql.tls` is
+`true`, both `mysqldump` and `mysql` are invoked with
+`--ssl-mode=VERIFY_IDENTITY`, matching the application's verified-TLS policy.
+Install client utilities that support that option; an unsupported client
+fails the operation rather than silently using opportunistic TLS.
 
 Restore is deliberately destructive and requires both a stopped instance and
 explicit confirmation:
@@ -202,10 +238,13 @@ sudo systemctl start gomail
 Restore verifies every archive hash, requires the configuration and matching
 database snapshot, and rejects duplicate archive paths before replacing
 configured state. SQLite restores stage all filesystem replacements before
-removing the old WAL/SHM sidecars. Restore refuses filesystem-root,
+removing the old WAL/SHM sidecars. SQLite and both in-place and staged MySQL restores now
+check all manifest table counts and every attachment reference against the staged
+attachment tree before activating it. An archive with no attachments restores
+an empty attachment directory. Restore refuses filesystem-root,
 current-directory, or overlapping destinations (for example, a configuration
 file inside the attachment directory). MySQL restore requires the `mysql`
-command. Before importing into MySQL, GoMail creates and verifies a
+command. Before either SQLite or MySQL restore mutates live state, GoMail creates and verifies a
 `gomail-pre-restore-*.tar.gz` safety archive next to the configuration file; if
 that fails, restore does not begin. Keep that archive until the restored server
 has been checked. For MySQL, attachment and ACME trees are also fully staged
@@ -214,8 +253,47 @@ configuration and any manual TLS certificate/key are likewise staged as sibling
 files before import; staging failure leaves the live database untouched. MySQL
 dump imports and the later filesystem swaps are not atomic together: if restore
 fails partway through, stop the server and recover
-from the safety archive before accepting mail. The restored configuration is
-the configuration preserved inside the requested archive.
+from the safety archive before accepting mail. Both SQLite and MySQL restores write a
+`config.local.json.restore-incomplete` marker beside the chosen config before
+their first state change. Normal startup refuses to serve while it exists. The
+marker contains the requested archive path and the safety-archive
+path; remove it only after checking that the
+database, attachments, TLS material and config form one consistent generation.
+An interrupted restore cannot be retried until that reconciliation is done.
+For MySQL, the restored
+configuration preserves the selected destination database connection,
+attachment path, TLS file/directory paths, and DKIM key directory instead of
+reinstalling source-host locations from the archive. A TLS-mode mismatch is
+rejected before database import; review all other restored settings before
+restarting the service.
+The staged-database and crash-recovery design is described in
+`docs/mysql_staged_restore.md`. An opt-in staged import is available, but
+automatic crash recovery is not implemented yet. To use it, pre-provision a
+distinct *empty* MySQL database and grant the configured GoMail database user
+access to it. Stop GoMail, then use:
+
+```bash
+./gomail -config ./config.local.json \
+  -restore-backup /secure/gomail-2026-10-14.tar.gz \
+  -restore-stage-db gomail_restore_stage -force-restore
+```
+
+The restore checks the staging database is empty, imports and verifies manifest
+table counts and every attachment file reference there, then switches the
+restored config to that database. Attachment references must be relative
+filenames resolving to regular files in the restored tree with matching sizes;
+legacy absolute paths are rejected before activation. It
+retains the previous database, attachment and ACME directory generations, and
+safety archive. The previous directory paths are recorded in the restore marker
+and printed on success; keep them until the restored instance has been checked.
+The marker also records the last completed phase, but a crash can happen
+between a file switch and its phase update. It is not proof by itself of which
+generation is active.
+The staged database must not
+be used by another service or process. If the restore fails after the file
+switch begins, the incomplete marker blocks startup; an operator must still
+reconcile the files and database before clearing it. Do not drop either
+database until the restored server and attachment references are verified.
 
 Attachment and certificate directory restores are copied into a sibling staging
 directory and swapped only after the full tree succeeds. A staging failure
@@ -229,10 +307,13 @@ separately. The backup command refuses to overwrite an existing archive.
 Administrators can also open **Admin → Backups** to create an online verified
 backup or configure an interval and retention count. Online archives use a
 database snapshot/dump and immutable attachment files, then verify every hash;
-a concurrent file change fails the backup instead of publishing an inconsistent
-archive. The page writes archives only to the configured server directory and
+changes to a file during capture fail the backup. MySQL's live dump and
+attachment-tree capture are not one atomic snapshot: concurrent same-count
+database changes or attachment races still need a quiet period and an isolated
+restore drill. The page writes archives only to the configured server directory and
 never offers secret-bearing archives as browser downloads. Automatic retention
-deletes only files matching GoMail's `gomail-*.tar.gz` naming pattern.
+deletes only scheduler-generated timestamped archives (`gomail-YYYYMMDDTHHMMSS[.nanoseconds]Z.tar.gz`),
+not `gomail-pre-restore-*` safety archives or other manually named files.
 
 The admin scheduler is convenient, but the stopped-service CLI procedure above
 remains the strongest recovery-point boundary. Use the CLI for upgrades and

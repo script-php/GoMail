@@ -37,7 +37,7 @@ type RecipientStatus struct {
 
 // ParseDSN parses a DSN message and extracts delivery failure information.
 // Accepts either just the text body or the full raw message (for multipart DSNs).
-// For multipart DSNs, it extracts the message/delivery-status part automatically.
+// For multipart DSNs, it extracts the delivery-status part automatically.
 // Returns the DSN structure with recipient status details.
 func ParseDSN(body string) (*DSNReport, error) {
 	report := &DSNReport{
@@ -225,7 +225,8 @@ func IsDSNMessage(subject string, headers map[string][]string, body string) bool
 	return false
 }
 
-// extractDeliveryStatusPart extracts the message/delivery-status MIME part from a multipart DSN.
+// extractDeliveryStatusPart extracts the traditional or internationalized
+// delivery-status MIME part from a multipart DSN.
 // Multipart DSNs have format:
 //
 //	--boundary
@@ -255,7 +256,7 @@ func findDeliveryStatusPart(contentType string, body io.Reader, depth int) ([]by
 	if err != nil {
 		return nil, err
 	}
-	if strings.EqualFold(mediaType, "message/delivery-status") {
+	if strings.EqualFold(mediaType, "message/delivery-status") || strings.EqualFold(mediaType, "message/global-delivery-status") {
 		return io.ReadAll(io.LimitReader(body, 4<<20))
 	}
 	if !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") || params["boundary"] == "" {

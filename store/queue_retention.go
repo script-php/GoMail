@@ -77,8 +77,9 @@ func (db *DB) PruneCompletedQueueEntries(days int, now time.Time, limit int) (in
 	}
 	cutoff := databaseTime(now.Add(-time.Duration(days) * 24 * time.Hour))
 	rows, err := db.Query(`SELECT id FROM outbound_queue WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?
-		AND NOT ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
-		  OR (status = 'failed' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%FAILURE%'))
+		AND NOT (mail_from <> '' AND ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
+		  OR (status IN ('failed', 'cancelled') AND dsn_sent = 0 AND (dsn_notify = '' OR UPPER(dsn_notify) LIKE '%FAILURE%')
+		      AND (status = 'failed' OR last_error = '`+adminCancellationReason+`'))))
 		ORDER BY updated_at, id LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return 0, err
@@ -105,8 +106,9 @@ func (db *DB) PruneCompletedQueueEntries(days int, now time.Time, limit int) (in
 		}
 		var address, recipient, sender, status string
 		err = tx.QueryRow(`SELECT verp_bounce_address, rcpt_to, mail_from, status FROM outbound_queue WHERE id = ? AND status IN ('sent', 'failed', 'cancelled') AND updated_at < ?
-			AND NOT ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
-			  OR (status = 'failed' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%FAILURE%'))`, id, cutoff).Scan(&address, &recipient, &sender, &status)
+			AND NOT (mail_from <> '' AND ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
+			  OR (status IN ('failed', 'cancelled') AND dsn_sent = 0 AND (dsn_notify = '' OR UPPER(dsn_notify) LIKE '%FAILURE%')
+			      AND (status = 'failed' OR last_error = '`+adminCancellationReason+`'))))`, id, cutoff).Scan(&address, &recipient, &sender, &status)
 		if err == sql.ErrNoRows {
 			_ = tx.Rollback()
 			continue
@@ -126,8 +128,9 @@ func (db *DB) PruneCompletedQueueEntries(days int, now time.Time, limit int) (in
 			}
 		}
 		result, err := tx.Exec(`DELETE FROM outbound_queue WHERE id = ? AND status IN ('sent', 'failed', 'cancelled') AND updated_at < ?
-			AND NOT ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
-			  OR (status = 'failed' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%FAILURE%'))`, id, cutoff)
+			AND NOT (mail_from <> '' AND ((status = 'sent' AND dsn_sent = 0 AND UPPER(dsn_notify) LIKE '%SUCCESS%')
+			  OR (status IN ('failed', 'cancelled') AND dsn_sent = 0 AND (dsn_notify = '' OR UPPER(dsn_notify) LIKE '%FAILURE%')
+			      AND (status = 'failed' OR last_error = '`+adminCancellationReason+`'))))`, id, cutoff)
 		if err != nil {
 			_ = tx.Rollback()
 			return count, err

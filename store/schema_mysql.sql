@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     id                  BIGINT PRIMARY KEY AUTO_INCREMENT,
     message_id          BIGINT,
     origin_account_id   BIGINT NOT NULL DEFAULT -1,
+    local_recipient     BIGINT NOT NULL DEFAULT 0,
+    tls_report          BIGINT NOT NULL DEFAULT 0,
     mail_from           VARCHAR(320)    NOT NULL,
     rcpt_to             LONGTEXT    NOT NULL,
     raw_message         LONGBLOB    NOT NULL,

@@ -39,6 +39,7 @@ type InboundServer struct {
 }
 
 var errInvalidAuthor = errors.New("invalid RFC 5322 From field")
+var errInvalidMessage = errors.New("invalid RFC 5322 message")
 
 // authorDomain extracts the one unambiguous domain DMARC is allowed to use.
 func authorDomain(headers mail.Header) (string, error) {
@@ -158,7 +159,7 @@ func (s *InboundServer) acceptLoop() {
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 		if !s.rateLimiter.AllowConnection(ip) {
 			logging.Warn(fmt.Sprintf("[smtp] rate limit: rejecting connection from %s", ip))
-			conn.Close()
+			rejectInboundConnection(conn, s.cfg.Server.Hostname)
 			continue
 		}
 
@@ -183,9 +184,17 @@ func (s *InboundServer) acceptLoop() {
 		default:
 			// No slots available, reject connection
 			logging.Warn(fmt.Sprintf("[smtp] max connections reached: rejecting connection from %s", ip))
-			conn.Close()
+			rejectInboundConnection(conn, s.cfg.Server.Hostname)
 		}
 	}
+}
+
+// Give clients an explicit temporary failure at connection opening. Keep the
+// write bounded so a peer that never reads cannot stall the accept loop.
+func rejectInboundConnection(conn net.Conn, hostname string) {
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	_, _ = fmt.Fprintf(conn, "421 %s Service temporarily unavailable, try again later\r\n", hostname)
 }
 
 func (s *InboundServer) handleConnection(conn net.Conn) {
@@ -193,7 +202,7 @@ func (s *InboundServer) handleConnection(conn net.Conn) {
 	domains, err := s.db.ListAllDomainNames()
 	if err != nil {
 		logging.Error(fmt.Sprintf("[smtp] error loading domains: %v", err))
-		conn.Close()
+		rejectInboundConnection(conn, s.cfg.Server.Hostname)
 		return
 	}
 
@@ -306,18 +315,20 @@ func (s *InboundServer) runSession(sess *Session) {
 			// Rate limit messages on first chunk (StateRcpt)
 			if sess.state == StateRcpt && !s.rateLimiter.AllowMessage(sess.clientIP) {
 				metrics.IncSMTP("deferred")
-				sess.sendEnhanced(451, "4.5.3", "Too many messages, try again later")
+				sess.rejectBDATChunkForRateLimit(arg)
 				continue
 			}
 
+			previousState := sess.state
 			sess.handleBDAT(arg)
 
-			// If LAST chunk was received (state transitions back to StateReady with data), process message
-			if sess.state == StateReady && sess.data.Len() == 0 {
+			// Only a completed LAST chunk transitions an active transaction to
+			// Ready. A rejected BDAT in Ready must not get a second reply.
+			if previousState != StateReady && sess.state == StateReady && sess.data.Len() == 0 {
 				metrics.IncSMTP("rejected")
 				sess.sendEnhanced(554, "5.6.0", "Empty message is not accepted")
 				sess.reset()
-			} else if sess.state == StateReady && sess.data.Len() > 0 {
+			} else if previousState != StateReady && sess.state == StateReady && sess.data.Len() > 0 {
 				if err := sess.validateMessageEncoding(); err != nil {
 					metrics.IncSMTP("rejected")
 					sess.sendEnhanced(550, "5.7.1", err.Error())
@@ -351,16 +362,25 @@ func (s *InboundServer) sendProcessingError(sess *Session, err error) {
 		sess.sendEnhanced(554, "5.6.0", "Invalid or ambiguous From field")
 		return
 	}
+	if errors.Is(err, errInvalidMessage) {
+		sess.sendEnhanced(554, "5.6.0", "Invalid message format")
+		return
+	}
 	sess.sendEnhanced(451, "4.3.0", "Message processing failed, try again later")
 }
 
 // processMessage runs authentication checks, parses, and stores an inbound message.
 func (s *InboundServer) processMessage(sess *Session) error {
 	rawMessage := sess.GetData()
+	// Verify signatures against the message exactly as received. A sender may
+	// have signed an Authentication-Results field; stripping that untrusted
+	// field before verification would invalidate an otherwise valid signature.
+	dkimResult, dkimDetail, dkimDomain, dkimSelector, verifiedDKIMDomains := auth.VerifyDKIMDetailedWithIdentities(rawMessage)
+	arcValidation := auth.ValidateARCChain(rawMessage)
 	var err error
 	rawMessage, err = RemoveExternalAuthenticationResults(rawMessage)
 	if err != nil {
-		return fmt.Errorf("removing untrusted authentication results: %w", err)
+		return fmt.Errorf("%w: removing untrusted authentication results: %v", errInvalidMessage, err)
 	}
 	mailFrom := sess.GetMailFrom()
 	rcptTo := sess.GetRcptTo()
@@ -387,22 +407,21 @@ func (s *InboundServer) processMessage(sess *Session) error {
 
 	// SPF
 	spfResult, spfDetail := auth.CheckSPFWithHELO(clientIP, mailFrom, sess.ehlo)
-	authBuilder.AddSPF(spfResult, spfDetail, mailFrom)
+	authBuilder.AddSPF(spfResult, spfDetail, mailFrom, sess.ehlo)
 	logging.Info(fmt.Sprintf("[smtp] SPF: %s (%s)", spfResult, spfDetail))
 
 	// DKIM
-	dkimResult, dkimDetail, dkimDomain, dkimSelector, verifiedDKIMDomains := auth.VerifyDKIMDetailedWithIdentities(rawMessage)
 	authBuilder.AddDKIM(dkimResult, dkimDetail, dkimDomain, dkimSelector)
 	logging.Info(fmt.Sprintf("[smtp] DKIM: %s (%s)", dkimResult, dkimDetail))
 
 	// DMARC
 	parsed, err := parser.Parse(rawMessage)
 	if err != nil {
-		return fmt.Errorf("parsing message: %w", err)
+		return fmt.Errorf("%w: parsing message: %v", errInvalidMessage, err)
 	}
 
-	logging.Info(fmt.Sprintf("[smtp] Parsed message: subject=%q, textLen=%d, htmlLen=%d, attachments=%d",
-		parsed.Subject, len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments)))
+	logging.Info(fmt.Sprintf("[smtp] parsed message: text_bytes=%d html_bytes=%d attachments=%d",
+		len(parsed.TextBody), len(parsed.HTMLBody), len(parsed.Attachments)))
 
 	fromDomain, err := authorDomain(parsed.Headers)
 	if err != nil {
@@ -425,7 +444,6 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	rawMessage = append([]byte(authResultsHeader), rawMessage...)
 
 	// --- Validate ARC Chain (if present) ---
-	arcValidation := auth.ValidateARCChain(rawMessage)
 	switch arcValidation.Status {
 	case "pass":
 		logging.Info(fmt.Sprintf("[smtp] ARC - PASS: valid chain through instance=%d",
@@ -459,7 +477,7 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	}
 	parsed, err = parser.Parse(rawMessage)
 	if err != nil {
-		return fmt.Errorf("parsing final message: %w", err)
+		return fmt.Errorf("%w: parsing final message: %v", errInvalidMessage, err)
 	}
 
 	// --- Check for MDN request ---
@@ -470,7 +488,6 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	}
 
 	// --- Store the message for each recipient's account ---
-	rcptJSON, _ := json.Marshal(rcptTo)
 
 	messageID := parsed.MessageID
 	if messageID == "" {
@@ -610,13 +627,19 @@ func (s *InboundServer) processMessage(sess *Session) error {
 				spfResult, dkimResult, dmarcResult.Result, inboxFolder.ID))
 		}
 
+		recipientJSON, err := json.Marshal([]string{rcpt})
+		if err != nil {
+			return fmt.Errorf("encoding mailbox recipient: %w", err)
+		}
 		msg := &store.Message{
-			AccountID:      accountID,
-			FolderID:       folderID,
-			MessageID:      messageID,
-			Direction:      "inbound",
-			MailFrom:       mailFrom,
-			RcptTo:         string(rcptJSON),
+			AccountID: accountID,
+			FolderID:  folderID,
+			MessageID: messageID,
+			Direction: "inbound",
+			MailFrom:  mailFrom,
+			// A mailbox copy must not disclose other envelope recipients,
+			// including addresses omitted from the message's To/Cc fields.
+			RcptTo:         string(recipientJSON),
 			FromAddr:       parsed.From,
 			ToAddr:         parsed.To,
 			CcAddr:         parsed.Cc,
@@ -635,13 +658,6 @@ func (s *InboundServer) processMessage(sess *Session) error {
 			MDNRequested:   mdnRequested,
 			MDNAddress:     mdnAddress,
 			ReceivedAt:     time.Now(),
-		}
-
-		// Log what folder_id will be saved
-		if folderID != nil {
-			logging.Info(fmt.Sprintf("[smtp] saving message subject=%q with folder_id=%d (rcpt=%s)", parsed.Subject, *folderID, rcpt))
-		} else {
-			logging.Info(fmt.Sprintf("[smtp] saving message subject=%q with folder_id=NULL (rcpt=%s)", parsed.Subject, rcpt))
 		}
 
 		pending = append(pending, pendingDelivery{message: msg, recipient: rcpt,
@@ -675,16 +691,13 @@ func (s *InboundServer) processMessage(sess *Session) error {
 	if shouldQuarantineDMARC(dmarcResult.Result, dmarcResult.Policy) {
 		disposition = "quarantine"
 	}
-	if err := s.db.SaveDMARCFeedbackEvaluated(fromDomain, dmarcResult.PolicyDomain, clientIP, spfDomain, dkimResult, dkimDomain, dkimSelector, string(spfResult), spfDomain, "mfrom", disposition, dmarcResult.DKIMAligned, dmarcResult.SPFAligned); err != nil {
+	if err := s.db.SaveDMARCFeedbackEvaluated(fromDomain, dmarcResult.PolicyDomain, clientIP, reportEnvelopeFromDomain(mailFrom), dkimResult, dkimDomain, dkimSelector, string(spfResult), spfDomain, "mfrom", disposition, dmarcResult.DKIMAligned, dmarcResult.SPFAligned); err != nil {
 		logging.Warn(fmt.Sprintf("[smtp] warning: failed to save DMARC feedback: %v", err))
 	}
 	for index, delivery := range pending {
 		msgID := messageIDs[index]
-		if delivery.message.FolderID != nil {
-			_ = s.db.UpdateFolderCounts(*delivery.message.FolderID)
-		}
-		logging.Info(fmt.Sprintf("[smtp] message stored id=%d account=%d msgid=%s from=%s to=%s subject=%s",
-			msgID, delivery.message.AccountID, messageID, mailFrom, delivery.recipient, parsed.Subject))
+		logging.Info(fmt.Sprintf("[smtp] message stored id=%d account=%d from=%s to=%s",
+			msgID, delivery.message.AccountID, mailFrom, delivery.recipient))
 	}
 
 	return nil
@@ -748,9 +761,9 @@ func extractDomain(addr string) string {
 			addr = addr[:end]
 		}
 	}
-	parts := strings.SplitN(addr, "@", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	at := strings.LastIndexByte(addr, '@')
+	if at >= 0 && at < len(addr)-1 {
+		return addr[at+1:]
 	}
 	return addr
 }
@@ -759,6 +772,15 @@ func spfIdentityDomain(mailFrom, helo string) string {
 	if mailFrom == "" {
 		// SPF checked postmaster@HELO for a null reverse-path.
 		return strings.TrimSuffix(helo, ".")
+	}
+	return extractDomain(mailFrom)
+}
+
+// The report's envelope_from identifies the actual RFC5321 reverse-path, not
+// the HELO-derived SPF identity used when that reverse-path is null.
+func reportEnvelopeFromDomain(mailFrom string) string {
+	if mailFrom == "" {
+		return ""
 	}
 	return extractDomain(mailFrom)
 }

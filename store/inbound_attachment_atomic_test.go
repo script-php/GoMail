@@ -1,11 +1,94 @@
 package store
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestInboundAttachmentWriteIgnoresOrphanFromInterruptedCommit(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&Domain{Domain: "example.test", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&Account{DomainID: domainID, Email: "alice@example.test", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("payload")
+	digest := sha256.Sum256(data)
+	orphanName := fmt.Sprintf("1_inbound_0_%x.txt", digest[:8])
+	if err := os.WriteFile(filepath.Join(db.AttachmentsPath(), orphanName), []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	message := &Message{AccountID: accountID, MessageID: "orphan-retry", Direction: "inbound", RawMessage: []byte("From: sender@remote.test\r\n\r\nbody\r\n"), HasAttachments: true, ReceivedAt: time.Now()}
+	ids, err := db.SaveMessagesWithQueueAndAttachments([]*Message{message}, nil, [][]IMAPAppendAttachment{{{Filename: "document.txt", ContentType: "text/plain", Data: data}}})
+	if err != nil {
+		t.Fatalf("orphan blocked delivery: %v", err)
+	}
+	attachments, err := db.GetAttachments(ids[0])
+	if err != nil || len(attachments) != 1 || attachments[0].StoragePath == orphanName {
+		t.Fatalf("delivery reused orphan: %+v, %v", attachments, err)
+	}
+	stored, err := os.ReadFile(filepath.Join(db.AttachmentsPath(), attachments[0].StoragePath))
+	if err != nil || string(stored) != string(data) {
+		t.Fatalf("delivered attachment: %q, %v", stored, err)
+	}
+}
+
+func TestInboundDeliveryCommitsFolderCountsOrRollsBack(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&Domain{Domain: "example.test", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&Account{DomainID: domainID, Email: "alice@example.test", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := db.GetFolderByType(accountID, "inbox")
+	if err != nil || inbox == nil {
+		t.Fatalf("inbox: %+v, %v", inbox, err)
+	}
+	newMessage := func(id string) *Message {
+		return &Message{AccountID: accountID, FolderID: &inbox.ID, MessageID: id, Direction: "inbound", RawMessage: []byte("From: sender@remote.test\r\n\r\nbody\r\n"), ReceivedAt: time.Now()}
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_folder_count BEFORE UPDATE OF total_count ON folders
+		WHEN NEW.total_count > 0 BEGIN SELECT RAISE(FAIL, 'folder count unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveInboundDelivery([]*Message{newMessage("first")}, nil, nil, nil); err == nil {
+		t.Fatal("delivery committed without folder count")
+	}
+	var messages int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_id=?`, accountID).Scan(&messages); err != nil || messages != 0 {
+		t.Fatalf("failed delivery left message: %d, %v", messages, err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_folder_count`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveInboundDelivery([]*Message{newMessage("second")}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := db.GetFolderByType(accountID, "inbox")
+	if err != nil || updated.TotalCount != 1 || updated.UnreadCount != 1 {
+		t.Fatalf("committed folder counts: %+v, %v", updated, err)
+	}
+}
 
 func TestInboundAttachmentsCommitOrRollbackWithMessage(t *testing.T) {
 	root := t.TempDir()

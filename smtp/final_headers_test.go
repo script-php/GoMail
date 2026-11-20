@@ -68,6 +68,12 @@ func TestFinalDeliveryReturnPathNullReversePath(t *testing.T) {
 	}
 }
 
+func TestFinalDeliveryReturnPathRejectsUnterminatedHeaders(t *testing.T) {
+	if _, err := FinalDeliveryReturnPath([]byte("From: sender@example.test"), "sender@example.test"); err == nil {
+		t.Fatal("accepted unterminated header-only message")
+	}
+}
+
 func TestInboundStoredHeadersDoNotLeakEnvelopeRecipients(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
@@ -79,18 +85,21 @@ func TestInboundStoredHeadersDoNotLeakEnvelopeRecipients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	accountEmails := make(map[int64]string)
 	for _, email := range []string{"alice@example.test", "hidden@example.test"} {
-		if _, err := db.CreateAccount(&store.Account{DomainID: domainID, Email: email, PasswordHash: "unused", IsActive: true}); err != nil {
+		accountID, err := db.CreateAccount(&store.Account{DomainID: domainID, Email: email, PasswordHash: "unused", IsActive: true})
+		if err != nil {
 			t.Fatal(err)
 		}
+		accountEmails[accountID] = email
 	}
 	sess := &Session{mailFrom: "bounce@remote.test", rcptTo: []string{"alice@example.test", "hidden@example.test"}, clientIP: "127.0.0.1", ehlo: "remote.test"}
-	sess.data.WriteString("From: sender@remote.test\r\nTo: alice@example.test\r\nReturn-Path: <forged@remote.test>\r\nSubject: privacy\r\n\r\nhello\r\n")
+	sess.data.WriteString("From: sender@remote.test\r\nTo: alice@example.test\r\nReturn-Path: <forged@remote.test>\r\nAuthentication-Results: forged.example; dkim=pass\r\nSubject: privacy\r\n\r\nhello\r\n")
 	inbound := &InboundServer{cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.test", Domain: "example.test"}}, db: db}
 	if err := inbound.processMessage(sess); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := db.Query(`SELECT raw_message, raw_headers FROM messages`)
+	rows, err := db.Query(`SELECT raw_message, raw_headers, rcpt_to, account_id FROM messages`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,13 +107,21 @@ func TestInboundStoredHeadersDoNotLeakEnvelopeRecipients(t *testing.T) {
 	count := 0
 	for rows.Next() {
 		var raw []byte
-		var headers string
-		if err := rows.Scan(&raw, &headers); err != nil {
+		var headers, recipients string
+		var accountID int64
+		if err := rows.Scan(&raw, &headers, &recipients, &accountID); err != nil {
 			t.Fatal(err)
 		}
 		count++
+		email := accountEmails[accountID]
+		if email == "" || recipients != `["`+email+`"]` {
+			t.Fatalf("mailbox %s can see other envelope recipients: %q", email, recipients)
+		}
 		if !bytes.HasPrefix(raw, []byte("Return-Path: <bounce@remote.test>\r\n")) || bytes.Contains(raw, []byte("forged@remote.test")) {
 			t.Fatalf("stored reverse-path is not trusted: %q", raw)
+		}
+		if bytes.Contains(raw, []byte("forged.example; dkim=pass")) || !bytes.Contains(raw, []byte("Authentication-Results: mail.example.test;")) {
+			t.Fatalf("stored authentication results are not trusted: %q", raw)
 		}
 		if !strings.Contains(headers, "Return-Path: <bounce@remote.test>") || strings.Contains(headers, "forged@remote.test") {
 			t.Fatalf("stored header metadata has wrong reverse-path: %q", headers)

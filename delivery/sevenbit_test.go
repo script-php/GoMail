@@ -93,6 +93,20 @@ func TestSevenBitMIMEConvertsMultipartWithPreamble(t *testing.T) {
 	}
 }
 
+func TestSevenBitMIMEPreservesMultipartEpilogue(t *testing.T) {
+	raw := []byte("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nCafé\r\n" +
+		"--outer--\r\nThis is the epilogue.\r\n")
+	converted := sevenBitMIME(raw)
+	if bytes.Equal(converted, raw) || containsEightBit(converted) || !bytes.HasSuffix(converted, []byte("--outer--\r\nThis is the epilogue.\r\n")) {
+		t.Fatalf("multipart epilogue was lost during conversion: %q", converted)
+	}
+	withEightBitEpilogue := bytes.Replace(raw, []byte("This is the epilogue."), []byte("Café epilogue."), 1)
+	if got := sevenBitMIME(withEightBitEpilogue); !bytes.Equal(got, withEightBitEpilogue) {
+		t.Fatal("8-bit epilogue was silently altered")
+	}
+}
+
 func TestSevenBitMIMEDoesNotAlterExistingSignaturesOrOpaqueParts(t *testing.T) {
 	for _, raw := range []string{
 		"MIME-Version: 1.0\r\nDKIM-Signature: v=1; b=abc\r\nContent-Transfer-Encoding: 8bit\r\n\r\ncafé",

@@ -11,8 +11,6 @@ import (
 	"mime/quotedprintable"
 	"net/http"
 	"net/mail"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -446,7 +444,7 @@ func (h *ComposeHandler) Send(w http.ResponseWriter, r *http.Request) {
 		_ = h.db.DeleteDraft(account.ID, draftID)
 	}
 
-	log.Printf("[web] message enqueued from=%s to=%v subject=%s attachments=%d", from, recipients, subject, len(attachmentData))
+	log.Printf("[web] message enqueued from=%s recipients=%d attachments=%d", from, len(recipients), len(attachmentData))
 	http.Redirect(w, r, "/sent", http.StatusSeeOther)
 }
 
@@ -626,81 +624,4 @@ func base64Encode(data []byte) string {
 	}
 
 	return result.String()
-}
-
-// saveAttachment saves an attachment to disk and creates a database record
-func saveAttachment(cfg *config.Config, db *store.DB, messageID int64, attachData map[string]interface{}) error {
-	filename := attachData["filename"].(string)
-	content := attachData["content"].([]byte)
-
-	// Create attachments directory if it doesn't exist
-	attachDir := cfg.Store.AttachmentsPath
-	if attachDir == "" {
-		attachDir = "data/attachments"
-	}
-	if err := os.MkdirAll(attachDir, 0755); err != nil {
-		return fmt.Errorf("creating attachments dir: %w", err)
-	}
-
-	// Generate a unique filename to avoid collisions
-	storageName := fmt.Sprintf("%d_%d_%s", messageID, time.Now().UnixNano(), filepath.Base(filename))
-	storagePath := filepath.Join(attachDir, storageName)
-
-	// Write attachment to disk
-	err := os.WriteFile(storagePath, content, 0644)
-	if err != nil {
-		return fmt.Errorf("writing attachment to disk: %w", err)
-	}
-
-	// Detect content type (use application/octet-stream as default)
-	contentType := "application/octet-stream"
-	if ext := strings.ToLower(filepath.Ext(filename)); ext != "" {
-		if ct, ok := mimeTypes[ext]; ok {
-			contentType = ct
-		}
-	}
-
-	// Save attachment metadata to database
-	attachment := &store.Attachment{
-		MessageID:   messageID,
-		Filename:    filename,
-		ContentType: contentType,
-		Size:        int64(len(content)),
-		StoragePath: storagePath,
-	}
-
-	_, err = db.SaveAttachment(attachment)
-	if err != nil {
-		// Clean up the file if database save fails
-		os.Remove(storagePath)
-		return fmt.Errorf("saving attachment to database: %w", err)
-	}
-
-	log.Printf("[web] attachment saved: filename=%s, size=%d, msgID=%d", filename, len(content), messageID)
-	return nil
-}
-
-// mimeTypes maps common file extensions to MIME types
-var mimeTypes = map[string]string{
-	".pdf":  "application/pdf",
-	".doc":  "application/msword",
-	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-	".xls":  "application/vnd.ms-excel",
-	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-	".ppt":  "application/vnd.ms-powerpoint",
-	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-	".txt":  "text/plain",
-	".csv":  "text/csv",
-	".zip":  "application/zip",
-	".rar":  "application/x-rar-compressed",
-	".7z":   "application/x-7z-compressed",
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".png":  "image/png",
-	".gif":  "image/gif",
-	".bmp":  "image/bmp",
-	".mp3":  "audio/mpeg",
-	".mp4":  "video/mp4",
-	".avi":  "video/x-msvideo",
-	".mov":  "video/quicktime",
 }

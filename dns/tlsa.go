@@ -121,13 +121,24 @@ func queryTLSARecords(name, server string) (TLSAResult, error) {
 			return result, ErrNoTLSA
 		}
 		var alias string
+		aliasCount := 0
+		tlsaAtCurrent := false
 		for _, answer := range resp.Answer {
-			if rr, ok := answer.(*mdns.CNAME); ok && strings.EqualFold(rr.Hdr.Name, current) {
-				alias = mdns.Fqdn(rr.Target)
-				if rr.Hdr.Ttl < minTTL {
-					minTTL = rr.Hdr.Ttl
+			switch rr := answer.(type) {
+			case *mdns.CNAME:
+				if strings.EqualFold(rr.Hdr.Name, current) {
+					alias = mdns.Fqdn(rr.Target)
+					aliasCount++
+					if rr.Hdr.Ttl < minTTL {
+						minTTL = rr.Hdr.Ttl
+					}
 				}
+			case *mdns.TLSA:
+				tlsaAtCurrent = tlsaAtCurrent || strings.EqualFold(rr.Hdr.Name, current)
 			}
+		}
+		if aliasCount > 1 || aliasCount > 0 && tlsaAtCurrent {
+			return result, fmt.Errorf("contradictory TLSA/CNAME answer for %s", current)
 		}
 		if alias != "" {
 			current = alias

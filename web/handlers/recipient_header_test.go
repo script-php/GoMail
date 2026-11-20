@@ -4,6 +4,7 @@ import (
 	"net/mail"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFormatRecipientHeaderPreservesAddresses(t *testing.T) {
@@ -25,5 +26,23 @@ func TestFormatRecipientHeaderPreservesAddresses(t *testing.T) {
 	}
 	if _, err := formatRecipientHeader("a@example.test\r\nBcc: other@example.test"); err == nil {
 		t.Fatal("accepted header injection")
+	}
+}
+
+func TestRecipientHeaderUsesIDNAForASCIILocalPart(t *testing.T) {
+	header, err := formatRecipientHeader("Müller <user@bücher.example>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(header, "<user@xn--bcher-kva.example>") || strings.Contains(header, "user@bücher.example") {
+		t.Fatalf("IDNA recipient header = %q", header)
+	}
+	trace := originatingHeaders(true, "", "mail.example.test", "id@example.test", []string{"user@bücher.example"}, time.Now())
+	if !strings.Contains(trace, "for <user@xn--bcher-kva.example>") || strings.Contains(trace, "user@bücher.example") {
+		t.Fatalf("IDNA trace field = %q", trace)
+	}
+	utf8Header, err := formatRecipientHeader("josé@bücher.example")
+	if err != nil || !strings.Contains(utf8Header, "josé@bücher.example") {
+		t.Fatalf("UTF-8 local part changed: %q, %v", utf8Header, err)
 	}
 }

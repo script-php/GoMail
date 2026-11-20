@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -848,8 +847,10 @@ func (db *DB) AppendIMAPMessageWithAttachments(message *Message, mutation IMAPFl
 		if !validIMAPAttachmentExtension(extension) {
 			extension = ".bin"
 		}
-		digest := sha256.Sum256(attachment.Data)
-		storedName := fmt.Sprintf("%d_imap_%d_%x%s", id, index, digest[:8], extension)
+		storedName, nameErr := newAttachmentName(id, "imap", index, attachment.Data, extension)
+		if nameErr != nil {
+			return 0, 0, nameErr
+		}
 		fullPath, safe := db.safeAttachmentPath(storedName)
 		if !safe {
 			return 0, 0, fmt.Errorf("unsafe APPEND attachment path")

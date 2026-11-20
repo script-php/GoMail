@@ -78,6 +78,32 @@ func TestTLSALookupDNSSECStates(t *testing.T) {
 			wantRecords: 1,
 		},
 		{
+			name: "authenticated CNAME and TLSA at same name",
+			response: func(request *mdns.Msg) *mdns.Msg {
+				response := new(mdns.Msg)
+				response.SetReply(request)
+				response.AuthenticatedData = true
+				alias, _ := mdns.NewRR("_25._tcp.mail.example. 60 IN CNAME shared.example.")
+				association, _ := mdns.NewRR("_25._tcp.mail.example. 60 IN TLSA 3 1 1 " + valid)
+				response.Answer = []mdns.RR{alias, association}
+				return response
+			},
+			wantAnyErr: true,
+		},
+		{
+			name: "authenticated multiple CNAME targets",
+			response: func(request *mdns.Msg) *mdns.Msg {
+				response := new(mdns.Msg)
+				response.SetReply(request)
+				response.AuthenticatedData = true
+				first, _ := mdns.NewRR("_25._tcp.mail.example. 60 IN CNAME one.example.")
+				second, _ := mdns.NewRR("_25._tcp.mail.example. 60 IN CNAME two.example.")
+				response.Answer = []mdns.RR{first, second}
+				return response
+			},
+			wantAnyErr: true,
+		},
+		{
 			name: "unrelated answer is not a TLSA association",
 			response: func(request *mdns.Msg) *mdns.Msg {
 				response := new(mdns.Msg)

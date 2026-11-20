@@ -4,20 +4,26 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"gomail/config"
 	"gomail/store"
+	_ "modernc.org/sqlite"
 )
 
 const FormatVersion = 1
@@ -57,6 +63,9 @@ func create(cfg *config.Config, configPath, outputPath, version string, acquireL
 	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0750); err != nil {
 		return manifest, fmt.Errorf("creating backup directory: %w", err)
+	}
+	if err := validateBackupDestination(cfg, configPath, outputPath); err != nil {
+		return manifest, err
 	}
 	var lock *InstanceLock
 	var err error
@@ -105,6 +114,18 @@ func create(cfg *config.Config, configPath, outputPath, version string, acquireL
 	if cfg.Store.Database == "mysql" {
 		databaseFile += ".sql"
 		err = dumpMySQL(cfg, databaseFile)
+		if err == nil {
+			var after map[string]int64
+			after, err = db.BackupCounts()
+			if err == nil && !reflect.DeepEqual(manifest.Counts, after) {
+				err = fmt.Errorf("database table counts changed during MySQL backup; retry after writes settle")
+			}
+		}
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			err = verifyStagedAttachments(ctx, db.DB, cfg.Store.AttachmentsPath)
+			cancel()
+		}
 	} else {
 		databaseFile += ".sqlite"
 		err = db.SnapshotSQLite(databaseFile)
@@ -112,6 +133,26 @@ func create(cfg *config.Config, configPath, outputPath, version string, acquireL
 	db.Close()
 	if err != nil {
 		return manifest, err
+	}
+	if cfg.Store.Database == "sqlite" {
+		manifest.Counts, err = sqliteSnapshotCounts(databaseFile)
+		if err != nil {
+			return manifest, fmt.Errorf("counting SQLite snapshot: %w", err)
+		}
+		snapshot, openErr := sql.Open("sqlite", databaseFile)
+		if openErr != nil {
+			return manifest, fmt.Errorf("opening SQLite backup snapshot: %w", openErr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		verifyErr := verifyStagedAttachments(ctx, snapshot, cfg.Store.AttachmentsPath)
+		cancel()
+		closeErr := snapshot.Close()
+		if verifyErr != nil {
+			return manifest, fmt.Errorf("backup snapshot references invalid attachment: %w", verifyErr)
+		}
+		if closeErr != nil {
+			return manifest, closeErr
+		}
 	}
 
 	sources := []sourceFile{{"database/" + filepath.Base(databaseFile), databaseFile}, {"config/config.json", configPath}}
@@ -145,6 +186,23 @@ func create(cfg *config.Config, configPath, outputPath, version string, acquireL
 		return manifest, fmt.Errorf("verifying completed backup: %w", err)
 	}
 	return manifest, nil
+}
+
+func sqliteSnapshotCounts(path string) (map[string]int64, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	counts := make(map[string]int64)
+	for _, table := range store.BackupTables() {
+		var count int64
+		if err := db.QueryRow("SELECT COUNT(*) FROM `" + table + "`").Scan(&count); err != nil {
+			return nil, fmt.Errorf("%s: %w", table, err)
+		}
+		counts[table] = count
+	}
+	return counts, nil
 }
 
 func estimateBackupBytes(cfg *config.Config, configPath string) (int64, error) {
@@ -233,17 +291,25 @@ func Verify(path string) (Manifest, error) {
 		if err != nil {
 			return manifest, err
 		}
-		if header.Typeflag != tar.TypeReg {
-			continue
+		if err := validateArchiveEntry(header); err != nil {
+			return manifest, err
 		}
 		hash := sha256.New()
 		if header.Name == "manifest.json" {
+			if header.Size > 16<<20 {
+				return manifest, fmt.Errorf("backup manifest exceeds 16 MiB")
+			}
 			if manifestSeen {
 				return manifest, fmt.Errorf("duplicate backup manifest")
 			}
 			manifestSeen = true
-			if err := json.NewDecoder(io.TeeReader(reader, hash)).Decode(&manifest); err != nil {
+			decoder := json.NewDecoder(io.TeeReader(reader, hash))
+			if err := decoder.Decode(&manifest); err != nil {
 				return manifest, err
+			}
+			var trailing any
+			if err := decoder.Decode(&trailing); err != io.EOF {
+				return manifest, fmt.Errorf("backup manifest has trailing data")
 			}
 			continue
 		}
@@ -261,6 +327,16 @@ func Verify(path string) (Manifest, error) {
 	}
 	if manifest.FormatVersion != FormatVersion {
 		return manifest, fmt.Errorf("unsupported backup format version %d", manifest.FormatVersion)
+	}
+	for _, table := range stagedCountTables {
+		if _, ok := manifest.Counts[table]; !ok {
+			return manifest, fmt.Errorf("backup manifest lacks %s count", table)
+		}
+	}
+	for table, count := range manifest.Counts {
+		if !isKnownBackupTable(table) || count < 0 {
+			return manifest, fmt.Errorf("backup manifest has invalid table count for %q", table)
+		}
 	}
 	if len(actual) != len(manifest.Files) {
 		return manifest, fmt.Errorf("manifest contains %d files but archive contains %d", len(manifest.Files), len(actual))
@@ -297,8 +373,19 @@ func Verify(path string) (Manifest, error) {
 	return manifest, nil
 }
 
+func validateArchiveEntry(header *tar.Header) error {
+	if header.Typeflag != tar.TypeReg {
+		return fmt.Errorf("unsupported backup entry %q", header.Name)
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(header.Name)))
+	if clean != header.Name || clean == "." || strings.IndexByte(header.Name, 0) >= 0 || !filepath.IsLocal(filepath.FromSlash(header.Name)) {
+		return fmt.Errorf("unsafe backup path %q", header.Name)
+	}
+	return nil
+}
+
 func appendTree(sources *[]sourceFile, logicalRoot, physicalRoot string) error {
-	info, err := os.Stat(physicalRoot)
+	info, err := os.Lstat(physicalRoot)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -312,8 +399,8 @@ func appendTree(sources *[]sourceFile, logicalRoot, physicalRoot string) error {
 		if err != nil || info.IsDir() {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing symlink in backup source: %s", path)
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular file in backup source: %s", path)
 		}
 		if info.Name() == ".gomail-instance.lock" {
 			return nil
@@ -328,7 +415,7 @@ func appendTree(sources *[]sourceFile, logicalRoot, physicalRoot string) error {
 }
 
 func hashFile(logical, physical string) (FileRecord, error) {
-	file, err := os.Open(physical)
+	file, err := openRegularBackupFile(physical)
 	if err != nil {
 		return FileRecord{}, err
 	}
@@ -339,6 +426,26 @@ func hashFile(logical, physical string) (FileRecord, error) {
 		return FileRecord{}, err
 	}
 	return FileRecord{Path: logical, Size: size, SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+}
+
+// O_NONBLOCK prevents a swapped-in FIFO from trapping an online backup in
+// open(2). The descriptor is checked after opening so a path replacement
+// between tree discovery and hashing cannot turn a special file into input.
+func openRegularBackupFile(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("backup source is not a regular file: %s", path)
+	}
+	return file, nil
 }
 
 func writeArchive(path string, manifest Manifest, sources []sourceFile) error {
@@ -382,7 +489,17 @@ func writeArchive(path string, manifest Manifest, sources []sourceFile) error {
 	if err := os.Chmod(temporaryPath, 0600); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, path)
+	// Link within the destination directory publishes the fully synced archive
+	// without replacing an archive another run created after the existence check.
+	if err := os.Link(temporaryPath, path); err != nil {
+		return err
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		log.Printf("[backup] published archive but could not remove temporary link: %v", err)
+	}
+	// The file was synced above; persist the directory entry before reporting
+	// the archive as complete to the scheduler or administrator.
+	return syncRestoreJournalDir(path)
 }
 
 func writeBytes(writer *tar.Writer, name string, data []byte, mode int64) error {
@@ -394,7 +511,7 @@ func writeBytes(writer *tar.Writer, name string, data []byte, mode int64) error 
 }
 
 func writeFile(writer *tar.Writer, source sourceFile) error {
-	file, err := os.Open(source.physical)
+	file, err := openRegularBackupFile(source.physical)
 	if err != nil {
 		return err
 	}
@@ -416,6 +533,7 @@ func writeFile(writer *tar.Writer, source sourceFile) error {
 
 func dumpMySQL(cfg *config.Config, destination string) error {
 	arguments := []string{"--single-transaction", "--quick", "--skip-lock-tables", "-h", cfg.Store.MySQL.Host, "-P", fmt.Sprint(cfg.Store.MySQL.Port), "-u", cfg.Store.MySQL.User, cfg.Store.MySQL.Name}
+	arguments = append(mysqlClientTLSArgs(cfg.Store.MySQL), arguments...)
 	command := exec.Command("mysqldump", arguments...)
 	command.Env = append(os.Environ(), "MYSQL_PWD="+cfg.Store.MySQL.Password)
 	file, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)

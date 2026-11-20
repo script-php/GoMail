@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,7 +68,13 @@ func (q *Queue) getDKIMSigner(from string) (*auth.DKIMSigner, error) {
 // Enqueue adds a new outbound message to the delivery queue.
 // It DKIM-signs the message (per-domain), stores it, and creates queue entries.
 func (q *Queue) Enqueue(from string, to []string, rawMessage []byte, accountID int64) error {
-	return q.enqueue(from, to, nil, rawMessage, accountID, 0)
+	return q.enqueue(from, to, nil, rawMessage, accountID, 0, false)
+}
+
+// EnqueueTLSReport marks only system-generated TLS-RPT email for RFC 8460
+// transport-policy exemption. Callers cannot supply an account ID here.
+func (q *Queue) EnqueueTLSReport(from string, to []string, rawMessage []byte) error {
+	return q.enqueue(from, to, nil, rawMessage, 0, 0, true)
 }
 
 // SubmissionDSN carries authenticated clients' DSN options into the durable queue.
@@ -83,15 +90,26 @@ func (q *Queue) EnqueueSubmission(from string, to []string, dsn SubmissionDSN, r
 	if len(to) != len(dsn.Notify) || len(to) != len(dsn.OriginalRecipient) {
 		return fmt.Errorf("recipient and DSN option counts differ")
 	}
-	return q.enqueue(from, to, &dsn, rawMessage, accountID, 0)
+	if err := smtp.ValidateOutboundDSNEnvelopeID(dsn.EnvelopeID); err != nil {
+		return fmt.Errorf("invalid submitted DSN envelope ID: %w", err)
+	}
+	for _, notify := range dsn.Notify {
+		if err := smtp.ValidateOutboundDSNOptions(notify, dsn.Return); err != nil {
+			return fmt.Errorf("invalid submitted DSN options: %w", err)
+		}
+	}
+	return q.enqueue(from, to, &dsn, rawMessage, accountID, 0, false)
 }
 
 // EnqueueMDN commits the receipt and its source-message marker together.
 func (q *Queue) EnqueueMDN(from string, to []string, rawMessage []byte, accountID, sourceMessageID int64) error {
-	return q.enqueue(from, to, nil, rawMessage, accountID, sourceMessageID)
+	return q.enqueue(from, to, nil, rawMessage, accountID, sourceMessageID, false)
 }
 
-func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage []byte, accountID, mdnSourceID int64) error {
+func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage []byte, accountID, mdnSourceID int64, tlsReport bool) error {
+	if len(to) == 0 {
+		return fmt.Errorf("%w: no recipients", ErrInvalidMessage)
+	}
 	// Normalize eligible MIME bodies before DKIM signs them. A DKIM-signed
 	// seven-bit representation can be delivered to both modern and legacy
 	// SMTP peers without changing the queued signature at delivery time.
@@ -196,7 +214,7 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 
 		dsnNotify := "FAILURE"
 		dsnRet := "FULL"
-		dsnEnvID := msg.MessageID
+		dsnEnvID := defaultDSNEnvelopeID(msg.MessageID)
 		originalRecipient := rcpt
 		if dsn != nil {
 			// Preserve absence of DSN parameters from submission when relaying.
@@ -213,6 +231,7 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 			}
 		}
 		entry := &store.QueueEntry{
+			TLSReport: tlsReport,
 
 			MailFrom:          from,
 			RcptTo:            rcpt,
@@ -246,19 +265,24 @@ func (q *Queue) enqueue(from string, to []string, dsn *SubmissionDSN, rawMessage
 	if err != nil {
 		return fmt.Errorf("queueing outbound message: %w", err)
 	}
-	// Update sent folder counts
-	if msg.FolderID != nil {
-		q.db.UpdateFolderCounts(*msg.FolderID)
-	}
-
 	logging.Info(fmt.Sprintf("[delivery] enqueued message from=%s to=%v id=%d", from, to, msgID))
 	return nil
 }
 
+// A Message-ID may be much longer than the RFC 3461 ENVID interoperability
+// limit. Keep ordinary IDs readable, but use a stable short identifier when
+// the encoded value would exceed that limit or contain unsafe bytes.
+func defaultDSNEnvelopeID(messageID string) string {
+	if err := smtp.ValidateOutboundDSNEnvelopeID(messageID); err == nil && messageID != "" {
+		return messageID
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(messageID)))
+}
+
 func extractDomain(addr string) string {
-	parts := strings.SplitN(addr, "@", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	at := strings.LastIndexByte(addr, '@')
+	if at >= 0 && at < len(addr)-1 {
+		return addr[at+1:]
 	}
 	return ""
 }

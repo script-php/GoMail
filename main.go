@@ -38,6 +38,7 @@ func main() {
 	backupPath := flag.String("backup", "", "Create a verified offline backup archive at this path")
 	verifyBackupPath := flag.String("verify-backup", "", "Verify a GoMail backup archive")
 	restoreBackupPath := flag.String("restore-backup", "", "Restore a verified offline backup archive")
+	restoreStageDB := flag.String("restore-stage-db", "", "Import a MySQL restore into this pre-provisioned empty database before switching configuration")
 	forceRestore := flag.Bool("force-restore", false, "Required destructive confirmation for -restore-backup")
 	flag.Parse()
 	if *verifyBackupPath != "" {
@@ -91,6 +92,14 @@ func main() {
 	}
 
 	// Load configuration
+	if completed, err := backupops.CompleteDurableRestore(*configPath); err != nil {
+		log.Fatalf("Refusing to start after restore: %v", err)
+	} else if completed {
+		log.Print("Verified and completed durable restore after interrupted cleanup")
+	}
+	if err := backupops.CheckRestoreJournal(*configPath); err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -104,12 +113,20 @@ func main() {
 		return
 	}
 	if *restoreBackupPath != "" {
-		manifest, err := backupops.Restore(cfg, *configPath, *restoreBackupPath, *forceRestore)
+		var manifest backupops.Manifest
+		if *restoreStageDB != "" {
+			manifest, err = backupops.RestoreStaged(cfg, *configPath, *restoreBackupPath, *restoreStageDB, *forceRestore)
+		} else {
+			manifest, err = backupops.Restore(cfg, *configPath, *restoreBackupPath, *forceRestore)
+		}
 		if err != nil {
 			log.Fatalf("Restore failed: %v", err)
 		}
 		fmt.Printf("Backup restored: version=%d created=%s files=%d counts=%v\n", manifest.FormatVersion, manifest.CreatedAt.Format(time.RFC3339), len(manifest.Files), manifest.Counts)
 		return
+	}
+	if *restoreStageDB != "" {
+		log.Fatal("-restore-stage-db requires -restore-backup")
 	}
 	instanceLock, err := backupops.AcquireInstanceLock(cfg)
 	if err != nil {
@@ -222,7 +239,10 @@ func main() {
 		return queue.Enqueue(from, []string{to}, []byte(message), 0)
 	}
 	reporting.ScheduleDailyDMARCReports(cfg, db, enqueueFunc)
-	reporting.ScheduleDailyTLSReports(cfg, db, enqueueFunc)
+	tlsReportEnqueueFunc := func(from, to, message string) error {
+		return queue.EnqueueTLSReport(from, []string{to}, []byte(message))
+	}
+	reporting.ScheduleDailyTLSReports(cfg, db, tlsReportEnqueueFunc)
 	stopReportScanner := reporting.RunReceivedReportScanner(db)
 	defer stopReportScanner()
 	backupManager := backupops.NewManager(cfg, db, *configPath, config.Version())
@@ -289,11 +309,13 @@ func main() {
 	<-sigChan
 
 	logging.Info("[main] shutting down...")
-	backupManager.Stop()
 	smtpServer.Stop()
 	clientServer.Stop()
+	if err := webServer.Shutdown(); err != nil {
+		logging.Warn(fmt.Sprintf("[main] web shutdown deadline exceeded: %v", err))
+	}
+	backupManager.Stop()
 	deliveryPool.Stop()
-	webServer.Shutdown()
 	if metricsServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

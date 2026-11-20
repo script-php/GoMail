@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,12 +14,16 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/idna"
+
 	"gomail/security"
 	"gomail/store"
 )
 
 // SessionState represents the current state of an SMTP conversation.
 type SessionState int
+
+var errSMTPDataTooLarge = errors.New("message exceeds maximum size")
 
 const (
 	StateGreeting SessionState = iota
@@ -170,12 +175,14 @@ func (s *Session) handleCommand(line string) {
 		s.state = StateQuit
 	case "VRFY":
 		s.send(252, "Cannot VRFY user, but will accept message and attempt delivery")
+	case "HELP", "EXPN":
+		s.send(502, "Command not implemented")
 	default:
 		// Apply tarpitting if enabled for any domain
 		if len(s.domains) > 0 {
 			s.applyTarpitting(s.domains[0], cmd)
 		}
-		s.send(502, "Command not recognized")
+		s.send(500, "Command not recognized")
 	}
 }
 
@@ -417,7 +424,7 @@ func (s *Session) handleMAIL(arg string) {
 				return
 			}
 		case "ENVID":
-			if value == "" {
+			if value == "" || len(value) > 100 {
 				s.sendEnhanced(501, "5.5.4", "Invalid ENVID parameter")
 				return
 			}
@@ -437,6 +444,12 @@ func (s *Session) handleMAIL(arg string) {
 		if decodeErr != nil {
 			s.sendEnhanced(501, "5.5.4", "Invalid ENVID parameter")
 			return
+		}
+		for _, b := range []byte(decoded) {
+			if b != '\t' && (b < 32 || b > 126) {
+				s.sendEnhanced(501, "5.5.4", "Invalid ENVID parameter")
+				return
+			}
 		}
 		mailEnvID = decoded
 	}
@@ -474,6 +487,13 @@ func (s *Session) handleRCPT(arg string) {
 		s.sendEnhanced(501, "5.5.2", "Syntax error in RCPT TO")
 		return
 	}
+	// SMTP forward-paths contain a mailbox, not RFC 5322 header comments
+	// or folding whitespace. Validate before account and alias lookup.
+	address, parseErr := mail.ParseAddress(to)
+	if parseErr != nil || address.Address != to {
+		s.sendEnhanced(553, "5.1.3", "Invalid recipient address")
+		return
+	}
 	if hasNonASCII(to) && !s.smtputf8Enabled {
 		s.sendEnhanced(553, "5.6.7", "SMTPUTF8 is required for internationalized address")
 		return
@@ -497,7 +517,7 @@ func (s *Session) handleRCPT(arg string) {
 				return
 			}
 		case "ORCPT":
-			if value == "" || !strings.Contains(value, ";") {
+			if value == "" || len(value) > 500 || !strings.Contains(value, ";") {
 				s.sendEnhanced(501, "5.5.4", "Invalid ORCPT parameter")
 				return
 			}
@@ -535,12 +555,18 @@ func (s *Session) handleRCPT(arg string) {
 	}
 
 	// Check if recipient is for one of our domains
-	parts := strings.SplitN(to, "@", 2)
-	if len(parts) != 2 {
+	at := strings.LastIndexByte(to, '@')
+	if at < 0 || at == len(to)-1 {
 		s.sendEnhanced(550, "5.1.3", fmt.Sprintf("Invalid address: %s", to))
 		return
 	}
-	recipientDomain := strings.ToLower(parts[1])
+	recipientDomain, domainErr := idna.Lookup.ToASCII(to[at+1:])
+	if domainErr != nil || recipientDomain == "" {
+		s.sendEnhanced(553, "5.1.3", "Invalid recipient domain")
+		return
+	}
+	recipientDomain = strings.ToLower(recipientDomain)
+	to = to[:at+1] + recipientDomain
 	accepted := false
 	for _, d := range s.domains {
 		if strings.EqualFold(d, recipientDomain) {
@@ -591,12 +617,20 @@ func (s *Session) handleRCPT(arg string) {
 	// Check greylisting if enabled for this domain
 	if s.db != nil && s.mailFrom != "" {
 		domain, err := s.db.GetDomainByName(recipientDomain)
-		if err == nil && domain != nil && domain.GreylistingEnabled {
+		if err != nil {
+			log.Printf("[smtp] domain policy lookup error for %s: %v", recipientDomain, err)
+			s.sendEnhanced(451, "4.3.0", "Temporary recipient policy lookup failure")
+			return
+		}
+		if domain != nil && domain.GreylistingEnabled {
 			// Check greylisting status
 			status, err := s.db.CheckGreylist(recipientDomain, s.clientIP, s.mailFrom, to, domain.GreylistingDelayMins)
 			if err != nil {
 				log.Printf("[smtp] greylisting check error for %s from %s: %v", to, s.clientIP, err)
-			} else if status != nil {
+				s.sendEnhanced(451, "4.3.0", "Temporary recipient policy lookup failure")
+				return
+			}
+			if status != nil {
 				if status.IsNew {
 					log.Printf("[smtp] greylisting: new triplet (IP=%s, FROM=%s, TO=%s), temporary rejection", s.clientIP, s.mailFrom, to)
 					s.sendEnhanced(450, "4.2.0", "Mailbox temporarily unavailable")
@@ -637,7 +671,7 @@ func (s *Session) readDataLine(limit int64) ([]byte, error) {
 	for {
 		fragment, err := s.reader.ReadSlice('\n')
 		if int64(len(line))+int64(len(fragment)) > limit {
-			return nil, fmt.Errorf("message exceeds maximum size")
+			return nil, errSMTPDataTooLarge
 		}
 		line = append(line, fragment...)
 		if err == bufio.ErrBufferFull {
@@ -664,6 +698,9 @@ func (s *Session) handleDATA() {
 		line, err := s.readDataLine(s.maxSize - totalSize + 3)
 		if err != nil {
 			log.Printf("[smtp] data read error from %s: %v", s.clientAddr, err)
+			if errors.Is(err, errSMTPDataTooLarge) {
+				s.sendEnhanced(552, "5.3.4", "Message exceeds maximum size")
+			}
 			s.data.Reset()
 			s.state = StateQuit
 			return
@@ -674,7 +711,7 @@ func (s *Session) handleDATA() {
 		if bytes.Equal(line, []byte(".\r\n")) {
 			break
 		}
-		if !bytes.HasSuffix(line, []byte("\r\n")) {
+		if !bytes.HasSuffix(line, []byte("\r\n")) || bytes.IndexByte(line[:len(line)-2], '\r') >= 0 {
 			s.sendEnhanced(554, "5.6.0", "DATA requires CRLF line endings")
 			s.data.Reset()
 			s.state = StateQuit
@@ -709,29 +746,49 @@ func (s *Session) handleDATA() {
 }
 
 func (s *Session) handleBDAT(arg string) {
-	if !s.esmtp || s.bdatFailed {
-		s.sendEnhanced(503, "5.5.1", "EHLO or RSET required before BDAT")
+	if !s.esmtp {
+		s.sendEnhanced(503, "5.5.1", "EHLO required before BDAT")
+		return
+	}
+	if s.bdatFailed {
+		// A sender may have pipelined more chunks before seeing our failure.
+		// RFC 3030 requires consuming each declared chunk before replying.
+		length, _, err := parseBDATArguments(arg)
+		if err != nil {
+			s.sendEnhanced(501, "5.5.2", err.Error())
+			return
+		}
+		s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+		if _, err := io.CopyN(io.Discard, s.reader, length); err != nil {
+			s.state = StateQuit
+			return
+		}
+		s.sendEnhanced(503, "5.5.1", "RSET required after failed BDAT")
 		return
 	}
 	if s.state != StateRcpt && s.state != StateData {
+		length, _, err := parseBDATArguments(arg)
+		if err != nil {
+			s.sendEnhanced(501, "5.5.2", err.Error())
+			return
+		}
+		// Even an out-of-sequence BDAT carries exactly length data octets.
+		// Consume them before replying so the next command stays framed.
+		s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+		if _, err := io.CopyN(io.Discard, s.reader, length); err != nil {
+			s.state = StateQuit
+			return
+		}
 		s.sendEnhanced(503, "5.5.1", "Bad sequence of commands")
 		return
 	}
 
 	// Parse "BDAT <length> [LAST]"
-	parts := strings.Fields(arg)
-	if len(parts) < 1 || len(parts) > 2 || (len(parts) == 2 && !strings.EqualFold(parts[1], "LAST")) {
-		s.sendEnhanced(501, "5.5.2", "Syntax error in BDAT command")
+	length, isLast, err := parseBDATArguments(arg)
+	if err != nil {
+		s.sendEnhanced(501, "5.5.2", err.Error())
 		return
 	}
-
-	length, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || length < 0 {
-		s.sendEnhanced(501, "5.5.2", "Invalid chunk size")
-		return
-	}
-
-	isLast := len(parts) > 1 && strings.ToUpper(parts[1]) == "LAST"
 
 	// Stream-discard an oversized chunk before replying, as RFC 3030 requires.
 	// CopyN uses a bounded buffer, and the read deadline bounds an incomplete
@@ -750,11 +807,10 @@ func (s *Session) handleBDAT(arg string) {
 		return
 	}
 
-	// Read exactly 'length' bytes from connection
+	// Read exactly length bytes into the already bounded message buffer. Avoid
+	// allocating a second, chunk-sized copy for every concurrent SMTP client.
 	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
-	chunk := make([]byte, length)
-
-	n, err := io.ReadFull(s.reader, chunk)
+	_, err = io.CopyN(&s.data, s.reader, length)
 	if err != nil {
 		log.Printf("[smtp] BDAT read error from %s: %v", s.clientAddr, err)
 		s.sendEnhanced(452, "4.3.0", "Failed to read chunk")
@@ -762,17 +818,6 @@ func (s *Session) handleBDAT(arg string) {
 		s.state = StateQuit
 		return
 	}
-
-	// Check total size including this chunk
-	totalSize := int64(s.data.Len()) + int64(n)
-	if totalSize > s.maxSize {
-		s.sendEnhanced(552, "5.3.4", "Message exceeds maximum size")
-		s.reset()
-		return
-	}
-
-	// Append chunk to message data
-	s.data.Write(chunk)
 
 	// If LAST flag received, message transmission is complete
 	if isLast {
@@ -784,6 +829,40 @@ func (s *Session) handleBDAT(arg string) {
 		s.sendEnhanced(250, "2.0.0", "OK")
 		s.state = StateData
 	}
+}
+
+func parseBDATArguments(arg string) (int64, bool, error) {
+	parts := strings.Fields(arg)
+	if len(parts) < 1 || len(parts) > 2 || (len(parts) == 2 && !strings.EqualFold(parts[1], "LAST")) {
+		return 0, false, fmt.Errorf("syntax error in BDAT command")
+	}
+	for _, c := range parts[0] {
+		if c < '0' || c > '9' {
+			return 0, false, fmt.Errorf("invalid chunk size")
+		}
+	}
+	length, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid chunk size")
+	}
+	return length, len(parts) == 2, nil
+}
+
+func (s *Session) rejectBDATChunkForRateLimit(arg string) {
+	length, _, err := parseBDATArguments(arg)
+	if err != nil {
+		s.sendEnhanced(501, "5.5.2", err.Error())
+		return
+	}
+	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	if _, err := io.CopyN(io.Discard, s.reader, length); err != nil {
+		s.state = StateQuit
+		return
+	}
+	s.data.Reset()
+	s.bdatFailed = true
+	s.state = StateData
+	s.sendEnhanced(451, "4.5.3", "Too many messages, try again later")
 }
 
 func (s *Session) handleRSET() {
@@ -872,11 +951,13 @@ func (s *Session) validateMessageEncoding() error {
 	boundary := bytes.Index(raw, []byte("\r\n\r\n"))
 	separator := 4
 	if boundary < 0 {
-		boundary = bytes.Index(raw, []byte("\n\n"))
-		separator = 2
-	}
-	if boundary < 0 {
-		return fmt.Errorf("malformed message: missing header/body boundary")
+		// RFC 5322 permits a message consisting solely of header fields.
+		// Without a blank line, all bytes belong to the header section.
+		if !bytes.HasSuffix(raw, []byte("\r\n")) {
+			return fmt.Errorf("malformed message: unterminated header section")
+		}
+		boundary = len(raw)
+		separator = 0
 	}
 	if has8Bit(raw[:boundary]) && !s.smtputf8Enabled {
 		return fmt.Errorf("SMTPUTF8 is required for UTF-8 message headers")

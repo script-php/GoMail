@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/idna"
+
 	"gomail/config"
 	"gomail/metrics"
 	"gomail/parser"
@@ -27,6 +29,10 @@ type Worker struct {
 	schedule *RetrySchedule
 	claimMu  *sync.Mutex // shared mutex to prevent duplicate claims
 }
+
+var errLocalMailboxMissing = errors.New("local mailbox does not exist")
+var errLocalMailboxInactive = errors.New("local mailbox is inactive")
+var errLocalDomainInactive = errors.New("local domain is missing or inactive")
 
 // Pool manages a group of delivery workers.
 type Pool struct {
@@ -52,11 +58,12 @@ func NewPool(cfg *config.Config, db *store.DB, tlsCfg *tls.Config) *Pool {
 // Start launches the delivery workers.
 func (p *Pool) Start() {
 	// Quarantine stale claims; SMTP may already have accepted the message.
-	if recovered, err := p.db.RecoverStaleQueueEntries(); err != nil {
-		log.Printf("[delivery] stale queue recovery error: %v", err)
-	} else if recovered > 0 {
-		log.Printf("[delivery] quarantined %d uncertain queue entries for operator review", recovered)
-	}
+	p.recoverStaleQueueEntries()
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.runQueueRecovery(5 * time.Minute)
+	}()
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -83,6 +90,27 @@ func (p *Pool) Start() {
 	}
 
 	log.Printf("[delivery] started %d workers", p.cfg.Delivery.QueueWorkers)
+}
+
+func (p *Pool) recoverStaleQueueEntries() {
+	if recovered, err := p.db.RecoverStaleQueueEntries(); err != nil {
+		log.Printf("[delivery] stale queue recovery error: %v", err)
+	} else if recovered > 0 {
+		log.Printf("[delivery] quarantined %d uncertain queue entries for operator review", recovered)
+	}
+}
+
+func (p *Pool) runQueueRecovery(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.quit:
+			return
+		case <-ticker.C:
+			p.recoverStaleQueueEntries()
+		}
+	}
 }
 
 func (p *Pool) runQueueRetention() {
@@ -191,17 +219,20 @@ func (w *Worker) processQueue() {
 	messageForDelivery := entry.RawMessage
 
 	// Use VERP bounce address in MAIL FROM if available, otherwise use original sender
-	mailFromAddr := entry.MailFrom
+	mailFromAddr := queueReversePath(entry)
 	if entry.VERPBounceAddress != "" {
-		mailFromAddr = entry.VERPBounceAddress
 		log.Printf("[delivery] using VERP bounce address: %s (original: %s)", mailFromAddr, entry.MailFrom)
 	}
 
-	isLocal, routeErr := w.isLocalRecipient(entry.RcptTo)
+	isLocal := entry.LocalRecipient
+	var routeErr error
+	if !isLocal {
+		isLocal, routeErr = w.isLocalRecipient(entry.RcptTo)
+	}
 	if routeErr != nil {
 		deliveryErr = fmt.Errorf("checking recipient route: %w", routeErr)
 	} else if isLocal {
-		deliveryErr = w.deliverLocal(entry, messageForDelivery)
+		deliveryErr = w.deliverLocalClaimed(entry, token, messageForDelivery)
 	} else {
 		// Outbound transport policy belongs to the sender's managed domain.
 		domain := parseRecipientDomain(entry.MailFrom)
@@ -219,7 +250,13 @@ func (w *Worker) processQueue() {
 			deliveryErr = fmt.Errorf("sender domain is missing or inactive")
 		} else {
 			requireTLS = domainRecord.RequireTLS
-			deliveryErr = smtp.SendMail(
+			send := smtp.SendMail
+			if entry.TLSReport && entry.OriginAccountID == 0 {
+				send = func(from, to string, msg []byte, hostname string, tlsCfg *tls.Config, _ bool, dsnNotify, dsnRet, dsnEnvID, network string, db *store.DB, policyDomain ...string) error {
+					return smtp.SendTLSReport(from, to, msg, hostname, tlsCfg, dsnNotify, dsnRet, dsnEnvID, network, db, policyDomain...)
+				}
+			}
+			deliveryErr = send(
 				mailFromAddr,
 				entry.RcptTo,
 				messageForDelivery,
@@ -239,6 +276,10 @@ func (w *Worker) processQueue() {
 	stopHeartbeat()
 
 	if deliveryErr != nil {
+		if errors.Is(deliveryErr, store.ErrQueueClaimLost) {
+			w.logStatePersistenceFailure(entry, "local delivery", deliveryErr)
+			return // Never requeue a claim that may have been resolved elsewhere.
+		}
 		if errors.Is(deliveryErr, smtp.ErrDeliveryOutcomeUnknown) {
 			entry.Attempts++
 			metrics.IncDelivery("uncertain")
@@ -249,6 +290,9 @@ func (w *Worker) processQueue() {
 			return
 		}
 		smtpCode := smtp.SMTPFailureCode(deliveryErr)
+		if errors.Is(deliveryErr, errLocalMailboxMissing) || errors.Is(deliveryErr, errLocalMailboxInactive) || errors.Is(deliveryErr, errLocalDomainInactive) {
+			smtpCode = 550
+		}
 		if errors.Is(deliveryErr, store.ErrQuotaExceeded) {
 			metrics.IncQuota("delivery")
 			smtpCode = 452
@@ -303,9 +347,11 @@ func (w *Worker) processQueue() {
 		if isLocal {
 			successDetail = "local mailbox delivery completed"
 		}
-		if err := w.transitionOwnedQueue(entry.ID, token, "sent", entry.Attempts+1, time.Now().UTC(), "", 0, successDetail); err != nil {
-			w.logStatePersistenceFailure(entry, "sent", err)
-			return
+		if !isLocal {
+			if err := w.transitionOwnedQueue(entry.ID, token, "sent", entry.Attempts+1, time.Now().UTC(), "", 0, successDetail); err != nil {
+				w.logStatePersistenceFailure(entry, "sent", err)
+				return
+			}
 		}
 		w.sendFinalDSNOrSchedule(entry, "delivered", "delivery completed", 250)
 	}
@@ -352,43 +398,75 @@ func (w *Worker) transitionOwnedQueue(id int64, token, status string, attempts i
 
 func (w *Worker) logStatePersistenceFailure(entry *store.QueueEntry, intended string, err error) {
 	metrics.IncDelivery("state_error")
-	log.Printf("[delivery] CRITICAL: worker %d delivered/attempted queue entry %d but could not persist state %q after retries: %v; entry remains recoverable as sending and may require operator reconciliation",
+	log.Printf("[delivery] CRITICAL: worker %d delivered/attempted queue entry %d but could not persist state %q: %v; inspect queue history before retrying because the outcome may require operator reconciliation",
 		w.id, entry.ID, intended, err)
 }
 
-// isLocalRecipient checks if the recipient's domain is handled by this server.
+// isLocalRecipient checks whether the recipient's domain is configured here.
+// Disabled hosted domains must still route locally: treating them as remote
+// could leak queued mail to an external MX after an administrator disables one.
 func (w *Worker) isLocalRecipient(rcpt string) (bool, error) {
-	parts := strings.SplitN(rcpt, "@", 2)
-	if len(parts) != 2 {
-		return false, fmt.Errorf("invalid recipient address %q", rcpt)
+	domain := parseRecipientDomain(rcpt)
+	if domain == "" {
+		return false, fmt.Errorf("%w: invalid recipient address %q", smtp.ErrInvalidEnvelopeAddress, rcpt)
 	}
-	domain := strings.ToLower(parts[1])
+	var err error
+	domain, err = idna.Lookup.ToASCII(domain)
+	if err != nil || domain == "" {
+		return false, fmt.Errorf("%w: invalid recipient domain %q", smtp.ErrInvalidEnvelopeAddress, rcpt)
+	}
+	domain = strings.ToLower(domain)
 
-	domains, err := w.db.ListAllDomainNames()
+	hosted, err := w.db.GetDomainByName(domain)
 	if err != nil {
-		return false, fmt.Errorf("listing local domains: %w", err)
+		return false, fmt.Errorf("looking up local domain: %w", err)
 	}
-	for _, d := range domains {
-		if strings.EqualFold(d, domain) {
-			return true, nil
-		}
+	return hosted != nil, nil
+}
+
+func queueReversePath(entry *store.QueueEntry) string {
+	if entry.VERPBounceAddress != "" {
+		return entry.VERPBounceAddress
 	}
-	return false, nil
+	return entry.MailFrom
 }
 
 // deliverLocal delivers a message directly to a local account's mailbox.
 func (w *Worker) deliverLocal(entry *store.QueueEntry, messageWithARC []byte) error {
+	return w.deliverLocalWithClaim(entry, "", messageWithARC)
+}
+
+func (w *Worker) deliverLocalClaimed(entry *store.QueueEntry, token string, messageWithARC []byte) error {
+	return w.deliverLocalWithClaim(entry, token, messageWithARC)
+}
+
+func (w *Worker) deliverLocalWithClaim(entry *store.QueueEntry, token string, messageWithARC []byte) error {
 	rcpt := entry.RcptTo
+	if at := strings.LastIndexByte(rcpt, '@'); at >= 0 {
+		domain, err := idna.Lookup.ToASCII(rcpt[at+1:])
+		if err != nil || domain == "" {
+			return fmt.Errorf("%w: invalid local recipient domain %q", smtp.ErrInvalidEnvelopeAddress, rcpt)
+		}
+		rcpt = rcpt[:at+1] + strings.ToLower(domain)
+	}
+	hostedDomain, err := w.db.GetDomainByName(parseRecipientDomain(rcpt))
+	if err != nil {
+		return fmt.Errorf("checking local recipient domain: %w", err)
+	}
+	if hostedDomain == nil || !hostedDomain.IsActive {
+		return fmt.Errorf("%w: %s", errLocalDomainInactive, parseRecipientDomain(rcpt))
+	}
+	reversePath := queueReversePath(entry)
 
 	account, err := w.db.GetDeliveryAccount(rcpt)
 	if err != nil {
 		return fmt.Errorf("account lookup for %s: %w", rcpt, err)
 	}
 	if account == nil {
-		return fmt.Errorf("no local account for %s", rcpt)
+		return fmt.Errorf("%w: %s", errLocalMailboxMissing, rcpt)
 	}
 	if !account.IsActive {
-		return fmt.Errorf("account %s is inactive", rcpt)
+		return fmt.Errorf("%w: %s", errLocalMailboxInactive, rcpt)
 	}
 
 	// Parse the message (use ARC-enhanced version)
@@ -406,7 +484,7 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry, messageWithARC []byte) er
 		time.Now().Format(time.RFC1123Z),
 	)
 	rawMessageWithReceived := append([]byte(receivedHeader), messageWithARC...)
-	rawMessageWithReceived, err = smtp.FinalDeliveryReturnPath(rawMessageWithReceived, entry.MailFrom)
+	rawMessageWithReceived, err = smtp.FinalDeliveryReturnPath(rawMessageWithReceived, reversePath)
 	if err != nil {
 		return fmt.Errorf("setting local Return-Path: %w", err)
 	}
@@ -434,7 +512,7 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry, messageWithARC []byte) er
 		AccountID:      account.ID,
 		MessageID:      messageID,
 		Direction:      "inbound",
-		MailFrom:       entry.MailFrom,
+		MailFrom:       reversePath,
 		RcptTo:         string(rcptJSON),
 		FromAddr:       parsed.From,
 		ToAddr:         parsed.To,
@@ -471,27 +549,30 @@ func (w *Worker) deliverLocal(entry *store.QueueEntry, messageWithARC []byte) er
 	for _, attachment := range parsed.Attachments {
 		attachments = append(attachments, store.IMAPAppendAttachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: attachment.Data})
 	}
-	ids, err := w.db.SaveMessagesWithQueueAndAttachments([]*store.Message{msg}, nil, [][]store.IMAPAppendAttachment{attachments})
+	var msgID int64
+	if token != "" {
+		msgID, err = w.db.SaveClaimedLocalDelivery(msg, attachments, entry.ID, token, entry.Attempts+1)
+	} else {
+		var ids []int64
+		ids, err = w.db.SaveMessagesWithQueueAndAttachments([]*store.Message{msg}, nil, [][]store.IMAPAppendAttachment{attachments})
+		if err == nil {
+			msgID = ids[0]
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("saving message for %s: %w", rcpt, err)
 	}
-	msgID := ids[0]
 
-	// Update folder counts
-	if msg.FolderID != nil {
-		w.db.UpdateFolderCounts(*msg.FolderID)
-	}
-
-	log.Printf("[delivery] local delivery: id=%d from=%s to=%s subject=%s (rawmessage_size=%d)",
-		msgID, entry.MailFrom, rcpt, parsed.Subject, len(rawMessageWithReceived))
+	log.Printf("[delivery] local delivery: id=%d from=%s to=%s rawmessage_size=%d",
+		msgID, entry.MailFrom, rcpt, len(rawMessageWithReceived))
 	return nil
 }
 
 // parseRecipientDomain extracts the domain from an email address
 func parseRecipientDomain(email string) string {
-	parts := strings.SplitN(email, "@", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	at := strings.LastIndexByte(email, '@')
+	if at >= 0 && at < len(email)-1 {
+		return email[at+1:]
 	}
 	return ""
 }
@@ -503,11 +584,15 @@ func extractSMTPCode(errMsg string) int {
 	// failures. Live retry decisions use typed SMTPFailureCode instead.
 	knownReply := strings.Contains(errMsg, "rejected by ") || strings.Contains(errMsg, "unexpected greeting from ") ||
 		strings.Contains(errMsg, "EHLO rejected:") || strings.Contains(errMsg, "HELO rejected:") ||
-		strings.Contains(errMsg, "invalid queued message") || strings.Contains(errMsg, "SMTPUTF8 required") ||
+		strings.Contains(errMsg, "invalid queued message") || strings.Contains(errMsg, "invalid envelope address") ||
+		strings.Contains(errMsg, "SMTPUTF8 required") ||
 		strings.Contains(errMsg, "8BITMIME required") || strings.Contains(errMsg, "recipient domain has no MX") ||
 		strings.Contains(errMsg, "recipient domain does not accept mail")
 	if !knownReply {
 		return 0
+	}
+	if strings.Contains(errMsg, "invalid envelope address") {
+		return 553
 	}
 	parts := strings.Fields(errMsg)
 	for _, part := range parts {
@@ -604,12 +689,25 @@ func (w *Worker) sendRequestedDSN(entry *store.QueueEntry, action, detail string
 
 	// Send DSN as an inbound message to the sender's mailbox (reverse path)
 	finalQueueID := int64(0)
-	if action != "delayed" {
+	delayQueueID := int64(0)
+	if action == "delayed" {
+		delayQueueID = entry.ID
+	} else {
 		finalQueueID = entry.ID
 	}
-	if err := w.deliverDSN(entry.MailFrom, dsnReport, finalQueueID); err != nil {
+	outcome := "failed"
+	if action == "delivered" {
+		outcome = "sent"
+	} else if entry.Status == "cancelled" {
+		outcome = "cancelled"
+	}
+	if err := w.deliverDSN(entry.MailFrom, dsnReport, finalQueueID, delayQueueID, outcome); err != nil {
 		if errors.Is(err, store.ErrDSNAlreadySent) {
-			entry.DSNSent = true
+			if action == "delayed" {
+				entry.DSNDelaySent = true
+			} else {
+				entry.DSNSent = true
+			}
 			return nil
 		}
 		log.Printf("[delivery] failed to deliver DSN to %s: %v", entry.MailFrom, err)
@@ -641,9 +739,6 @@ func (w *Worker) sendRequestedDSN(entry *store.QueueEntry, action, detail string
 	}
 
 	if action == "delayed" {
-		if err := w.db.MarkDSNDelaySent(entry.ID); err != nil {
-			return fmt.Errorf("marking delayed DSN sent: %w", err)
-		}
 		entry.DSNDelaySent = true
 	} else {
 		entry.DSNSent = true
@@ -662,10 +757,13 @@ func dsnNotifyContains(value, wanted string) bool {
 }
 
 // deliverDSN stores a DSN report message in the sender's mailbox.
-func (w *Worker) deliverDSN(senderEmail string, dsnReport string, finalQueueID int64) error {
-	account, err := w.db.GetAccountByEmail(senderEmail)
-	if err != nil || account == nil {
-		return fmt.Errorf("account not found for DSN: %s", senderEmail)
+func (w *Worker) deliverDSN(senderEmail string, dsnReport string, finalQueueID, delayQueueID int64, outcome string) error {
+	account, err := w.db.GetDeliveryAccount(senderEmail)
+	if err != nil {
+		return fmt.Errorf("resolving DSN destination %s: %w", senderEmail, err)
+	}
+	if account == nil || !account.IsActive {
+		return fmt.Errorf("active mailbox not found for DSN: %s", senderEmail)
 	}
 
 	// Parse DSN as an inbound message
@@ -720,7 +818,9 @@ func (w *Worker) deliverDSN(senderEmail string, dsnReport string, finalQueueID i
 	msg.FolderID = &inboxFolder.ID
 
 	if finalQueueID != 0 {
-		_, err = w.db.SaveFinalDSNMessage(msg, finalQueueID)
+		_, err = w.db.SaveFinalDSNMessage(msg, finalQueueID, outcome)
+	} else if delayQueueID != 0 {
+		_, err = w.db.SaveDelayDSNMessage(msg, delayQueueID)
 	} else {
 		_, err = w.db.SaveMessage(msg)
 	}

@@ -60,6 +60,66 @@ func TestSubmissionHELODoesNotNegotiateExtensions(t *testing.T) {
 	}
 }
 
+func TestSubmissionUnknownAndUnimplementedCommands(t *testing.T) {
+	srv := protocolTestServer()
+	server, client := net.Pipe()
+	defer client.Close()
+	go srv.handleSubmission(server)
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReader(client)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct{ command, prefix string }{
+		{"XUNKNOWN\r\n", "500 "},
+		{"VRFY user@example.test\r\n", "502 "},
+		{"EXPN list\r\n", "502 "},
+		{"HELP\r\n", "502 "},
+		{"NOOP\r\n", "250 "},
+		{"QUIT\r\n", "221 "},
+	} {
+		if _, err := fmt.Fprint(client, step.command); err != nil {
+			t.Fatal(err)
+		}
+		response, err := reader.ReadString('\n')
+		if err != nil || !strings.HasPrefix(response, step.prefix) {
+			t.Fatalf("%q: response=%q err=%v; want prefix %q", step.command, response, err, step.prefix)
+		}
+	}
+}
+
+func TestSubmissionDataTransparency(t *testing.T) {
+	srv := protocolTestServer()
+	srv.cfg.SMTP.MaxMessageSize = 1024
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p := &submissionSession{server: srv, conn: server, reader: bufio.NewReader(server)}
+	result := make(chan struct {
+		message []byte
+		err     error
+	}, 1)
+	go func() {
+		message, err := p.readData()
+		result <- struct {
+			message []byte
+			err     error
+		}{message, err}
+	}()
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := fmt.Fprint(client, "Subject: test\r\n\r\n.single\r\n..stuffed\r\n.\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := <-result
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	want := "Subject: test\r\n\r\nsingle\r\n.stuffed\r\n"
+	if string(got.message) != want {
+		t.Fatalf("DATA=%q; want %q", got.message, want)
+	}
+}
+
 func TestSubmissionHELORejectsMailParameters(t *testing.T) {
 	srv := protocolTestServer()
 	server, client := net.Pipe()

@@ -21,6 +21,7 @@ import (
 	"gomail/logging"
 	"gomail/metrics"
 	"gomail/security"
+	"gomail/smtp"
 	"gomail/store"
 )
 
@@ -142,8 +143,10 @@ func (s *Server) handleSubmission(conn net.Conn) {
 			}
 			p.reply(221, "Bye")
 			return
-		default:
+		case "VRFY", "EXPN", "HELP":
 			p.reply(502, "Command not implemented")
+		default:
+			p.reply(500, "Command not recognized")
 		}
 	}
 }
@@ -447,7 +450,8 @@ func (p *submissionSession) handleRCPT(argument string) {
 			return
 		}
 	}
-	if _, err := mail.ParseAddress(address); err != nil {
+	parsedAddress, err := mail.ParseAddress(address)
+	if err != nil || parsedAddress.Address != address {
 		p.reply(553, "Invalid recipient address")
 		return
 	}
@@ -615,6 +619,8 @@ func (p *submissionSession) handleDATA() {
 		if errors.Is(err, store.ErrOutboundLimit) {
 			metrics.IncOutboundLimit("submission")
 			p.reply(452, "4.7.0 Outbound account limit exceeded; try again later")
+		} else if errors.Is(err, store.ErrSenderUnavailable) {
+			p.reply(550, "5.7.1 Sender account or domain is no longer active")
 		} else if errors.Is(err, store.ErrDiskPressure) {
 			p.reply(452, "4.3.1 Insufficient system storage")
 		} else if errors.Is(err, store.ErrQuotaExceeded) {
@@ -653,7 +659,9 @@ func (p *submissionSession) readData() ([]byte, error) {
 		if len(line) > 1000 && !(strings.HasPrefix(line, "..") && len(line) == 1001) {
 			return nil, fmt.Errorf("%w: DATA line exceeds 1000 octets", security.ErrLineTooLong)
 		}
-		if strings.HasPrefix(line, "..") {
+		// RFC 5321 §4.5.2 removes the first dot from every non-terminating
+		// DATA line that begins with a dot, even if the sender omitted stuffing.
+		if strings.HasPrefix(line, ".") {
 			line = line[1:]
 		}
 		// Preserve canonical DATA octets; mutating message text can break a
@@ -692,6 +700,9 @@ func validateSubmissionEncoding(raw []byte, bodyMode string) error {
 			return fmt.Errorf("SMTPUTF8 is required for UTF-8 message headers")
 		}
 	}
+	if smtp.MessageRequiresSMTPUTF8(raw) {
+		return fmt.Errorf("SMTPUTF8 is required for UTF-8 MIME or attached-message headers")
+	}
 	for _, b := range raw[boundary+4:] {
 		if b >= 0x80 && bodyMode != "8BITMIME" {
 			return fmt.Errorf("BODY=8BITMIME is required for 8-bit content")
@@ -728,8 +739,8 @@ func parsePath(argument, prefix string) (string, string, bool) {
 	if end < 0 {
 		return "", "", false
 	}
-	address := strings.TrimSpace(trimmed[start:end])
-	if address == "" || strings.ContainsAny(address, "\r\n") {
+	address := trimmed[start:end]
+	if address == "" || address != strings.TrimSpace(address) || strings.ContainsAny(address, "\r\n") {
 		return "", "", false
 	}
 	if end+1 < len(trimmed) && trimmed[end+1] != ' ' {

@@ -1,5 +1,144 @@
 # Open work and completed history
 
+Current open work is consolidated under **Open verification and design work**
+below. Later milestone sections retain historical implementation notes and may
+repeat the corresponding deployment or interoperability checks; they are not
+additional independent bugs. Optional future features are separate from
+production-readiness issues.
+
+## Fixed backup archive collision finding (2026-11-18)
+
+- Two manual backup runs in the same second previously chose the same output
+  path. When the second run found the first archive already present, its error
+  cleanup deleted that valid archive. Failed runs no longer remove the output
+  path, names include nanoseconds, and final publication uses an atomic
+  no-replace hard link so concurrent runs cannot overwrite one another.
+  A regression makes two runs choose the same timestamp and verifies the
+  original archive remains byte-identical and verifiable.
+- Automatic retention now matches only GoMail's old and current timestamped
+  scheduler filenames. The former broad `gomail-*.tar.gz` match could delete
+  a `gomail-pre-restore-*` safety archive or an operator-named backup when
+  stored in the same directory. A regression keeps both while pruning an old
+  scheduler archive.
+
+## Fixed SQLite restore compatibility finding (2026-11-17)
+
+- Staged SQLite restore now checks that the restored schema contains the core
+  columns needed for authentication, mailbox access, attachment serving, and
+  queued delivery. Integrity checks and matching table counts alone could
+  accept an incompatible snapshot. Regressions reject a missing login column
+  and accept the current live schema. It also requires full, non-partial unique
+  indexes on hosted domain and account email identities; composite-only or
+  absent uniqueness is rejected before activation. Full schema-version migration and a
+  real operator restore drill remain separate verification work.
+
+## Fixed SQLite restore relationship finding (2026-11-18)
+
+- A restored SQLite database can pass `foreign_key_check` when the relevant
+  foreign-key rules were removed entirely. Restore now requires the core
+  account-domain, message-account, attachment-message, queue-message, and
+  queue-event relationships before activating the snapshot. Regressions
+  reject a missing account-domain rule and accept the current schema.
+
+## Fixed permanent-delete integrity finding (2026-11-17)
+
+- Permanent Trash deletion now checks for cursor iteration errors while
+  collecting attachment paths and IMAP expunge state before committing the
+  deletion. A failed read can no longer silently produce incomplete cleanup
+  metadata. Post-commit attachment removal errors are logged so orphaned
+  private files are visible to operators rather than silently retained.
+
+## Fixed final-DSN retry finding (2026-11-17)
+
+- Administrator-cancelled outbound entries already requested a failure notice,
+  but a temporary failure delivering that notice did not advance its retry
+  clock. The final-DSN retry update now includes administrator cancellations
+  without admitting other cancelled outcomes. A regression verifies deferred
+  retry, recovery, and exactly one delivered notice.
+
+## Fixed attachment recovery finding (2026-11-17)
+
+- Inbound, sent, and IMAP-APPEND attachment writes now include a random
+  filename suffix. An interrupted transaction can leave an unreferenced file
+  while its rolled-back message ID is later reused; the new delivery no longer
+  collides with that file. A store regression simulates an old-format orphan.
+- Attachment sidecars now include a random filename suffix. If the server
+  crashes after writing a sidecar but before committing its metadata, a later
+  repair can write a fresh copy from the preserved raw MIME without trusting
+  or overwriting the orphaned file. Repair also verifies message ownership
+  before treating existing attachment metadata as success. A regression
+  simulates the interrupted-commit sidecar.
+- A message view now checks the complete attachment set, including recorded
+  file type and size. Missing files or partial metadata trigger an atomic
+  rebuild from the preserved raw MIME; failed rebuilds retain the prior
+  metadata. Regression tests cover missing sidecars and incomplete rows.
+  Old orphaned sidecars are not deleted automatically because damaged metadata
+  cannot safely establish whether another message references a path.
+- Attachment downloads now reject sidecars whose current file size differs
+  from the saved metadata, rather than returning truncated or expanded bytes
+  as a successful download. A web regression covers a truncated sidecar.
+
+## Fixed mailbox counter durability finding (2026-11-17)
+
+- POP3 deletion now moves Inbox mail to Trash and updates both folder counts
+  in one transaction. Sent-copy creation, requested DSN mailbox notices, and
+  permanent draft deletion also update their folder counts before commit.
+  Best-effort post-commit counter writes were removed. Regressions inject
+  count-update failures into POP3, Sent, and draft flows and verify rollback.
+- Inbound SMTP and queued local delivery now recalculate the affected
+  account's folder counters inside the same transaction that saves the
+  mailbox copy, attachments, and queue outcome. A counter-write failure
+  rolls the delivery back instead of leaving a committed message with stale
+  Inbox counts. The post-commit best-effort updates were removed, and a
+  fault-injection regression covers rollback and successful retry.
+
+## Fixed local-delivery review finding (2026-11-16)
+
+- Delayed-delivery DSNs now save the sender's mailbox notice and mark the
+  corresponding queue notice sent in one transaction. A failed commit leaves
+  both unchanged, and retries cannot create a duplicate notice. Regression
+  coverage injects a mailbox write failure and verifies idempotent retry.
+- Outbound SMTP now declares exact RFC 1870 `SIZE` on `MAIL FROM` when the
+  remote server advertises it, including the CRLF added before DATA's dot
+  terminator when needed. A wire-level regression verifies both forms, so
+  remote size limits can reject before the message body is transmitted.
+- Mailbox storage reservations now require both an active account and an
+  active hosted domain at commit time. This closes the gap where a domain
+  disabled after SMTP recipient acceptance could still receive a stored copy;
+  a regression verifies rejection without increasing mailbox usage.
+- A queued message for a hosted domain disabled after admission now fails
+  locally instead of being placed in an active mailbox or routed to an
+  external MX. The worker checks the domain state immediately before local
+  delivery; regressions cover the disabled-domain transition.
+- Queued local delivery now stores the mailbox copy, decoded attachments,
+  IMAP state, queue success state, and delivery event in one database
+  transaction. A crash cannot leave a saved mailbox copy behind a still-
+  sending queue entry, and reuse of the same claim cannot create a duplicate.
+  A regression verifies the queue state and exactly one mailbox copy.
+- SMTPUTF8 recipients using a Unicode U-label for a hosted internationalized
+  domain now resolve to the configured DNS A-label before local-domain,
+  duplicate-recipient, alias, and mailbox checks. Queued local delivery uses
+  the same canonical domain, so it cannot accidentally route that mailbox to
+  external MX hosts. SMTP and queue regressions cover both paths.
+- Queued mail for a local account disabled after enqueue now fails once with
+  a permanent mailbox-unavailable result instead of retrying until queue
+  exhaustion. A regression covers the inactive-recipient transition.
+- Stale outbound queue claims are now checked every five minutes while the
+  server remains running, not only at startup. They become uncertain for
+  operator review and are never automatically resent; a scheduler regression
+  covers quarantine without requeue.
+- Internationalized DSNs now use RFC 6533 global delivery-status and returned
+  message/header media types when UTF-8 fields require them. Final recipients
+  retain the UTF-8 address type, and the DSN parser accepts the global part.
+- Outbound SMTP now sends Unicode-only envelope domains as IDNA A-labels,
+  allowing an ASCII local part and ASCII message headers to reach legacy peers
+  without SMTPUTF8. UTF-8 local parts or headers still require SMTPUTF8;
+  ORCPT retains the original Unicode address in RFC 6533-safe encoding.
+- Webmail compose and forward now emit IDNA A-labels in To/Cc and single-
+  recipient Received trace fields for ASCII local parts, before queue signing.
+  This lets those ordinary messages use the compatible envelope path; UTF-8
+  local parts remain unchanged.
+
 ## Fixed protocol review findings (2026-10-21)
 
 34. Submission closes an oversized DATA connection if draining fails before
@@ -28,10 +167,12 @@
   require end-to-end testing with external providers. A configured local
   recipient is checked for existence and active status, but GoMail cannot
   prove that external senders will deliver reports until DNS is published.
-- DMARC `ri` requests shorter than one day remain a best-effort enhancement;
-  scheduled aggregate reports now meet the required daily cadence.
 
 ## Fixed report-generation review findings (2026-10-24)
+
+The former DMARC `ri` interval tag was removed by RFC 9989. GoMail's daily
+aggregate scheduler meets its at-least-daily recommendation; subdaily `ri`
+scheduling is not a current-standard gap.
 
 1. TLS-RPT ignores a DNS RRset with multiple matching policy records instead
    of combining destinations from conflicting records.
@@ -267,20 +408,173 @@ warns that expired mappings lose late-bounce attribution.
 
 ## Open verification and design work
 
-- Run an isolated MySQL backup/restore round trip with a test-only MySQL user
-  permitted to create and drop disposable databases. The opt-in test is
-  `GOMAIL_TEST_MYSQL_CONFIG=/absolute/path/to/config.local.json go test ./backup -run TestMySQLBackupRestoreIsolatedRoundTrip -count=1`.
+SQLite restore now checkpoints the active database's WAL and refuses a busy
+checkpoint before deleting old `-wal`/`-shm` files. If replacement of the
+database file then fails, the original file still contains its committed
+transactions rather than depending on a WAL that restore already removed.
+A regression reopens the original database after simulated sidecar removal.
+
+POP3 `RETR` and `TOP` now recheck that a snapshot message is still inbound
+Inbox mail before returning its body. If webmail or IMAP moved it meanwhile,
+the read fails rather than exposing mail outside the POP3 maildrop; QUIT's
+existing atomic delete check also rejects the stale selection. GoMail's POP3
+lock still excludes only other POP3 sessions, not concurrent webmail/IMAP
+mutations. A shared cross-protocol maildrop-lock design remains open for
+strict RFC 1939 snapshot semantics.
+
+Final delivery-status notices now resolve local virtual addresses, including
+an administrator-configured `postmaster@domain` alias, before saving to the
+target mailbox. Previously a failed system TLS report could leave its failure
+notice retrying indefinitely because DSN delivery looked up only real login
+accounts. A regression verifies one notice and a durable sent marker.
+
+IMAP expunge now checks attachment-path iteration errors before committing a
+deletion. An incomplete read can no longer silently omit sidecar cleanup
+paths; post-commit removal failures are logged for operator investigation.
+
+Attachment downloads now carry a restrictive sandbox CSP in addition to
+`Content-Disposition: attachment`, so an HTML attachment remains isolated if a
+browser renders it despite the download directive. Webmail view and compose
+logs no longer record message subjects or MDN destination addresses.
+Inbound SMTP and local-delivery logs now also omit sender-controlled subjects
+and Message-ID values while retaining internal delivery IDs and results.
+
+Attachment creation now syncs both file contents and the containing directory
+before the database can commit a mailbox reference. A sync failure removes the
+new file and rejects the delivery, rather than acknowledging mail with a
+database row that could outlive its attachment after a crash. The obsolete
+webmail helper that wrote world-readable attachment files outside the active
+transactional path has been removed; all active attachment writes use the
+durable, exclusive-creation helper. A fault-injection regression covers
+directory-sync failure cleanup.
+
+Administrator cancellation of an accepted pending delivery now remains
+eligible for a failure DSN and is protected from completed-queue cleanup until
+that notice is saved. Automatic cancellation when sender authority disappears
+is still excluded, avoiding an undeliverable notice retry loop. Store and
+delivery regressions verify one notice and safe cleanup afterward.
+
+Completed-queue retention now uses the same failure-DSN default as the retry
+scanner: an empty `NOTIFY` still requires a failure notice. Such rows stay
+until the notice is committed; null-sender rows, which cannot receive DSNs,
+remain eligible for normal cleanup. Regression tests cover both cases.
+
+Final DSN persistence now requires the queue's current terminal outcome to
+match the report being saved. A stale success or failure report built before an
+operator retry/outcome change cannot mark the queue notified or insert an
+incorrect mailbox notice; regression coverage verifies this race boundary.
+
+SMTPUTF8 capability checks now inspect nested MIME part headers and attached
+message headers, as required by RFC 6531. Encoded attached messages and normal
+8-bit body text do not spuriously require SMTPUTF8. The inspection is bounded,
+uses raw MIME parts, and conservatively requires SMTPUTF8 when malformed or
+excessively nested MIME cannot be fully inspected. MIME body inspection now
+streams without a 32 MiB size cutoff, so large ASCII attachments are not
+rejected by legacy peers; regressions also check a UTF-8 header after a large
+body part. The depth and part-count limits remain fail-safe.
+Authenticated submission now uses that same MIME-level check before accepting
+DATA. Its listener does not advertise SMTPUTF8, so nested UTF-8 MIME or
+attached-message headers are rejected at submission instead of creating a
+queued message that cannot be relayed to a legacy peer.
+
+Outbound SMTP now accepts the RFC 5321 `252` positive RCPT reply and any well-formed `2yz` DATA completion reply. This removes a provider interoperability failure where GoMail could treat an accepted recipient or message as rejected. Loopback regression coverage is included; live provider testing remains open.
+Outbound DSN `NOTIFY` and `RET` queue metadata is now checked against RFC 3461's permitted tokens both at authenticated-submission admission and before SMTP command construction. Malformed persisted values fail permanently before networking instead of becoming SMTP command text.
+Outbound SMTP command writes now reject embedded control bytes (including CR/LF) before touching the connection, covering configuration-derived EHLO names as well as stored envelope metadata. Invalid envelope control bytes are classified as permanent address failures rather than retrying an undeliverable queued entry.
+Queued delivery now treats a configured but disabled recipient domain as local. Previously the active-domain-only routing check could classify it as remote and attempt MX delivery, potentially disclosing a queued message outside the server. The disabled local mailbox instead fails locally; regression coverage checks both the hosted and genuinely remote cases.
+Domain deletion now refuses to remove a hosted routing record while pending, sending, or uncertain queue entries target that domain (including IDN U-label recipients). The admin receives a conflict response directing them to resolve the queue first; terminal entries do not block deletion. Queue entries now also persist whether the recipient domain was hosted at enqueue time, and workers honor that marker even if a concurrent or out-of-band deletion removes the domain. SQLite and MySQL schemas include the marker; an additive, bounded startup migration backfills existing queue entries against currently configured domains. Entries queued before an earlier domain deletion cannot be reconstructed retroactively.
+Inbound DATA now returns `552 5.3.4` when a line crosses the configured message-size bound before its CRLF arrives, then closes the transaction. Previously this path closed silently, leaving the sender with an ambiguous disconnect instead of the permanent size failure described by RFC 1870. A loopback regression checks the reply and discarded partial message.
+Inbound DATA now also rejects an embedded bare carriage return with `554 5.6.0`, matching the already strict submission path; the regression verifies that malformed message bytes cannot be accepted as a valid CRLF-framed line.
+Inbound connection throttling, connection-capacity rejection, and domain-list lookup failure now return a bounded `421` temporary SMTP greeting before closing. Previously all three paths silently closed the socket, making retry behavior less clear to sending peers. The opening reply has a regression test.
+Generated DSN envelope IDs are now bounded even when a valid Message-ID is long; malformed or overlong persisted ENVID/ORCPT metadata is rejected before DNS or SMTP transport. Authenticated-submission queue admission also checks ENVID, so an invalid report identifier cannot create a stuck delivery.
+Configuration loading now checks `server.hostname` as a syntactically valid SMTP DNS hostname, with `localhost` reserved for local development. This catches malformed EHLO/HELO identity before listeners start; public A/AAAA and PTR alignment still need deployment verification.
+
+RFC 8460 TLS-RPT email now uses a durable system-only queue marker and
+opportunistic delivery that does not enforce destination MTA-STS/DANE. A failed
+STARTTLS handshake reconnects on a fresh socket before a plaintext retry;
+ordinary mail retains its TLS policies. Live-domain behavior still needs
+interoperability testing.
+
 - Run live SMTP/DSN/ARC intermediary interoperability and external mail-client
   matrices on a real domain. These cannot be established by local fixtures.
-- Expand independent final-RFC ARC validation vectors beyond the current
-  one- and two-hop dkimpy fixtures; verify live intermediary behavior.
-- Run the WebKit interaction/accessibility suite in CI or on a host with
-  `libwoff1` and `libavif16`. Local Chromium and Firefox suites passed.
+- Continue adding external ARC vectors as available and verify live
+  intermediary behavior on a real domain. Local one-, two-, and three-hop
+  independent dkimpy fixtures pass, including a tampered middle hop.
+- Run the three-engine browser suite in CI. All 15 local Chromium, Firefox,
+  and WebKit tests passed after correcting a stale outbound-limits test locator;
+  CI remains the cross-host check.
 - Copy verified backups to encrypted off-host storage and perform an operator
   restore drill. Local scheduling alone does not cover host loss.
-- Design a staged-database MySQL restore so database import and filesystem
-  activation cannot leave a mixed state. This needs suitable CREATE/DROP
-  privileges and an isolated drill.
+  Automatic scheduling now treats a future-dated last-success timestamp as due
+  immediately, so a backward clock correction cannot pause backups until that
+  timestamp; scheduler settings-read failures are logged instead of silently
+  disabling backup attempts.
+- Complete and drill the staged-database MySQL restore described in
+  `docs/mysql_staged_restore.md`. An opt-in path now imports into a distinct
+  pre-provisioned empty database, verifies manifest table counts and attachment
+  references, and switches the configuration while retaining the old database
+  and previous attachment/ACME directory generations.
+  The fail-closed restore marker now records each completed phase for diagnosis.
+  Final-phase startup completion also re-verifies the pre-restore safety archive before clearing the marker; a merely present but corrupt fallback no longer counts as recoverable.
+  Full schema compatibility checks, phase-aware rollback and intermediate-phase crash recovery remain. Restores now check SQLite integrity and foreign keys, require counted objects to be real tables, require core MySQL authentication/mailbox/queue columns with their expected data types, require full-column unique MySQL indexes on domain and account email identities, require seven core MySQL mail-store foreign keys with their delete rules, and check installed MySQL single-column foreign keys for orphaned rows; startup also checks active attachment hashes before clearing a final durable marker. Earlier or unverifiable phases still block startup. The staged database switch is implemented but is not atomic with filesystem swaps because
+  MySQL and filesystem swaps are not one transaction. The current `gomailtest` grant cannot create a second database;
+  use separate disposable test grants or pre-provisioned databases for the
+  switch/crash tests. The existing restore still needs manual safety-archive
+  recovery after a partial import or activation failure; its marker deliberately
+  blocks startup until the operator verifies recovery.
+
+  Durable-marker startup verification now also hashes restored ACME files and
+  manual TLS certificate/key files against the archive, and checks the exact
+  restored SQLite configuration. A corrupt credential file or changed config
+  leaves the marker in place instead of starting a mixed generation. MySQL
+  intentionally rewrites destination fields in its config. The marker now
+  records the exact hash of that staged, rewritten config and verifies it
+  before startup clears the marker. Older markers without this hash retain
+  the previous checks. Real staged-database activation still needs an
+  isolated restore drill.
+
+  Restore now stages and swaps an empty ACME directory when the destination
+  has one, so old account keys or certificates cannot survive a restore whose
+  archive contains no ACME files. An archive with ACME files and no configured
+  destination is rejected before any live data changes. Durable-marker startup
+  verification now also checks that the active ACME tree contains no extra
+  credential files or symlinks absent from the archive; a mismatch keeps the
+  recovery marker in place.
+
+The standalone backup verifier now applies the same regular-file and canonical, local-path rules as extraction; an archive that restore would reject can no longer be reported as verified.
+Backup creation and admin backup-directory settings now also resolve symlinks
+before checking that the output is outside the database, configuration,
+attachment, and ACME paths. A symlinked directory into the attachment tree is
+rejected before an archive can copy itself or become mailbox state.
+Backup source collection now rejects symlinked tree roots and non-regular tree entries, and opens files nonblocking before checking their type. A FIFO or device in the attachment/ACME tree or a credential path can no longer stall an online backup indefinitely. Regular TLS certificate/key symlinks to files remain supported.
+Backup creation now checks that every database attachment reference points to a regular file of the recorded size before publishing an archive. SQLite uses the captured database snapshot; MySQL checks the live database after its transactional dump, so concurrent same-count MySQL changes and filesystem races still require operational quieting or an isolated restore drill.
+
+The restore guard now applies to SQLite as well as MySQL. SQLite restores
+also retain a verified pre-restore safety archive before
+replacing the old database, so a later filesystem failure has a recovery source.
+The MySQL instance
+lock was moved outside the attachment tree so replacing that tree cannot
+silently create a new lock identity; the previous lock remains honored during
+upgrades. SQLite and opt-in staged MySQL restores also verify manifest row
+counts and every attachment path/size against staged files before activation. In-place
+MySQL restore now verifies the imported database too; new backups count all
+persisted tables, while older six-count manifests remain restorable. An import mismatch leaves
+the incomplete-restore marker in place instead of activating the file tree.
+
+Account creation and edits now enforce at the storage boundary that the email
+address belongs to its selected hosted domain, even when a caller bypasses the
+admin form. Staged backup verification rejects accounts whose addresses do not
+match their hosted domain before activation. This closes a routing/policy split
+that row counts and foreign-key checks cannot detect.
+Restore verification also rejects hosted domains or account addresses that
+differ only by case, because GoMail resolves both identities case-insensitively
+even when a restored database's unique index uses a binary collation.
+Both SQLite and MySQL staged-restore checks now verify the core foreign-key
+delete actions as well as their targets. In particular, the outbound queue's
+message reference must use `ON DELETE SET NULL`; a restored cascade would
+otherwise erase pending delivery when its Sent copy is removed.
+Folder ownership and message-folder relationships are also required, including
+`ON DELETE SET NULL` for `messages.folder_id`, so deleting a mailbox cannot
+silently cascade-delete its messages after a malformed restore.
 
 ## Completed work and historical milestones
 
@@ -288,7 +582,27 @@ The sections below preserve implementation history and earlier milestone
 checklists. They are not the authoritative open-issue list; actionable work is
 listed only in the two open sections above.
 
-- ARC validation covers independent dkimpy one- and two-hop final-RFC fixtures,
+- Inbound SMTP now returns temporary `451 4.3.0` when its domain-policy or
+  enabled-greylisting database lookup fails at RCPT, instead of accepting the
+  recipient while bypassing that policy. A forced greylisting-table failure
+  regression verifies the recipient is not added to the transaction.
+
+- On 2026-11-13, the MySQL backup/restore round-trip test passed against the
+  dedicated, initially empty `gomailtest` database. It verified the archive,
+  attachment and queue-history restoration, and removal of a database change
+  made after the backup. The test cleans its tables afterward; the configured
+  `gomail` database was not touched. The existing two-disposable-database
+  variant remains available when the test user has database-creation rights.
+  The MySQL storage integration test also passed against `gomailtest`; its
+  test-created schema was removed afterward, leaving the database empty.
+- MySQL restore now keeps the selected destination database connection and
+  runtime storage/TLS/DKIM paths in the installed configuration rather than
+  switching back to source-host paths from the archive. The fixed-database
+  round trip verifies those settings after restore. This does not make the
+  database import and filesystem activation atomic; staged restore remains
+  open above.
+
+- ARC validation covers independent dkimpy one-, two-, and three-hop final-RFC fixtures,
   historical AMS body modification, malformed/ambiguous tags, and chain-status
   transitions. Chromium and Firefox interaction/accessibility suites passed
   locally on 2026-10-20.
@@ -466,8 +780,9 @@ synchronization state.
   endpoints. They accept configured local domains and advertise only services
   enabled behind the master switch with certificate-backed TLS configuration;
   disabled services and plaintext deployments return no discovery document.
-- Publish/document SRV records and Apple/mobile manual profiles only after the
-  corresponding listener is operational.
+- SRV and client-discovery DNS examples are documented in `docs/dns_records.md`.
+  Publishing is an operator deployment step, only for enabled and tested
+  listeners; live Apple/mobile profile checks remain open.
 - Run Thunderbird, Outlook, Apple Mail, iOS and Android interoperability
   matrices for IMAP, POP3 and submission on the real server. Test initial sync,
   large folders, reconnect, IDLE, moves, drafts, Sent, Trash and deletion.
@@ -665,6 +980,16 @@ synchronization state.
   only original headers even when `RET=FULL` was requested.
 - Incoming success and delay DSNs are retained for the recipient instead of
   being discarded or recorded as permanent bounces.
+
+## Completed submission authority follow-up (2026-11-20)
+
+- Outbound queue creation now rechecks the sending account and hosted domain
+  inside the same transaction that stores the Sent copy and queue entries.
+  MySQL locks those rows until commit so a concurrent admin disable cannot
+  slip between authorization and acceptance; SMTP submission returns a
+  permanent authorization error instead of accepting a message it cannot queue.
+- SQLite regression tests cover disabled/deleted accounts and disabled domains,
+  and verify that rejected submissions leave no Sent copy or queue entry.
 
 ## Optional future features
 

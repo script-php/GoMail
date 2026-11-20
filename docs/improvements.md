@@ -53,8 +53,8 @@
 
 ## Remaining
 
-- Expand the independent final-RFC ARC fixtures (currently static one- and
-  two-hop dkimpy-signed messages) and run live intermediary interoperability tests.
+- Continue independent final-RFC ARC vectors beyond the static one-, two-, and
+  three-hop dkimpy-signed messages; run live intermediary interoperability tests.
 - Run live IMAP/POP3/submission client matrices and extended IMAP load/failure
   testing.
 - Run the opt-in isolated MySQL backup/restore test with a suitably privileged

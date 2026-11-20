@@ -1,11 +1,42 @@
 package mta_sts
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestFailedPolicyFetchBackoffByPolicyID(t *testing.T) {
+	ClearPolicyCache()
+	oldLookup, oldFetcher := lookupTXT, policyDocument
+	t.Cleanup(func() {
+		lookupTXT, policyDocument = oldLookup, oldFetcher
+		ClearPolicyCache()
+	})
+	id := "first"
+	lookupTXT = func(string) ([]string, error) { return []string{"v=STSv1; id=" + id}, nil }
+	attempts := 0
+	policyDocument = func(string) (*Policy, error) {
+		attempts++
+		return nil, errors.New("HTTPS unavailable")
+	}
+	if FetchPolicy("example.test") != nil || FetchPolicy("example.test") != nil || attempts != 1 {
+		t.Fatalf("repeated failed fetch for same ID: %d attempts", attempts)
+	}
+	id = "second"
+	if FetchPolicy("example.test") != nil || attempts != 2 {
+		t.Fatalf("new policy ID did not bypass failure backoff: %d attempts", attempts)
+	}
+	cacheMutex.Lock()
+	failedFetches["example.test"] = failedPolicyFetch{policyID: id, retryAt: time.Now().Add(-time.Second)}
+	cacheMutex.Unlock()
+	if FetchPolicy("example.test") != nil || attempts != 3 {
+		t.Fatalf("expired failure backoff did not retry: %d attempts", attempts)
+	}
+}
 
 type policyTransport func(*http.Request) (*http.Response, error)
 
@@ -65,7 +96,7 @@ func TestSTSTXTRecordMustBeUniqueAndValid(t *testing.T) {
 		{"empty id", []string{"v=STSv1; id="}, ""},
 		{"invalid id", []string{"v=STSv1; id=bad value"}, ""},
 		{"long id", []string{"v=STSv1; id=" + strings.Repeat("x", 33)}, ""},
-		{"duplicate id", []string{"v=STSv1; id=one; id=two"}, ""},
+		{"duplicate id keeps first", []string{"v=STSv1; id=one; id=two"}, "one"},
 		{"invalid extension", []string{"v=STSv1; id=one; ext=has=equals"}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

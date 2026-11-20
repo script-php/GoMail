@@ -130,7 +130,7 @@ func TestGenerateTLSReportGroupsPoliciesAndSessions(t *testing.T) {
 		t.Fatal("STS policy group missing")
 	}
 
-	message := BuildTLSRPTEmail("sender.example", "noreply-smtp-tls-reporting@sender.example", report, "reports@example.net")
+	message := BuildTLSRPTEmail("sender.example", "noreply-smtp-tls-reporting@sender.example", "example.net", report, "reports@example.net")
 	for _, want := range []string{"TLS-Report-Domain: example.net", "TLS-Report-Submitter: sender.example",
 		"multipart/report; report-type=\"tlsrpt\"", "application/tlsrpt+gzip", ".json.gz\""} {
 		if !strings.Contains(message, want) {
@@ -181,5 +181,30 @@ func TestGenerateTLSReportGroupsPoliciesAndSessions(t *testing.T) {
 	var attached TLSReport
 	if err := json.NewDecoder(unzipped).Decode(&attached); err != nil || attached.ReportID != report.ReportID {
 		t.Fatalf("report payload=%+v err=%v", attached, err)
+	}
+}
+
+func TestTLSRPTEmailUsesRecipientDomainNotDANEPolicyDomain(t *testing.T) {
+	start := time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC)
+	report := &TLSReport{
+		OrganizationName: "sender.example", ContactInfo: "postmaster@sender.example",
+		ReportID:  "report+receiver.example@sender.example",
+		DateRange: TLSDateRange{StartDatetime: start.Format(time.RFC3339), EndDatetime: start.Add(24 * time.Hour).Format(time.RFC3339)},
+		Policies:  []TLSPolicy{{Policy: TLSPolicyDesc{PolicyType: "tlsa", PolicyDomain: "canonical.mx.example"}}},
+	}
+	message := BuildTLSRPTEmail("sender.example", "reports@sender.example", "receiver.example", report, "rua@receiver.example")
+	parsed, err := mail.ReadMessage(strings.NewReader(message))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Header.Get("TLS-Report-Domain"); got != "receiver.example" {
+		t.Fatalf("TLS-Report-Domain = %q, want recipient domain", got)
+	}
+	if got := parsed.Header.Get("TLS-Report-Submitter"); got != "sender.example" {
+		t.Fatalf("TLS-Report-Submitter = %q", got)
+	}
+	if !strings.Contains(parsed.Header.Get("Subject"), "Report Domain: receiver.example ") ||
+		!strings.Contains(message, "sender.example!receiver.example!") {
+		t.Fatal("subject or attachment filename used the DANE policy domain")
 	}
 }

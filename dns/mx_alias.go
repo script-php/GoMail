@@ -89,10 +89,23 @@ func querySecureMXAddressName(host, server string) (string, bool, error) {
 			if !response.AuthenticatedData {
 				return host, false, nil
 			}
+			aliasCount := 0
+			addressAtCurrent := false
 			for _, answer := range response.Answer {
-				if rr, ok := answer.(*mdns.CNAME); ok && strings.EqualFold(rr.Hdr.Name, current) {
-					next = rr.Target
+				switch rr := answer.(type) {
+				case *mdns.CNAME:
+					if strings.EqualFold(rr.Hdr.Name, current) {
+						next = rr.Target
+						aliasCount++
+					}
+				case *mdns.A:
+					addressAtCurrent = addressAtCurrent || strings.EqualFold(rr.Hdr.Name, current)
+				case *mdns.AAAA:
+					addressAtCurrent = addressAtCurrent || strings.EqualFold(rr.Hdr.Name, current)
 				}
+			}
+			if aliasCount > 1 || aliasCount > 0 && addressAtCurrent {
+				return "", false, fmt.Errorf("contradictory MX address CNAME answer for %s", current)
 			}
 			if next != "" {
 				break

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Policy represents an MTA-STS policy.
@@ -14,6 +15,8 @@ type Policy struct {
 	MXHosts []string
 	MaxAge  int // Seconds
 }
+
+const maxPolicyAgeSeconds = 31557600 // RFC 8461: at most one year.
 
 // DefaultPolicy creates a standard MTA-STS policy for the given domain.
 func DefaultPolicy(hostname string) *Policy {
@@ -50,13 +53,13 @@ func ParsePolicy(text string) (*Policy, error) {
 		switch key {
 		case "version":
 			if seen[key] {
-				return nil, fmt.Errorf("duplicate version field")
+				continue
 			}
 			seen[key] = true
 			policy.Version = value
 		case "mode":
 			if seen[key] {
-				return nil, fmt.Errorf("duplicate mode field")
+				continue
 			}
 			seen[key] = true
 			policy.Mode = value
@@ -67,33 +70,72 @@ func ParsePolicy(text string) (*Policy, error) {
 			policy.MXHosts = append(policy.MXHosts, value)
 		case "max_age":
 			if seen[key] {
-				return nil, fmt.Errorf("duplicate max_age field")
+				continue
 			}
 			seen[key] = true
-			// Parse as int
-			if age, err := strconv.Atoi(value); err == nil && age >= 0 {
+			// RFC 8461 requires 1 to 10 ASCII decimal digits.
+			if len(value) == 0 || len(value) > 10 {
+				return nil, fmt.Errorf("invalid max_age: %s", value)
+			}
+			for i := 0; i < len(value); i++ {
+				if value[i] < '0' || value[i] > '9' {
+					return nil, fmt.Errorf("invalid max_age: %s", value)
+				}
+			}
+			if age, err := strconv.Atoi(value); err == nil && age <= maxPolicyAgeSeconds {
 				policy.MaxAge = age
 			} else {
 				return nil, fmt.Errorf("invalid max_age: %s", value)
 			}
+		default:
+			// Unknown extensions are ignored only when syntactically valid.
+			if !validSTSFieldName(key) || !validPolicyExtensionValue(value) {
+				return nil, fmt.Errorf("invalid policy extension %q", key)
+			}
 		}
 	}
 
-	// Validate required fields
-	if policy.Version != "STSv1" {
-		return nil, fmt.Errorf("unsupported policy version: %s", policy.Version)
-	}
-	if policy.Mode != "enforce" && policy.Mode != "testing" && policy.Mode != "none" {
-		return nil, fmt.Errorf("invalid mode: %s", policy.Mode)
-	}
 	if !seen["max_age"] {
 		return nil, fmt.Errorf("policy has no max_age")
 	}
-	if policy.Mode != "none" && len(policy.MXHosts) == 0 {
-		return nil, fmt.Errorf("policy has no MX hosts")
+	if err := policy.validate(); err != nil {
+		return nil, err
 	}
 
 	return policy, nil
+}
+
+func validPolicyExtensionValue(value string) bool {
+	if value == "" || !utf8.ValidString(value) || value[0] == ' ' || value[len(value)-1] == ' ' {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < ' ' || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func (policy *Policy) validate() error {
+	if policy.Version != "STSv1" {
+		return fmt.Errorf("unsupported policy version: %s", policy.Version)
+	}
+	if policy.Mode != "enforce" && policy.Mode != "testing" && policy.Mode != "none" {
+		return fmt.Errorf("invalid mode: %s", policy.Mode)
+	}
+	if policy.MaxAge < 0 || policy.MaxAge > maxPolicyAgeSeconds {
+		return fmt.Errorf("invalid max_age: %d", policy.MaxAge)
+	}
+	if policy.Mode != "none" && len(policy.MXHosts) == 0 {
+		return fmt.Errorf("policy has no MX hosts")
+	}
+	for _, host := range policy.MXHosts {
+		if !validMXPattern(host) {
+			return fmt.Errorf("invalid mx pattern %q", host)
+		}
+	}
+	return nil
 }
 
 func validMXPattern(pattern string) bool {

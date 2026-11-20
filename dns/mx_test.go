@@ -55,6 +55,39 @@ func TestAuthenticatedMXRequiresDNSSECThroughCNAME(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedMXRejectsContradictoryCNAMEAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answers []string
+	}{
+		{"CNAME with MX", []string{"example.test. 60 IN CNAME alias.example.test.", "example.test. 60 IN MX 10 mx.example.test."}},
+		{"multiple CNAMEs", []string{"example.test. 60 IN CNAME one.example.test.", "example.test. 60 IN CNAME two.example.test."}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &mdns.Server{PacketConn: packet, Handler: mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
+				response := new(mdns.Msg)
+				response.SetReply(req)
+				response.AuthenticatedData = true
+				for _, text := range tc.answers {
+					rr, _ := mdns.NewRR(text)
+					response.Answer = append(response.Answer, rr)
+				}
+				_ = w.WriteMsg(response)
+			})}
+			go func() { _ = server.ActivateAndServe() }()
+			defer server.Shutdown()
+			_, err = queryAuthenticatedMX("example.test", packet.LocalAddr().String())
+			if err == nil || errors.Is(err, ErrNoMailRoute) || errors.Is(err, ErrNullMX) {
+				t.Fatalf("contradictory CNAME answer was accepted or made permanent: %v", err)
+			}
+		})
+	}
+}
+
 func TestLookupMXImplicitAndNullMX(t *testing.T) {
 	InitCache(60)
 	oldMX, oldHost := lookupMX, lookupHost
@@ -70,6 +103,50 @@ func TestLookupMXImplicitAndNullMX(t *testing.T) {
 	lookupMX = func(string) ([]*net.MX, error) { return []*net.MX{{Host: ".", Pref: 0}}, nil }
 	if _, err := LookupMX("null.example"); !errors.Is(err, ErrNullMX) {
 		t.Fatalf("null MX result: %v", err)
+	}
+}
+
+func TestContradictoryNullMXIsRetryable(t *testing.T) {
+	InitCache(60)
+	oldMX := lookupMX
+	t.Cleanup(func() { lookupMX = oldMX })
+	for _, tc := range []struct {
+		name    string
+		records []*net.MX
+	}{
+		{"mixed", []*net.MX{{Host: ".", Pref: 0}, {Host: "mx.example.test.", Pref: 10}}},
+		{"wrong preference", []*net.MX{{Host: ".", Pref: 10}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookupMX = func(string) ([]*net.MX, error) { return tc.records, nil }
+			_, err := LookupMX(tc.name + ".example.test")
+			if !errors.Is(err, errMalformedNullMX) || errors.Is(err, ErrNullMX) {
+				t.Fatalf("contradictory null MX classified as permanent: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedContradictoryNullMXIsRetryable(t *testing.T) {
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &mdns.Server{PacketConn: packet, Handler: mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
+		response := new(mdns.Msg)
+		response.SetReply(req)
+		response.AuthenticatedData = true
+		for _, text := range []string{"example.test. 60 IN MX 0 .", "example.test. 60 IN MX 10 mx.example.test."} {
+			rr, _ := mdns.NewRR(text)
+			response.Answer = append(response.Answer, rr)
+		}
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = server.ActivateAndServe() }()
+	defer server.Shutdown()
+	_, err = queryAuthenticatedMX("example.test", packet.LocalAddr().String())
+	if !errors.Is(err, errMalformedNullMX) || errors.Is(err, ErrNullMX) {
+		t.Fatalf("authenticated contradictory null MX classified as permanent: %v", err)
 	}
 }
 

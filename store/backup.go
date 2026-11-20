@@ -21,7 +21,7 @@ func (db *DB) SnapshotSQLite(destination string) error {
 
 func (db *DB) BackupCounts() (map[string]int64, error) {
 	result := map[string]int64{}
-	for _, table := range []string{"domains", "accounts", "messages", "attachments", "outbound_queue", "outbound_queue_events"} {
+	for _, table := range backupTables {
 		var count int64
 		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
 			return nil, fmt.Errorf("counting %s: %w", table, err)
@@ -30,3 +30,20 @@ func (db *DB) BackupCounts() (map[string]int64, error) {
 	}
 	return result, nil
 }
+
+// Keep this list in step with the persisted tables in schema.sql and
+// schema_mysql.sql. Archive manifests use these counts to check imports.
+var backupTables = []string{
+	"domains", "accounts", "domain_report_recipients", "smtp_auth_policy",
+	"smtp_user_auth_policy", "smtp_app_passwords", "aliases", "folders",
+	"messages", "imap_mailboxes", "imap_message_state", "imap_keywords",
+	"imap_subscriptions", "imap_expunge_history", "attachments", "outbound_queue",
+	"outbound_queue_events", "outbound_queue_retention", "issued_verp", "sessions",
+	"backup_settings", "report_inbox_settings", "received_reports",
+	"report_inbox_failures", "outbound_account_usage", "dmarc_feedback",
+	"dmarc_report_log", "tls_failures", "mta_sts_policy_cache", "greylisting",
+	"tarpitting", "verp_bounces",
+}
+
+// BackupTables returns the allowlisted persisted tables in an archive manifest.
+func BackupTables() []string { return append([]string(nil), backupTables...) }

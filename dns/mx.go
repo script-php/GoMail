@@ -17,6 +17,8 @@ import (
 var ErrNullMX = errors.New("556 5.1.10 recipient domain does not accept mail (null MX)")
 var ErrNoMailRoute = errors.New("550 5.1.2 recipient domain has no MX or address records")
 
+var errMalformedNullMX = errors.New("malformed null MX RRset")
+
 var lookupMX = net.LookupMX
 var lookupHost = net.LookupHost
 
@@ -69,18 +71,19 @@ func LookupMX(domain string) ([]MXRecord, error) {
 		}
 		return nil, fmt.Errorf("%s: %w", domain, ErrNoMailRoute)
 	}
-	for _, mx := range mxRecords {
-		if mx.Host == "." {
-			return nil, ErrNullMX
-		}
-	}
-
 	records := make([]MXRecord, len(mxRecords))
 	for i, mx := range mxRecords {
+		host := mx.Host
+		if host != "." {
+			host = strings.TrimSuffix(host, ".")
+		}
 		records[i] = MXRecord{
-			Host: strings.TrimSuffix(mx.Host, "."),
+			Host: host,
 			Pref: mx.Pref,
 		}
+	}
+	if err := checkNullMX(records); err != nil {
+		return nil, err
 	}
 
 	// Sort by preference (lower = higher priority)
@@ -158,24 +161,33 @@ func queryAuthenticatedMX(domain, server string) ([]MXRecord, error) {
 		}
 		var records []MXRecord
 		var alias string
+		aliasCount := 0
 		for _, answer := range response.Answer {
 			switch rr := answer.(type) {
 			case *mdns.MX:
 				if strings.EqualFold(rr.Hdr.Name, name) {
-					if rr.Mx == "." {
-						return nil, ErrNullMX
+					host := rr.Mx
+					if host != "." {
+						host = strings.TrimSuffix(host, ".")
 					}
-					records = append(records, MXRecord{Host: strings.TrimSuffix(rr.Mx, "."), Pref: rr.Preference})
+					records = append(records, MXRecord{Host: host, Pref: rr.Preference})
 				}
 			case *mdns.CNAME:
 				if strings.EqualFold(rr.Hdr.Name, name) {
 					alias = strings.ToLower(rr.Target)
+					aliasCount++
 				}
 			}
+		}
+		if aliasCount > 1 || aliasCount > 0 && len(records) > 0 {
+			return nil, fmt.Errorf("contradictory MX/CNAME answer for %s", name)
 		}
 		if alias != "" {
 			name = alias
 			continue
+		}
+		if err := checkNullMX(records); err != nil {
+			return nil, err
 		}
 		if len(records) == 0 {
 			if _, secure, err := querySecureMXAddressName(strings.TrimSuffix(name, "."), server); err != nil {
@@ -193,6 +205,21 @@ func queryAuthenticatedMX(domain, server string) ([]MXRecord, error) {
 		return records, nil
 	}
 	return nil, fmt.Errorf("MX CNAME chain too long for %s", domain)
+}
+
+// A null MX is an unambiguous no-service declaration only when it is the
+// sole MX record and has preference zero (RFC 7505). A contradictory RRset
+// must not turn into a permanent non-delivery decision.
+func checkNullMX(records []MXRecord) error {
+	for _, record := range records {
+		if record.Host == "." {
+			if len(records) == 1 && record.Pref == 0 {
+				return ErrNullMX
+			}
+			return errMalformedNullMX
+		}
+	}
+	return nil
 }
 
 // shuffleMXPreferences spreads deliveries over equal-priority hosts while

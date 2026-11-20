@@ -14,7 +14,13 @@ import (
 func RemoveExternalAuthenticationResults(raw []byte) ([]byte, error) {
 	boundary := bytes.Index(raw, []byte("\r\n\r\n"))
 	if boundary < 0 {
-		return nil, fmt.Errorf("message has no header/body separator")
+		// A body is optional. Normalize a header-only message to an empty
+		// body after removing untrusted fields so later header edits can use
+		// the usual separator without changing the signed input beforehand.
+		if !bytes.HasSuffix(raw, []byte("\r\n")) {
+			return nil, fmt.Errorf("unterminated header-only message")
+		}
+		boundary = len(raw)
 	}
 	var result bytes.Buffer
 	lines := bytes.Split(raw[:boundary], []byte("\r\n"))
@@ -33,7 +39,9 @@ func RemoveExternalAuthenticationResults(raw []byte) ([]byte, error) {
 		}
 	}
 	result.WriteString("\r\n")
-	result.Write(raw[boundary+4:])
+	if boundary < len(raw) {
+		result.Write(raw[boundary+4:])
+	}
 	return result.Bytes(), nil
 }
 
@@ -42,7 +50,10 @@ func RemoveExternalAuthenticationResults(raw []byte) ([]byte, error) {
 func FinalDeliveryReturnPath(raw []byte, mailFrom string) ([]byte, error) {
 	boundary := bytes.Index(raw, []byte("\r\n\r\n"))
 	if boundary < 0 {
-		return nil, fmt.Errorf("message has no header/body separator")
+		if !bytes.HasSuffix(raw, []byte("\r\n")) {
+			return nil, fmt.Errorf("unterminated header-only message")
+		}
+		boundary = len(raw)
 	}
 	var result bytes.Buffer
 	path := "<>"
@@ -71,7 +82,9 @@ func FinalDeliveryReturnPath(raw []byte, mailFrom string) ([]byte, error) {
 		}
 	}
 	result.WriteString("\r\n")
-	result.Write(raw[boundary+4:])
+	if boundary < len(raw) {
+		result.Write(raw[boundary+4:])
+	}
 	return result.Bytes(), nil
 }
 

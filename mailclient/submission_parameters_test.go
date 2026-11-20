@@ -91,6 +91,34 @@ func TestSubmissionRejectsInternationalizedRecipientWithoutSMTPUTF8(t *testing.T
 	}
 }
 
+func TestSubmissionRejectsHeaderStyleEnvelopeRecipient(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "mail.db"), filepath.Join(t.TempDir(), "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p := &submissionSession{server: &Server{db: db, cfg: &config.Config{SMTP: config.SMTPConfig{MaxRecipients: 10}, Clients: config.MailClientsConfig{WriteTimeout: 5}}}, conn: server, writer: bufio.NewWriter(server), mailFrom: "alice@example.test", greeted: true, ehlo: true}
+	for _, tc := range []struct{ command, prefix string }{
+		{"TO:<bob@example.net (comment)>", "553 "},
+		{"TO:< bob@example.net >", "501 "},
+	} {
+		done := make(chan struct{})
+		go func() { p.handleRCPT(tc.command); close(done) }()
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		line, err := bufio.NewReader(client).ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, tc.prefix) {
+			t.Fatalf("RCPT %q response=%q err=%v; want prefix %q", tc.command, line, err, tc.prefix)
+		}
+		<-done
+	}
+	if len(p.recipients) != 0 {
+		t.Fatalf("header-style recipient accepted: %v", p.recipients)
+	}
+}
+
 func TestSubmissionDSNParameterParsing(t *testing.T) {
 	for _, tc := range []struct {
 		name, command, wantReply, wantReturn, wantEnvID string
@@ -259,6 +287,27 @@ func TestSubmissionEncodingRequiresNegotiatedBodyMode(t *testing.T) {
 	}
 	if err := validateSubmissionEncoding(utf8Header, "8BITMIME"); err == nil {
 		t.Fatal("UTF-8 header accepted without SMTPUTF8 negotiation")
+	}
+}
+
+func TestSubmissionRejectsNestedUTF8HeadersWithoutSMTPUTF8(t *testing.T) {
+	const prefix = "From: alice@example.test\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\n"
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"MIME part", prefix + "Content-Type: text/plain\r\nX-Title: caf\xc3\xa9\r\n\r\nbody\r\n--part--\r\n"},
+		{"attached message", prefix + "Content-Type: message/rfc822\r\n\r\nFrom: bob@example.test\r\nSubject: caf\xc3\xa9\r\n\r\nbody\r\n--part--\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateSubmissionEncoding([]byte(tc.raw), "8BITMIME"); err == nil || !strings.Contains(err.Error(), "SMTPUTF8") {
+				t.Fatalf("nested UTF-8 header accepted without SMTPUTF8: %v", err)
+			}
+		})
+	}
+	encoded := prefix + "Content-Type: text/plain\r\nX-Title: =?UTF-8?Q?caf=C3=A9?=\r\n\r\nbody\r\n--part--\r\n"
+	if err := validateSubmissionEncoding([]byte(encoded), ""); err != nil {
+		t.Fatalf("7-bit encoded MIME header rejected: %v", err)
 	}
 }
 

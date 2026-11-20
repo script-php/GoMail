@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"time"
@@ -179,6 +180,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Admin panel (requires admin role)
 	adminHandler := handlers.NewAdminHandler(s.cfg, s.db, s.sessionMgr, s.enqueueFunc, s.backupManager)
+	if s.queue != nil {
+		adminHandler.SetTLSReportEnqueue(func(from, to, message string) error {
+			return s.queue.EnqueueTLSReport(from, []string{to}, []byte(message))
+		})
+	}
 	mux.Handle("/admin", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Dashboard)))
 	mux.Handle("/admin/domains", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.Domains)))
 	mux.Handle("/admin/domain/edit/", s.sessionMgr.RequireAdmin(http.HandlerFunc(adminHandler.DomainEdit)))
@@ -228,7 +234,14 @@ func (s *Server) ListenAndServe() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully shuts down the server.
+// Shutdown stops accepting new web requests and lets active handlers finish
+// before the queue and database are stopped by the caller.
 func (s *Server) Shutdown() error {
-	return s.httpServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		_ = s.httpServer.Close()
+		return err
+	}
+	return nil
 }

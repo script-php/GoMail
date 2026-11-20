@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,6 +260,10 @@ func (db *DB) ExpungeIMAPMessages(accountID, folderID int64, messageIDs []int64)
 			}
 			paths = append(paths, path)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("reading IMAP attachment paths: %w", err)
+		}
 		if err := rows.Close(); err != nil {
 			return nil, err
 		}
@@ -282,7 +287,9 @@ func (db *DB) ExpungeIMAPMessages(accountID, folderID int64, messageIDs []int64)
 	db.NotifyIMAPChanges(accountID)
 	for _, path := range paths {
 		if fullPath, ok := db.safeAttachmentPath(path); ok {
-			_ = os.Remove(fullPath)
+			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[store] attachment cleanup after IMAP expunge failed: %v", err)
+			}
 		}
 	}
 	return messageIDs, nil

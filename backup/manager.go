@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,11 @@ import (
 )
 
 var ErrBackupInProgress = errors.New("backup already in progress")
+
+// Retention owns only scheduler-generated archives, including the older
+// second-resolution naming format. It must never remove restore safety copies
+// or an operator's manually named archive in the same directory.
+var managedBackupName = regexp.MustCompile(`^gomail-[0-9]{8}T[0-9]{6}(\.[0-9]{9})?Z\.tar\.gz$`)
 
 type Manager struct {
 	cfg        *config.Config
@@ -62,10 +68,17 @@ func (manager *Manager) SaveSettings(settings store.BackupSettings) error {
 	if err := os.MkdirAll(settings.Directory, 0750); err != nil {
 		return err
 	}
+	if err := validateBackupDestination(manager.cfg, manager.configPath, probe); err != nil {
+		return err
+	}
 	return manager.db.SaveBackupSettings(settings)
 }
 
 func (manager *Manager) RunNow() (Manifest, string, error) {
+	return manager.runNowAt(time.Now().UTC())
+}
+
+func (manager *Manager) runNowAt(startedAt time.Time) (Manifest, string, error) {
 	if !manager.runMu.TryLock() {
 		return Manifest{}, "", ErrBackupInProgress
 	}
@@ -77,16 +90,17 @@ func (manager *Manager) RunNow() (Manifest, string, error) {
 	if err := manager.SaveSettings(settings); err != nil {
 		return Manifest{}, "", err
 	}
-	filename := "gomail-" + time.Now().UTC().Format("20060102T150405Z") + ".tar.gz"
+	filename := "gomail-" + startedAt.UTC().Format("20060102T150405.000000000Z") + ".tar.gz"
 	path := filepath.Join(settings.Directory, filename)
 	manifest, createErr := CreateOnline(manager.cfg, manager.configPath, path, manager.version)
 	completedAt := time.Now().UTC()
-	_ = manager.db.RecordBackupResult(path, completedAt, createErr)
+	if err := manager.db.RecordBackupResult(path, completedAt, createErr); err != nil {
+		logging.Error(fmt.Sprintf("[backup] could not record backup result for %s: %v", path, err))
+	}
 	if createErr != nil {
-		_ = os.Remove(path)
 		return manifest, path, createErr
 	}
-	if err := manager.applyRetention(settings.Directory, settings.RetentionCount); err != nil {
+	if err := manager.applyRetentionKeeping(settings.Directory, settings.RetentionCount, path); err != nil {
 		logging.Warn(fmt.Sprintf("[backup] retention cleanup failed: %v", err))
 	}
 	return manifest, path, nil
@@ -121,10 +135,15 @@ func (manager *Manager) Stop() {
 
 func (manager *Manager) runScheduled() {
 	settings, err := manager.Settings()
-	if err != nil || !settings.Enabled {
+	if err != nil {
+		logging.Error(fmt.Sprintf("[backup] automatic backup settings unavailable: %v", err))
 		return
 	}
-	if settings.LastSuccessAt != nil && time.Since(*settings.LastSuccessAt) < time.Duration(settings.IntervalHours)*time.Hour {
+	if !settings.Enabled {
+		return
+	}
+	now := time.Now().UTC()
+	if settings.LastSuccessAt != nil && !settings.LastSuccessAt.After(now) && now.Sub(*settings.LastSuccessAt) < time.Duration(settings.IntervalHours)*time.Hour {
 		return
 	}
 	if _, path, err := manager.RunNow(); err != nil {
@@ -135,22 +154,35 @@ func (manager *Manager) runScheduled() {
 }
 
 func (manager *Manager) applyRetention(directory string, keep int) error {
+	return manager.applyRetentionKeeping(directory, keep, "")
+}
+
+// A successful run must not remove the archive it just published, even when
+// older archives have future-dated filenames because the host clock changed.
+func (manager *Manager) applyRetentionKeeping(directory string, keep int, protected string) error {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return err
 	}
 	var archives []string
 	for _, entry := range entries {
-		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), "gomail-") && strings.HasSuffix(entry.Name(), ".tar.gz") {
+		if entry.Type().IsRegular() && managedBackupName.MatchString(entry.Name()) {
 			archives = append(archives, filepath.Join(directory, entry.Name()))
 		}
 	}
 	sort.Strings(archives)
 	for len(archives) > keep {
-		if err := os.Remove(archives[0]); err != nil {
+		candidate := 0
+		if archives[candidate] == protected {
+			candidate++
+		}
+		if candidate >= len(archives) {
+			break
+		}
+		if err := os.Remove(archives[candidate]); err != nil {
 			return err
 		}
-		archives = archives[1:]
+		archives = append(archives[:candidate], archives[candidate+1:]...)
 	}
 	return nil
 }

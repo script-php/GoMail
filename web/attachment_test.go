@@ -93,6 +93,22 @@ func TestAttachmentDownloadRequiresMessageOwnership(t *testing.T) {
 	if bobResponse.Code != http.StatusOK || bobResponse.Body.String() != secret || bobResponse.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("owned attachment status=%d cache=%q body=%q", bobResponse.Code, bobResponse.Header().Get("Cache-Control"), bobResponse.Body.String())
 	}
+	if got := bobResponse.Header().Get("Content-Security-Policy"); !strings.Contains(got, "sandbox") || !strings.Contains(got, "default-src 'none'") {
+		t.Fatalf("downloadable attachment lacks an isolated rendering policy: %q", got)
+	}
+	if got := bobResponse.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "attachment") {
+		t.Fatalf("attachment could be rendered inline: %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(attachmentsRoot, "bob-secret.txt"), []byte("short"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	truncatedRequest := httptest.NewRequest(http.MethodGet, "/attachment/"+formatID(attachmentID), nil)
+	truncatedRequest.AddCookie(bobLogin.Result().Cookies()[0])
+	truncatedResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(truncatedResponse, truncatedRequest)
+	if truncatedResponse.Code != http.StatusNotFound || strings.Contains(truncatedResponse.Body.String(), "short") {
+		t.Fatalf("truncated sidecar was served: status=%d body=%q", truncatedResponse.Code, truncatedResponse.Body.String())
+	}
 	outside := filepath.Join(root, "outside-secret.txt")
 	if err := os.WriteFile(outside, []byte("outside-secret"), 0600); err != nil {
 		t.Fatal(err)

@@ -70,6 +70,41 @@ func TestSQLiteStartupAndAdditiveMigration(t *testing.T) {
 	}
 }
 
+func TestQueuedLocalRecipientMigrationBackfillsExistingRows(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "mail.db")
+	attachments := filepath.Join(root, "attachments")
+	db, err := Open(path, attachments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateDomain(&Domain{Domain: "xn--bcher-kva.example", IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.EnqueueMessage(&QueueEntry{RcptTo: "bob@bücher.example", RawMessage: []byte("From: sender@example.test\r\n\r\nbody\r\n"), MaxAttempts: 3, NextRetry: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE outbound_queue SET local_recipient=0 WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE name='outbound_local_recipient_v1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, attachments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var local int
+	if err := db.QueryRow(`SELECT local_recipient FROM outbound_queue WHERE id=?`, id).Scan(&local); err != nil || local != 1 {
+		t.Fatalf("local queue route was not backfilled: %d, %v", local, err)
+	}
+}
+
 func TestMySQLSchemaParityAndConfiguration(t *testing.T) {
 	db := &DB{}
 	mysqlTables := map[string]map[string]bool{}

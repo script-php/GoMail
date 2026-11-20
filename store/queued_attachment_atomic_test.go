@@ -61,4 +61,21 @@ func TestQueuedAttachmentsCommitWithSentCopy(t *testing.T) {
 	if err != nil || len(stored) != 1 {
 		t.Fatalf("stored sidecars=%d err=%v", len(stored), err)
 	}
+	updatedSent, err := db.GetFolderByType(accountID, "sent")
+	if err != nil || updatedSent.TotalCount != 1 {
+		t.Fatalf("Sent count was not committed with message: %+v, %v", updatedSent, err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_sent_count BEFORE UPDATE OF total_count ON folders
+		WHEN NEW.total_count > 1 BEGIN SELECT RAISE(FAIL, 'sent count unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveQueuedMessageWithAttachments(message(), entries(), attachments); err == nil {
+		t.Fatal("outbound queue committed without Sent count")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_id=?`, accountID).Scan(&sentCount); err != nil || sentCount != 1 {
+		t.Fatalf("failed Sent count update left message: %d, %v", sentCount, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM outbound_queue WHERE mail_from='alice@example.test'`).Scan(&queueCount); err != nil || queueCount != 1 {
+		t.Fatalf("failed Sent count update left queue entry: %d, %v", queueCount, err)
+	}
 }

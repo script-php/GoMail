@@ -89,6 +89,8 @@ type QueueEntry struct {
 	ID                int64     `json:"id"`
 	MessageID         *int64    `json:"message_id,omitempty"`
 	OriginAccountID   int64     `json:"-"` // 0=system; -1=legacy unknown
+	LocalRecipient    bool      `json:"-"` // recipient domain was hosted when queued
+	TLSReport         bool      `json:"-"` // system-generated RFC 8460 report only
 	MailFrom          string    `json:"mail_from"`
 	RcptTo            string    `json:"rcpt_to"`
 	RawMessage        []byte    `json:"-"`

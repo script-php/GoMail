@@ -42,3 +42,35 @@ func TestInboundDATARejectsArgumentsBeforeTransfer(t *testing.T) {
 	_ = client.Close()
 	<-done
 }
+
+func TestInboundUnknownAndUnimplementedCommands(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	session := &Session{
+		conn: server, reader: bufio.NewReader(server), writer: bufio.NewWriter(server),
+		readTimeout: time.Second, writeTimeout: time.Second,
+	}
+	done := make(chan struct{})
+	go func() { (&InboundServer{}).runSession(session); close(done) }()
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	r := bufio.NewReader(client)
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ command, prefix string }{
+		{"XUNKNOWN\r\n", "500 "},
+		{"HELP\r\n", "502 "},
+		{"EXPN list\r\n", "502 "},
+		{"NOOP\r\n", "250 "},
+		{"QUIT\r\n", "221 "},
+	} {
+		if _, err := client.Write([]byte(tc.command)); err != nil {
+			t.Fatal(err)
+		}
+		response, err := r.ReadString('\n')
+		if err != nil || !strings.HasPrefix(response, tc.prefix) {
+			t.Fatalf("%q reply=%q err=%v; want prefix %q", tc.command, response, err, tc.prefix)
+		}
+	}
+	<-done
+}

@@ -23,11 +23,17 @@ type cachedPolicy struct {
 	expiresAt time.Time
 }
 
+type failedPolicyFetch struct {
+	policyID string
+	retryAt  time.Time
+}
+
 var (
-	policyCache  = make(map[string]*cachedPolicy)
-	cacheMutex   sync.RWMutex
-	persistLocks [64]sync.Mutex
-	httpClient   = &http.Client{
+	policyCache   = make(map[string]*cachedPolicy)
+	failedFetches = make(map[string]failedPolicyFetch)
+	cacheMutex    sync.RWMutex
+	persistLocks  [64]sync.Mutex
+	httpClient    = &http.Client{
 		Timeout: 10 * time.Second,
 		// RFC 8461 policy retrieval is bound to the fixed HTTPS policy host.
 		// A redirect must not move the policy to another host or scheme.
@@ -57,14 +63,19 @@ func FetchPolicyWithStore(domain string, db *store.DB) (*Policy, error) {
 	if id != "" && time.Now().Before(expiry) {
 		var policy Policy
 		if err := json.Unmarshal([]byte(document), &policy); err != nil {
-			return nil, fmt.Errorf("decoding MTA-STS policy cache: %w", err)
+			logging.Warn(fmt.Sprintf("[mta-sts] ignoring invalid cached policy for %s: %v", domain, err))
+		} else if err := policy.validate(); err != nil {
+			logging.Warn(fmt.Sprintf("[mta-sts] ignoring invalid cached policy for %s: %v", domain, err))
+		} else if expiry.After(time.Now().Add(time.Duration(policy.MaxAge) * time.Second)) {
+			logging.Warn(fmt.Sprintf("[mta-sts] ignoring cached policy for %s with expiry beyond max_age", domain))
+		} else {
+			cacheMutex.Lock()
+			cached := policyCache[domain]
+			if cached == nil || cached.expiresAt.Before(expiry) {
+				policyCache[domain] = &cachedPolicy{policy: &policy, policyID: id, expiresAt: expiry}
+			}
+			cacheMutex.Unlock()
 		}
-		cacheMutex.Lock()
-		cached := policyCache[domain]
-		if cached == nil || cached.expiresAt.Before(expiry) {
-			policyCache[domain] = &cachedPolicy{policy: &policy, policyID: id, expiresAt: expiry}
-		}
-		cacheMutex.Unlock()
 	}
 	policy := FetchPolicy(domain)
 	cacheMutex.RLock()
@@ -136,7 +147,7 @@ func parseSTSTXTRecord(record string) (string, bool) {
 			return "", false
 		}
 		if key == "id" {
-			if id != "" || len(value) == 0 || len(value) > 32 {
+			if len(value) == 0 || len(value) > 32 {
 				return "", false
 			}
 			for i := 0; i < len(value); i++ {
@@ -144,7 +155,9 @@ func parseSTSTXTRecord(record string) (string, bool) {
 					return "", false
 				}
 			}
-			id = value
+			if id == "" { // RFC 8461: first non-repeated field wins.
+				id = value
+			}
 		}
 	}
 	return id, id != ""
@@ -214,10 +227,22 @@ func FetchPolicy(domain string) *Policy {
 	if dnsID == "" {
 		return nil
 	}
+	cacheMutex.RLock()
+	failed, recentlyFailed := failedFetches[domain]
+	cacheMutex.RUnlock()
+	if recentlyFailed && failed.policyID == dnsID && time.Now().Before(failed.retryAt) {
+		if validCached != nil {
+			return validCached.policy
+		}
+		return nil
+	}
 
 	// Step 3: Fetch HTTPS policy (cache miss or ID changed)
 	policy, err := policyDocument(domain)
 	if err != nil {
+		cacheMutex.Lock()
+		failedFetches[domain] = failedPolicyFetch{policyID: dnsID, retryAt: time.Now().Add(5 * time.Minute)}
+		cacheMutex.Unlock()
 		logging.Info(fmt.Sprintf("[mta-sts] failed to fetch replacement policy for %s: %v", domain, err))
 		if validCached != nil {
 			logging.Warn(fmt.Sprintf("[mta-sts] retaining still-valid cached policy for %s after replacement fetch failure", domain))
@@ -228,6 +253,7 @@ func FetchPolicy(domain string) *Policy {
 
 	// Step 4: Cache policy respecting max_age
 	cacheMutex.Lock()
+	delete(failedFetches, domain)
 	policyCache[domain] = &cachedPolicy{
 		policy:    policy,
 		policyID:  dnsID,
@@ -288,4 +314,5 @@ func ClearPolicyCache() {
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
 	policyCache = make(map[string]*cachedPolicy)
+	failedFetches = make(map[string]failedPolicyFetch)
 }

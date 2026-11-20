@@ -332,6 +332,9 @@ func (c *Config) Validate() error {
 	if c.Server.Hostname == "" {
 		return fmt.Errorf("server.hostname is required")
 	}
+	if !validSMTPHostname(c.Server.Hostname) {
+		return fmt.Errorf("server.hostname must be a valid fully qualified DNS hostname (or localhost for local development)")
+	}
 	if err := validateOperationalSender("server.tls_report_sender", c.Server.TLSReportSender, c.Server.Domain); err != nil {
 		return err
 	}
@@ -527,4 +530,29 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("mdn.mode must be 'auto' or 'manual'")
 	}
 	return nil
+}
+
+// SMTP uses this name in EHLO/HELO and greetings. Validate its wire syntax
+// without requiring DNS access at config-load time; deployment must still
+// publish matching address and reverse-DNS records for Internet delivery.
+func validSMTPHostname(name string) bool {
+	if name == "localhost" {
+		return true
+	}
+	if len(name) > 253 || !strings.Contains(name, ".") || strings.HasSuffix(name, ".") {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			b := label[i]
+			if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

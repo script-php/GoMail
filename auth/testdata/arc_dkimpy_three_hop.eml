@@ -1,0 +1,64 @@
+ARC-Seal: i=3; cv=pass; a=rsa-sha256; d=example.test; s=arc;
+ t=1794600003;
+ b=QUvw7rEvsbrbi4ix85vu5VIQ6OL0gqbsV6SabEwnUFWs+uzKw2QV9QAil7E1TxIP9hXlG
+ zGe/DZf+S+uXOvZ2CXQHe6Hz2k8h4x6kzTPaB2/G7eZNpBw8ewyiuu3fCfeAQRghhuLqHQ2
+ gvNEwM8o2oka2ut1VqaGJqKgRCEvmvacNPp/JyfTkvEjl3HlylRnjM7GFHbjmQgtFNwCtVW
+ R9urU8apkpE0uqHC7D8u7Vj4XvrzXJatfWwvahBndmb5A4hlsTILgM/p6tIAbE5HEXzDJVO
+ JzClGcv+s+O3JKULWCudiiq1y3GaDPkYWgbpjkkRoHJKuTdOoSnpDgcrMSKQ==
+ARC-Message-Signature: i=3; a=rsa-sha256; c=relaxed/relaxed;
+ d=example.test; s=arc; t=1794600003; h=from : to : subject : date :
+ message-id : from; bh=Iw/80Mo9MPW60RUqXVuQ31MptwZFGBZrAlXQkGn/1pw=;
+ b=ZI6uJwjCfnCrtKJIhU1zdeVpbhsWKizCXiVCcZNMqcKbsEndDBSqU09WIXlZEkZAp+ZIB
+ 66H+NeNs3rufeTRUMpatXivdI5AfQH28SCACZ1CTxFIx6fYU7wuA3BXZbSy2GYYvkZz6m11
+ RppTEojXr/s6Mpqs3SYdw2fc91FSXq2nKfJLY0S3m/7DYIPn3FxDj+2zm3C4b4E1bE662+B
+ MRmTYLnAERItVVl3uSmNskxSFu2P/uiBNp6nbUmQWIiUwSy4wmYajCiogX0pTjRa/6GsY1R
+ 7hPNn9JMBCskyyKIHu3PPp3++3Un5pSeiVedRmwVQeBHxQk/jIpH6qu0cIJg==
+ARC-Authentication-Results: i=3; mx3.example.test;
+ arc=pass;
+ spf=pass smtp.mailfrom=sender@example.test
+Authentication-Results: mx3.example.test; arc=pass; spf=pass smtp.mailfrom=sender@example.test
+ARC-Seal: i=2; cv=pass; a=rsa-sha256; d=example.test; s=arc;
+ t=1794600002;
+ b=b5TPTPMAxKUmAD+CTyQoCZWGiydMQgclZNKJKbVmZbFpJQwN0XNmRtDDmdJiZNjLlIKNJ
+ OPB5ZXo3yS1PUx17c9nL2qofJlOSk3/Hl0UXf+f6KZB+V4XK22djaOeBfdrP8p4CyhN6Dm4
+ Vvy/rKX54jq/QFnHgwQtGjMZXj/nEl7H7rR7Y0LeB8xIs7QpdF/CVAxq7pPeGrYun4q+uPG
+ J4tde+SYVvOb4bNh8zjp6wGfzIzaJfczwa413KCxolqphBbJxuCz+niuZP+e+Ui3fQCgTHz
+ hFL9nRXVklD0HdRiFZr7Z1RHTLR+6PAMpshldJOvfY15+VAn1gG1N4/r6Ghg==
+ARC-Message-Signature: i=2; a=rsa-sha256; c=relaxed/relaxed;
+ d=example.test; s=arc; t=1794600002; h=from : to : subject : date :
+ message-id : from; bh=Iw/80Mo9MPW60RUqXVuQ31MptwZFGBZrAlXQkGn/1pw=;
+ b=VXK8ar97yvCAwS657foXztx8rZmeds9JMwI/9xFY3Ryp1wwrKz1jZZulyGgwTpT2UrNhz
+ 1XZu8fO9DUFFtR94vxYbwmK05TXR0nQQaGamk9HaY85uJGahMjaV3MJ35p1Qrsy5UoT8ZTr
+ YBDLJEEwQr/3+PuofuSwHSrPlq2sxK1cyMTI0gCS7+QuL/fwwbuMcGIh2h0Gz6wJwe7QRCl
+ oyWZ4oRmdeeTFx9sLZgCu6vjesgIwn5ISaMZgSrFpHn2iCdrxUEH7TfHl1LcUH3GLMa0AER
+ u5BwmYKGp3hld5GcjFpwKWsM7QvnqmY0zlzHuG9SNmoCW6HEayLpICHJmSlw==
+ARC-Authentication-Results: i=2; mx2.example.test;
+ arc=pass;
+ spf=pass smtp.mailfrom=sender@example.test
+Authentication-Results: mx2.example.test; arc=pass; spf=pass smtp.mailfrom=sender@example.test
+ARC-Seal: i=1; cv=none; a=rsa-sha256; d=example.test; s=arc;
+ t=1794600001;
+ b=N+8oIeF3CvMEKdLIZG/66hVLTlx6T7xGvOQ7jSGmAq+cfRI9RB5FB9tgR8mWIEVp30j+B
+ wN7fCc2w9xhqWbcwB7Wj/dyGbVtl/wySua9aLlZ5rRdzIPA/lPY04rAdBtzun6yWdCqcxCJ
+ F7j3B/Yq2LNGzDs7MDyRVAF19U3z8y2PgYlfxNSF3t2m1zaG6oD0gbk7Uhl0BR63+vmckax
+ 2v/e0ZN8sbloLdC6PW2OLxn5ELJMHfzoCtskEfRCPVkdDry2GjN7ZdgsVBN2xRQcjJZuMlk
+ LUDYDcfuCd+ENYYXhmnJHIgDiutYdg6W62exVc0HvTH91ue/75gIkt2Em14A==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed;
+ d=example.test; s=arc; t=1794600001; h=from : to : subject : date :
+ message-id : from; bh=Iw/80Mo9MPW60RUqXVuQ31MptwZFGBZrAlXQkGn/1pw=;
+ b=OdjLejN4C0f0H3tJUDnyneHG/UKxn1JHE29AlAXRWb5wqpBjsI6sNzSW3oRdLd3w07F6z
+ Nl2SMLv+wA9mDwS3xKOwN/PbLUUxrJMrtdk1mTEEvfxcYuuwUyabn6QyQUQFmZopU2d1vdT
+ k2X+PZyNI4AZBtxYTdNWXxSdqrC+WEfRKwM0R+bjAjIpDrvGiKwfM/3NdOe1u77YzTmQ3ak
+ mplVaq9enpGUi4r3UZ3u/2RRtLSRZup0SzzX4HX3LMORYZM8xNuXlioHwWsbyV9paaIxOJI
+ qtKRBgNN806Y7lJaDA0WAjJsBLPl2WOpwsmkJgrDX08DY6linBGnWCnm6CVw==
+ARC-Authentication-Results: i=1; mx1.example.test;
+ arc=none;
+ spf=pass smtp.mailfrom=sender@example.test
+Authentication-Results: mx1.example.test; arc=none; spf=pass smtp.mailfrom=sender@example.test
+From: sender@example.test
+To: receiver@example.test
+Subject: Three-hop ARC fixture
+Date: Fri, 13 Nov 2026 20:00:00 +0000
+Message-ID: <three-hop@example.test>
+
+Fixture body

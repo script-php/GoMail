@@ -35,6 +35,24 @@ func TestInboundSTARTTLSHandshakeTimesOut(t *testing.T) {
 	}
 }
 
+func TestInboundUnavailableConnectionGetsTemporarySMTPReply(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		rejectInboundConnection(server, "mx.example.test")
+		close(done)
+	}()
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil || reply != "421 mx.example.test Service temporarily unavailable, try again later\r\n" {
+		t.Fatalf("unavailable greeting = %q, %v", reply, err)
+	}
+	<-done
+}
+
 func TestInboundMissingInboxDoesNotAcceptMessageOrRecordDMARCFeedback(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
@@ -111,5 +129,38 @@ func TestInboundDuplicateRecipientDoesNotDuplicateDeliveryOrReplaceDSNOptions(t 
 	}
 	if len(s.rcptTo) != 1 || s.dsnNotify["alice@example.test"] != "SUCCESS" {
 		t.Fatalf("duplicate recipient changed delivery state: rcpt=%v notify=%v", s.rcptTo, s.dsnNotify)
+	}
+}
+
+func TestGreylistingDatabaseFailureDefersRecipient(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.CreateDomain(&store.Domain{Domain: "example.test", IsActive: true, GreylistingEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE greylisting`); err != nil {
+		t.Fatal(err)
+	}
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	s := &Session{conn: server, writer: bufio.NewWriter(server), state: StateMail,
+		mailFrom: "sender@remote.test", clientIP: "127.0.0.1", domains: []string{"example.test"},
+		maxRcpt: 10, writeTimeout: time.Second, db: db,
+		accountExists: func(string) (bool, error) { return true, nil }}
+	done := make(chan struct{})
+	go func() { s.handleRCPT("TO:<alice@example.test>"); close(done) }()
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	reply, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil || !strings.HasPrefix(reply, "451 4.3.0") {
+		t.Fatalf("greylisting failure reply=%q err=%v", reply, err)
+	}
+	<-done
+	if len(s.rcptTo) != 0 || s.state != StateMail {
+		t.Fatalf("recipient accepted after greylisting failure: state=%v recipients=%v", s.state, s.rcptTo)
 	}
 }

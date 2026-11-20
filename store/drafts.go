@@ -55,7 +55,6 @@ func (db *DB) SaveDraft(accountID, draftID int64, from, to, cc, subject, body st
 		err = nil
 	}
 	if err == nil {
-		_ = db.UpdateFolderCounts(folder.ID)
 		db.NotifyIMAPChanges(accountID)
 	}
 	return draftID, err
@@ -102,6 +101,9 @@ func (db *DB) DeleteDraft(accountID, draftID int64) error {
 	if err := releaseMailboxBytes(tx, accountID, size); err != nil {
 		return err
 	}
+	if err := updateAccountFolderCounts(tx, accountID); err != nil {
+		return fmt.Errorf("updating draft folder counts: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -110,7 +112,6 @@ func (db *DB) DeleteDraft(accountID, draftID int64) error {
 			_ = os.Remove(fullPath)
 		}
 	}
-	err = db.UpdateFolderCounts(folderID)
 	db.NotifyIMAPChanges(accountID)
-	return err
+	return nil
 }

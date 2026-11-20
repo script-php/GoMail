@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/idna"
+
 	"gomail/security"
 	"gomail/store"
 )
@@ -96,6 +98,7 @@ func formatRecipientHeader(value string) (string, error) {
 	}
 	formatted := make([]string, 0, len(addresses))
 	for _, address := range addresses {
+		address.Address = asciiMailboxDomain(address.Address)
 		if !isASCII(address.Address) {
 			// RFC 6532 keeps an internationalized addr-spec as UTF-8;
 			// encoding it as an RFC 2047 word would hide the address.
@@ -141,7 +144,7 @@ func originatingHeaders(strip bool, clientIP, hostname, messageID string, recipi
 	// it for multiple recipients also avoids disclosing blind recipients.
 	forClause := ""
 	if len(recipients) == 1 {
-		forClause = fmt.Sprintf("\r\n\tfor <%s>", singleLineHeaderValue(recipients[0]))
+		forClause = fmt.Sprintf("\r\n\tfor <%s>", singleLineHeaderValue(asciiMailboxDomain(recipients[0])))
 	}
 	var headers strings.Builder
 	if strip {
@@ -153,6 +156,21 @@ func originatingHeaders(strip bool, clientIP, hostname, messageID string, recipi
 		fmt.Fprintf(&headers, "X-Originating-IP: [%s]\r\n", clientIP)
 	}
 	return headers.String()
+}
+
+// ASCII local parts can use an IDNA A-label in headers and trace fields,
+// avoiding an unnecessary SMTPUTF8 requirement on legacy delivery hops.
+// Internationalized local parts remain untouched and still require SMTPUTF8.
+func asciiMailboxDomain(address string) string {
+	at := strings.LastIndexByte(address, '@')
+	if at < 0 || !isASCII(address[:at]) || isASCII(address[at+1:]) {
+		return address
+	}
+	domain, err := idna.Lookup.ToASCII(address[at+1:])
+	if err != nil || domain == "" {
+		return address
+	}
+	return address[:at+1] + strings.ToLower(domain)
 }
 
 func singleLineHeaderValue(value string) string {

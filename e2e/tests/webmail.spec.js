@@ -82,9 +82,10 @@ test('queue controls, retention settings and outbound policy work in the browser
   await expect(page.getByLabel('Keep archived mappings for days')).toHaveValue('90');
   await page.goto('/admin/outbound-limits');
   await expect(page.getByRole('heading', { name: 'Outbound Account Limits' })).toBeVisible();
-  await page.getByLabel('Messages per hour').fill('110');
+  const messagesPerHour = page.getByRole('group', { name: 'Message limits' }).getByRole('spinbutton', { name: 'Per hour' });
+  await messagesPerHour.fill('110');
   await page.getByRole('button', { name: 'Save and apply' }).click();
-  await expect(page.getByLabel('Messages per hour')).toHaveValue('110');
+  await expect(messagesPerHour).toHaveValue('110');
 });
 
 test('admin operational pages are accessible at mobile width', async ({ page }) => {

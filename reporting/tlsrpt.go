@@ -321,7 +321,7 @@ func ExtractTLSRPTAddress(domain string) (string, error) {
 
 // BuildTLSRPTEmail creates an email message containing the TLS-RPT report
 // RFC 8460: Report is gzip-compressed and base64-encoded
-func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipientEmail string) string {
+func BuildTLSRPTEmail(ourHostname, senderEmail, reportDomain string, report *TLSReport, recipientEmail string) string {
 	reportJSON, _ := json.MarshalIndent(report, "", "  ")
 
 	// Gzip compress the JSON (RFC 8460 requirement)
@@ -332,13 +332,9 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 
 	// Base64 encode the compressed data
 	encodedReport := foldBase64(base64.StdEncoding.EncodeToString(compressedBuf.Bytes()))
-	policyDomain := "unknown"
-	if len(report.Policies) > 0 {
-		policyDomain = report.Policies[0].Policy.PolicyDomain
-	}
 	start, _ := time.Parse(time.RFC3339, report.DateRange.StartDatetime)
 	end, _ := time.Parse(time.RFC3339, report.DateRange.EndDatetime)
-	filename := fmt.Sprintf("%s!%s!%d!%d!001.json.gz", ourHostname, policyDomain, start.Unix(), end.Unix())
+	filename := fmt.Sprintf("%s!%s!%d!%d!001.json.gz", ourHostname, reportDomain, start.Unix(), end.Unix())
 
 	// Build multipart email with gzip-compressed JSON report as attachment
 	boundary := "boundary_tlsrpt"
@@ -367,12 +363,12 @@ func BuildTLSRPTEmail(ourHostname, senderEmail string, report *TLSReport, recipi
 			"--%s--\r\n",
 		senderEmail,
 		recipientEmail,
-		policyDomain,
+		reportDomain,
 		ourHostname,
 		report.ReportID,
 		time.Now().Format(time.RFC1123Z),
 		report.ReportID,
-		policyDomain,
+		reportDomain,
 		ourHostname,
 		boundary,
 		boundary,

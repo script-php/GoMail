@@ -72,3 +72,136 @@ func TestFinalDSNRetryAfterTransientMailboxFailure(t *testing.T) {
 		t.Fatalf("invalid direct DSN delivery metadata: headers=%q size=%d rawSize=%d mailFrom=%q", headers, size, len(raw), mailFrom)
 	}
 }
+
+func TestSystemReportFailureNoticeResolvesPostmasterAlias(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	domainID, err := db.CreateDomain(&store.Domain{Domain: "example.com", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := db.CreateAccount(&store.Account{DomainID: domainID, Email: "admin@example.com", PasswordHash: "unused", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateAlias("postmaster@example.com", accountID); err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.EnqueueMessage(&store.QueueEntry{
+		MailFrom: "postmaster@example.com", RcptTo: "reports@remote.test",
+		RawMessage:  []byte("From: tlsrpt@example.com\r\nTo: reports@remote.test\r\nSubject: report\r\n\r\nbody"),
+		MaxAttempts: 1, NextRetry: time.Now().UTC(), DSNNotify: "FAILURE", TLSReport: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE outbound_queue SET status='failed',last_error='550 remote rejected' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	w := &Worker{db: db, cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.com", Domain: "example.com"}}}
+	w.processFinalDSNs()
+	w.processFinalDSNs()
+	var notices, sent int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_id=? AND direction='inbound' AND to_addr='postmaster@example.com'`, accountID).Scan(&notices); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT dsn_sent FROM outbound_queue WHERE id=?`, id).Scan(&sent); err != nil {
+		t.Fatal(err)
+	}
+	if notices != 1 || sent != 1 {
+		t.Fatalf("postmaster alias notices=%d marker=%d", notices, sent)
+	}
+}
+
+func TestAdminCancellationDeliversFailureNotice(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO domains(id,domain) VALUES(1,'example.com'); INSERT INTO accounts(id,domain_id,email,password_hash,is_active) VALUES(1,1,'sender@example.com','test',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DefaultFolders(1); err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.EnqueueMessage(&store.QueueEntry{MailFrom: "sender@example.com", RcptTo: "recipient@example.net", RawMessage: []byte("From: sender@example.com\r\nTo: recipient@example.net\r\nSubject: original\r\n\r\nbody"), MaxAttempts: 3, NextRetry: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.CancelQueueEntry(id); err != nil || !changed {
+		t.Fatalf("cancel: changed=%v err=%v", changed, err)
+	}
+	w := &Worker{db: db, cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.com", Domain: "example.com"}}}
+	w.processFinalDSNs()
+	w.processFinalDSNs()
+	var notices, sent int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_id = 1 AND direction = 'inbound'`).Scan(&notices); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT dsn_sent FROM outbound_queue WHERE id = ?`, id).Scan(&sent); err != nil {
+		t.Fatal(err)
+	}
+	if notices != 1 || sent != 1 {
+		t.Fatalf("cancel notices=%d sent=%d", notices, sent)
+	}
+}
+
+func TestAdminCancellationFailureNoticeRetry(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "mail.db"), filepath.Join(root, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO domains(id,domain) VALUES(1,'example.com'); INSERT INTO accounts(id,domain_id,email,password_hash,is_active) VALUES(1,1,'sender@example.com','test',0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DefaultFolders(1); err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.EnqueueMessage(&store.QueueEntry{MailFrom: "sender@example.com", RcptTo: "recipient@example.net", RawMessage: []byte("From: sender@example.com\r\nTo: recipient@example.net\r\nSubject: original\r\n\r\nbody"), MaxAttempts: 3, NextRetry: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := db.CancelQueueEntry(id); err != nil || !changed {
+		t.Fatalf("cancel: changed=%v err=%v", changed, err)
+	}
+	w := &Worker{db: db, cfg: &config.Config{Server: config.ServerConfig{Hostname: "mail.example.com", Domain: "example.com"}}}
+	w.processFinalDSNs()
+	var attempts, sent int
+	var retryAt time.Time
+	if err := db.QueryRow(`SELECT dsn_attempts, dsn_sent, dsn_retry_at FROM outbound_queue WHERE id = ?`, id).Scan(&attempts, &sent, &retryAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || sent != 0 || !retryAt.After(time.Now().UTC()) {
+		t.Fatalf("cancel retry attempts=%d sent=%d retryAt=%v", attempts, sent, retryAt)
+	}
+	if _, err := db.Exec(`UPDATE accounts SET is_active = 1 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	w.processFinalDSNs()
+	if err := db.QueryRow(`SELECT dsn_sent FROM outbound_queue WHERE id = ?`, id).Scan(&sent); err != nil || sent != 0 {
+		t.Fatalf("early retry sent=%d err=%v", sent, err)
+	}
+	if _, err := db.Exec(`UPDATE outbound_queue SET dsn_retry_at = '1970-01-01 00:00:00' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	w.processFinalDSNs()
+	w.processFinalDSNs()
+	var notices int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_id = 1 AND direction = 'inbound'`).Scan(&notices); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT dsn_sent FROM outbound_queue WHERE id = ?`, id).Scan(&sent); err != nil {
+		t.Fatal(err)
+	}
+	if notices != 1 || sent != 1 {
+		t.Fatalf("cancel notices=%d sent=%d", notices, sent)
+	}
+}

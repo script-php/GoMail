@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,5 +39,29 @@ func TestAttachmentFileRejectsSymlinkAndOverwrite(t *testing.T) {
 	contents, err = ReadAttachmentFile(link)
 	if err != nil || string(contents) != "first" {
 		t.Fatalf("attachment changed: %q, %v", contents, err)
+	}
+}
+
+func TestAttachmentFileDoesNotPublishAfterDirectorySyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "message.bin")
+	previous := syncAttachmentDirectory
+	t.Cleanup(func() { syncAttachmentDirectory = previous })
+	calls := 0
+	syncAttachmentDirectory = func(fd int) error {
+		calls++
+		if calls == 1 {
+			return errors.New("simulated directory sync failure")
+		}
+		return previous(fd)
+	}
+	if err := WriteAttachmentFile(path, []byte("mail attachment")); err == nil {
+		t.Fatal("attachment reported durable despite directory sync failure")
+	}
+	if calls != 2 {
+		t.Fatalf("directory sync calls=%d, want creation and cleanup", calls)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed attachment write left a file: %v", err)
 	}
 }

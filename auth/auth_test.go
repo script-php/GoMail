@@ -40,6 +40,31 @@ func TestAuthenticationResultsIncludesDKIMIdentity(t *testing.T) {
 	}
 }
 
+func TestAuthenticationResultsSPFUsesCheckedSMTPIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		mailFrom, helo, want, absent string
+	}{
+		{"alice@example.com", "client.example", "smtp.mailfrom=example.com", "alice@"},
+		{"", "bounce.example", "smtp.helo=bounce.example", "smtp.mailfrom="},
+	} {
+		b := NewAuthResultsBuilder("mx.example")
+		b.AddSPF(SPFPass, "authorized", tc.mailFrom, tc.helo)
+		got := b.Build()
+		if !strings.Contains(got, tc.want) || strings.Contains(got, tc.absent) {
+			t.Fatalf("SPF result for %q: %q", tc.mailFrom, got)
+		}
+	}
+}
+
+func TestAuthenticationResultsDKIMNoneDoesNotInventSignature(t *testing.T) {
+	b := NewAuthResultsBuilder("mx.example")
+	b.AddDKIM("none", "no signature", "", "")
+	got := b.Build()
+	if !strings.Contains(got, "dkim=none") || strings.Contains(got, "header.d=") || strings.Contains(got, "header.s=") {
+		t.Fatalf("invented DKIM identity: %q", got)
+	}
+}
+
 func TestAuthenticationResultsCannotInjectHeaders(t *testing.T) {
 	b := NewAuthResultsBuilder("mx.example")
 	b.AddDKIM("fail", "bad)\r\nX-Evil: yes", "evil; injected", "s")

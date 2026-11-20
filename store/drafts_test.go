@@ -12,6 +12,10 @@ func TestDraftLifecycleAndOwnership(t *testing.T) {
 	if err != nil || msg == nil || msg.Direction != "draft" || msg.Subject != "subject" {
 		t.Fatalf("bad draft: %+v %v", msg, err)
 	}
+	drafts, err := db.GetFolderByType(1, "drafts")
+	if err != nil || drafts.TotalCount != 1 {
+		t.Fatalf("draft count after save: %+v, %v", drafts, err)
+	}
 	if _, err = db.SaveDraft(2, id, "two@drafts.example", "attacker@example.net", "", "changed", "changed"); err == nil {
 		t.Fatal("cross-account draft update succeeded")
 	}
@@ -25,7 +29,10 @@ func TestDraftLifecycleAndOwnership(t *testing.T) {
 	if err = db.DeleteDraft(1, id); err != nil {
 		t.Fatal(err)
 	}
-	drafts, _ := db.GetFolderByType(1, "drafts")
+	drafts, _ = db.GetFolderByType(1, "drafts")
+	if drafts.TotalCount != 0 {
+		t.Fatalf("draft count after delete: %+v", drafts)
+	}
 	expunges, err := db.GetIMAPExpunges(1, drafts.ID, 0)
 	if err != nil || len(expunges) != 1 || expunges[0].UID == 0 {
 		t.Fatalf("draft expunge history=%#v err=%v", expunges, err)
@@ -33,6 +40,25 @@ func TestDraftLifecycleAndOwnership(t *testing.T) {
 	msg, _ = db.GetMessage(id, 1)
 	if msg != nil {
 		t.Fatal("draft was not deleted")
+	}
+}
+
+func TestDeleteDraftRollsBackWhenFolderCountFails(t *testing.T) {
+	db := mailboxDB(t)
+	id, err := db.SaveDraft(1, 0, "user1@drafts.example", "to@example.net", "", "draft", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_draft_count BEFORE UPDATE OF total_count ON folders
+		WHEN OLD.total_count > 0 BEGIN SELECT RAISE(FAIL, 'draft count unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteDraft(1, id); err == nil {
+		t.Fatal("draft deletion committed without folder count")
+	}
+	message, err := db.GetMessage(id, 1)
+	if err != nil || message == nil {
+		t.Fatalf("failed deletion removed draft: %+v, %v", message, err)
 	}
 }
 

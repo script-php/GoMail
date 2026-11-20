@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -21,13 +22,20 @@ func SaveAttachments(attachments []ParsedAttachment, messageDBID int64, basePath
 	}
 
 	for i, att := range attachments {
-		// Generate a safe, unique filename using hash
+		// A previous process may have written the sidecar but crashed before
+		// committing its metadata. A fresh suffix lets the next repair succeed
+		// without overwriting or trusting that orphaned file.
 		hash := sha256.Sum256(att.Data)
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("generating attachment filename: %w", err)
+		}
 		ext := filepath.Ext(att.Filename)
 		if !safeAttachmentExtension(ext) {
 			ext = ".bin"
 		}
-		safeFilename := fmt.Sprintf("%d_%d_%x%s", messageDBID, i, hash[:8], ext)
+		safeFilename := fmt.Sprintf("%d_%d_%x_%x%s", messageDBID, i, hash[:8], nonce[:], ext)
 		storagePath := filepath.Join(safeFilename)
 		fullPath := filepath.Join(basePath, safeFilename)
 

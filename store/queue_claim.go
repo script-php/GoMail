@@ -2,10 +2,14 @@ package store
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrQueueClaimLost = errors.New("queue claim changed")
 
 // ClaimQueueEntry assigns a unique delivery attempt to one worker. The SQL
 // condition arbitrates claims across processes and database connections.
@@ -72,6 +76,13 @@ func (db *DB) TransitionOwnedQueueEntryWithCode(id int64, token, status string, 
 		return err
 	}
 	defer tx.Rollback()
+	if err := transitionOwnedQueueEntry(tx, id, token, status, attempts, nextRetry, lastError, smtpCode, successDetail); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func transitionOwnedQueueEntry(tx *sql.Tx, id int64, token, status string, attempts int, nextRetry time.Time, lastError string, smtpCode int, successDetail string) error {
 	result, err := tx.Exec(`UPDATE outbound_queue SET status = ?, claim_token = '',
 		attempts = ?, next_retry = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND status IN ('sending', 'uncertain') AND claim_token = ?`,
@@ -84,7 +95,7 @@ func (db *DB) TransitionOwnedQueueEntryWithCode(id int64, token, status string, 
 		return err
 	}
 	if count != 1 {
-		return fmt.Errorf("queue entry %d claim changed before %s transition", id, status)
+		return fmt.Errorf("%w: queue entry %d before %s transition", ErrQueueClaimLost, id, status)
 	}
 	eventType := "temporary_failure"
 	detail := lastError
@@ -103,5 +114,5 @@ func (db *DB) TransitionOwnedQueueEntryWithCode(id int64, token, status string, 
 	if err := appendQueueEvent(tx, id, eventType, attempts, smtpCode, detail); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }

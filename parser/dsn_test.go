@@ -63,6 +63,17 @@ func TestParseDSNMultipartWithComplexBoundaryAndFoldedFields(t *testing.T) {
 	}
 }
 
+func TestParseGlobalDeliveryStatus(t *testing.T) {
+	raw := "From: daemon@example.test\r\nMIME-Version: 1.0\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=dsn\r\n\r\n--dsn\r\nContent-Type: text/plain\r\n\r\nFailed\r\n--dsn\r\nContent-Type: message/global-delivery-status\r\n\r\nReporting-MTA: dns; mail.example.test\r\n\r\nFinal-Recipient: utf-8; josé@example.test\r\nAction: failed\r\nStatus: 5.1.1\r\n\r\n--dsn--\r\n"
+	report, err := ParseDSN(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.RecipientsStatus) != 1 || report.RecipientsStatus[0].FinalRecipient != "josé@example.test" {
+		t.Fatalf("internationalized recipient not parsed: %+v", report)
+	}
+}
+
 func TestParseDSNRecipientBlocksWithoutBlankSeparator(t *testing.T) {
 	body := "Final-Recipient: rfc822; one@example.net\r\nAction: failed\r\nStatus: 5.1.1\r\nFinal-Recipient: rfc822; two@example.net\r\nAction: failed\r\nStatus: 5.1.2\r\n"
 	report, err := ParseDSN(body)

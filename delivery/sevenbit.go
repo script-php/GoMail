@@ -88,10 +88,26 @@ func sevenBitMultipart(body []byte, boundary string, depth int) ([]byte, bool, b
 		boundaryStart = index + 2
 	}
 	preamble := body[:boundaryStart]
-	// Do not discard a MIME epilogue while reconstructing the parts.
+	// The closing delimiter must begin a line. Preserve any legal epilogue;
+	// it is part of the submitted MIME entity even though MIME readers ignore it.
 	closing := []byte("--" + boundary + "--")
-	end := bytes.LastIndex(body, closing)
-	if end < 0 || len(bytes.TrimSpace(body[end+len(closing):])) != 0 {
+	end := -1
+	if bytes.HasPrefix(body, closing) {
+		end = 0
+	}
+	for search := 0; search < len(body); {
+		index := bytes.Index(body[search:], append([]byte("\r\n"), closing...))
+		if index < 0 {
+			break
+		}
+		end = search + index + 2
+		search = end + len(closing)
+	}
+	if end < 0 {
+		return nil, false, false
+	}
+	epilogue := body[end+len(closing):]
+	if containsEightBit(epilogue) {
 		return nil, false, false
 	}
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
@@ -159,7 +175,13 @@ func sevenBitMultipart(body []byte, boundary string, depth int) ([]byte, bool, b
 	if partCount == 0 || writer.Close() != nil {
 		return nil, false, false
 	}
-	return append(append([]byte(nil), preamble...), output.Bytes()...), changed, true
+	converted := append(append([]byte(nil), preamble...), output.Bytes()...)
+	// multipart.Writer writes its own closing delimiter and CRLF. Retain the
+	// original post-delimiter bytes, omitting only the CRLF it already wrote.
+	if bytes.HasPrefix(epilogue, []byte("\r\n")) {
+		epilogue = epilogue[2:]
+	}
+	return append(converted, epilogue...), changed, true
 }
 
 func sevenBitLeaf(body []byte, transferEncoding string) ([]byte, bool) {

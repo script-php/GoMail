@@ -158,6 +158,13 @@ func BuildDSNMessageWithSender(reportingMTA, dsnSender, recipient, originalRecip
 	}
 	boundary := fmt.Sprintf("boundary-%d", time.Now().UnixNano())
 	diagnosticText = strings.NewReplacer("\r", " ", "\n", " ").Replace(diagnosticText)
+	utf8Report := !isASCII(recipient) || !isASCII(originalRecipient) || !isASCII(diagnosticText)
+	utf8Original := !isASCII(string(dsnOriginalHeaders(originalMessage)))
+	utf8Report = utf8Report || utf8Original
+	statusType := "message/delivery-status"
+	if utf8Report {
+		statusType = "message/global-delivery-status"
+	}
 	now := time.Now().UTC()
 	subject, explanation := "Delivery Status Notification", "Delivery status for"
 	switch action {
@@ -182,19 +189,29 @@ func BuildDSNMessageWithSender(reportingMTA, dsnSender, recipient, originalRecip
 	fmt.Fprintf(&msg, "Content-Type: multipart/report; report-type=delivery-status; boundary=\"%s\"\r\n", boundary)
 	fmt.Fprintf(&msg, "Message-ID: <%d@%s>\r\n\r\n", now.UnixNano(), reportingMTA)
 	fmt.Fprintf(&msg, "--%s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s: %s\r\n\r\n", boundary, explanation, recipient)
-	fmt.Fprintf(&msg, "--%s\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; %s\r\n", boundary, reportingMTA)
+	fmt.Fprintf(&msg, "--%s\r\nContent-Type: %s\r\n\r\nReporting-MTA: dns; %s\r\n", boundary, statusType, reportingMTA)
 	if envID != "" {
 		fmt.Fprintf(&msg, "Original-Envelope-Id: %s\r\n", sanitizeDSNField(envID))
 	}
 	fmt.Fprintf(&msg, "Arrival-Date: %s\r\n\r\n", now.Format(time.RFC1123Z))
 	if originalRecipient != "" {
 		if strings.HasPrefix(originalRecipient, "utf-8;") {
-			fmt.Fprintf(&msg, "Original-Recipient: utf-8; %s\r\n", encodeDSNUTF8Address(originalRecipient[len("utf-8;"):]))
+			address := originalRecipient[len("utf-8;"):]
+			if !utf8Report {
+				address = encodeDSNUTF8Address(address)
+			}
+			fmt.Fprintf(&msg, "Original-Recipient: utf-8; %s\r\n", sanitizeDSNField(address))
+		} else if !isASCII(originalRecipient) {
+			fmt.Fprintf(&msg, "Original-Recipient: utf-8; %s\r\n", sanitizeDSNField(originalRecipient))
 		} else {
 			fmt.Fprintf(&msg, "Original-Recipient: rfc822; %s\r\n", sanitizeDSNField(originalRecipient))
 		}
 	}
-	fmt.Fprintf(&msg, "Final-Recipient: rfc822; %s\r\nAction: %s\r\nStatus: %s\r\n", sanitizeDSNField(recipient), action, statusCode)
+	finalType, finalAddress := "rfc822", sanitizeDSNField(recipient)
+	if !isASCII(recipient) {
+		finalType = "utf-8"
+	}
+	fmt.Fprintf(&msg, "Final-Recipient: %s; %s\r\nAction: %s\r\nStatus: %s\r\n", finalType, finalAddress, action, statusCode)
 	if diagnosticText != "" {
 		if smtpCode > 0 {
 			fmt.Fprintf(&msg, "Diagnostic-Code: smtp; %d %s\r\n", smtpCode, diagnosticText)
@@ -211,6 +228,13 @@ func BuildDSNMessageWithSender(reportingMTA, dsnSender, recipient, originalRecip
 			contentType = "text/rfc822-headers"
 			content = dsnOriginalHeaders(content)
 		}
+		if utf8Original {
+			if contentType == "message/rfc822" {
+				contentType = "message/global"
+			} else {
+				contentType = "message/global-headers"
+			}
+		}
 		fmt.Fprintf(&msg, "\r\n--%s\r\nContent-Type: %s\r\n\r\n", boundary, contentType)
 		msg.Write(content)
 		if !bytes.HasSuffix(content, []byte("\r\n")) {
@@ -219,6 +243,15 @@ func BuildDSNMessageWithSender(reportingMTA, dsnSender, recipient, originalRecip
 	}
 	fmt.Fprintf(&msg, "\r\n--%s--\r\n", boundary)
 	return msg.String(), nil
+}
+
+func isASCII(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // message/delivery-status is seven-bit; RFC 6533 defines unitext escapes
